@@ -36,7 +36,7 @@ bash setup_env.sh
 | `verify_env.py` | M1.0 | ☑ |
 | `curobo_hello.py` | M1.0.5 | ☑ |
 | `depth_source.py` | M1.1 | ☑ |
-| `mapping.py` | M1.2 | ☐ |
+| `mapping.py` | M1.2 | ☑ |
 | `observation_check.py` | M1.3 | ☐ |
 | `arm_kin.py` | M1.4 | ☐ |
 | `graph.py` | M1.5 | ☐ |
