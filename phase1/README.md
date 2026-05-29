@@ -34,8 +34,8 @@ bash setup_env.sh
 |------|--------|------|
 | `setup_env.sh` | M1.0 | ☑ |
 | `verify_env.py` | M1.0 | ☑ |
-| `curobo_hello.py` | M1.0.5 | ☐ |
-| `depth_source.py` | M1.1 | ☐ |
+| `curobo_hello.py` | M1.0.5 | ☑ |
+| `depth_source.py` | M1.1 | ☑ |
 | `mapping.py` | M1.2 | ☐ |
 | `observation_check.py` | M1.3 | ☐ |
 | `arm_kin.py` | M1.4 | ☐ |

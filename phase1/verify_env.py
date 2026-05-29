@@ -4,14 +4,13 @@
   1. Python 版本
   2. PyTorch + CUDA
   3. cuRobo 安装 + 关键模块 import
-  4. nvblox_torch 安装
-  5. Isaac Sim Python (omni / pxr 在 AppLauncher 启动后才可用, 这里只检查 isaacsim 包)
+  4. networkx (M1.5 全局图用)
+  5. Isaac Sim Python (omni / pxr 在 AppLauncher 启动后才可用)
 
 跑法: /home/a/miniforge3/envs/env_isaaclab/bin/python verify_env.py
 """
 from __future__ import annotations
 
-import importlib
 import sys
 
 
@@ -49,17 +48,16 @@ def _check_torch_cuda():
 
 def _check_curobo():
     import curobo
-    from curobo.types.base import TensorDeviceType
+    from curobo.types.base import TensorDeviceType  # noqa: F401
     from curobo.util_file import get_robot_configs_path
-    from curobo.wrap.reacher.motion_gen import MotionGen
 
     return f"v={getattr(curobo, '__version__', 'dev')}  configs={get_robot_configs_path()}"
 
 
-def _check_nvblox_torch():
-    import nvblox_torch
+def _check_networkx():
+    import networkx
 
-    return f"v={getattr(nvblox_torch, '__version__', 'dev')}"
+    return f"v={networkx.__version__}"
 
 
 def _check_isaacsim():
@@ -77,7 +75,7 @@ def main() -> int:
         check("Python",       _check_python),
         check("PyTorch+CUDA", _check_torch_cuda),
         check("cuRobo",       _check_curobo),
-        check("nvblox_torch", _check_nvblox_torch),
+        check("networkx",     _check_networkx),
         check("Isaac Sim",    _check_isaacsim),
     ]
 
@@ -90,11 +88,9 @@ def main() -> int:
     print(f"  {n_pass}/{n_total} 通过, {n_total - n_pass} 失败.")
     print()
     print("处理建议:")
-    print("  - cuRobo 失败:        检查 /home/a/Projects/Github/curobo 是否存在")
-    print("                         重跑 setup_env.sh, 注意 build 过程的 nvcc 错误")
-    print("  - nvblox_torch 失败:  克隆 https://github.com/nvidia-isaac/nvblox_torch")
-    print("                         手动 bash install.sh")
-    print("  - Isaac Sim 失败:     conda activate env_isaaclab 没生效, 或包损坏")
+    print("  - cuRobo 失败:    检查 /home/a/Projects/Github/curobo, 重跑 setup_env.sh")
+    print("  - networkx 失败:  pip install networkx")
+    print("  - Isaac Sim 失败: conda activate env_isaaclab 没生效")
     return 1
 
 
