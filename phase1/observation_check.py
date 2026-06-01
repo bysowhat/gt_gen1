@@ -157,6 +157,45 @@ def check_line_of_sight(
     return True
 
 
+def wedge_bisector(
+    seam_limits: np.ndarray,
+    tangent: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """返回 wedge 中线 (角平分线) 单位方向, 从 seam 指向开口外.
+
+    与 check_seam_wedge 里的 bisector 算法一致, 抽出来给评分复用 (M1.8):
+    让最优观测候选的 (cam_pos - p_seam) 方向尽量对准这条中线 → 最"正"地看焊缝.
+
+    `seam_limits.shape = (2, 3)` (boundary_dirs). tangent 给了就投影到 ⊥tangent 平面.
+    退化 (limits 不合法 / 反向) 返回 None.
+    """
+    sl = np.asarray(seam_limits, dtype=np.float64)
+    if sl.shape != (2, 3):
+        return None
+    n1, n2 = np.linalg.norm(sl[0]), np.linalg.norm(sl[1])
+    if n1 < 1e-9 or n2 < 1e-9:
+        return None
+    d1, d2 = sl[0] / n1, sl[1] / n2
+
+    if tangent is not None:
+        t = np.asarray(tangent, dtype=np.float64).reshape(3)
+        tn = np.linalg.norm(t)
+        if tn > 1e-9:
+            t = t / tn
+            d1 = d1 - np.dot(d1, t) * t
+            d2 = d2 - np.dot(d2, t) * t
+            m1, m2 = np.linalg.norm(d1), np.linalg.norm(d2)
+            if m1 < 1e-9 or m2 < 1e-9:
+                return None
+            d1 /= m1; d2 /= m2
+
+    bis = d1 + d2
+    bn = np.linalg.norm(bis)
+    if bn < 1e-9:
+        return None                      # d1, d2 反向 (gap=180°), 无明确中线
+    return bis / bn
+
+
 def check_seam_wedge(
     viewpoint: Viewpoint, p_seam: np.ndarray, seam_limits: np.ndarray,
     tangent: np.ndarray | None = None,
@@ -284,6 +323,7 @@ def is_valid_observation(
 
 
 __all__ = [
+    "wedge_bisector",
     "Viewpoint",
     "ObservationResult",
     "is_valid_observation",

@@ -250,8 +250,16 @@ def test_run_one_cycle_returns_action(kin, seam, vm, intrin):
 
 
 def test_run_one_cycle_collision_world_returns_failure(kin, seam, intrin):
-    """全 occupied 世界, 没法不撞, 应返回 success=False."""
-    bounds = np.array([[19.0, -1.0, 10.5], [29.0, 1.5, 13.0]])
+    """全 occupied 世界, 没法不撞, 应返回 success=False.
+
+    bounds 必须罩住 init EE 周围整个采样盒 (box=0.30), 否则盒外=free 会漏过碰撞.
+    """
+    import torch
+    fk = kin.fk(torch.tensor(INITIAL_JOINT_ANGLES, dtype=torch.float32,
+                              device="cuda"))
+    ee0 = fk["ee_pos_world"][0].cpu().numpy()
+    pad = 0.6                                       # > sample_box_half, 留余量
+    bounds = np.stack([ee0 - pad, ee0 + pad])
     vm_blocked = VoxelMap(bounds=bounds, resolution=0.05, max_range=2.0)
     from phase1.mapping import STATE_OCCUPIED
     vm_blocked._state[:] = STATE_OCCUPIED          # 全堵死

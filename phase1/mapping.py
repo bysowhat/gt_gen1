@@ -204,6 +204,11 @@ class VoxelMap:
 
         if free_mask.any():
             f_idx = idx[free_mask]
+            # 保护已 occupied 体素: 射线 free-carving 不能把真实障碍(工件)擦成 free.
+            # 静态工件的占据是"黏性"的, 否则擦过工件的射线会侵蚀碰撞几何 → 路径穿模.
+            cur = self._state[f_idx[..., 0], f_idx[..., 1], f_idx[..., 2]]
+            keep = cur != STATE_OCCUPIED
+            f_idx = f_idx[keep]
             self._state[f_idx[..., 0], f_idx[..., 1], f_idx[..., 2]] = STATE_FREE
 
         if occ_mask.any():

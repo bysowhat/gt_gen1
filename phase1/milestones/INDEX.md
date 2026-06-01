@@ -12,8 +12,8 @@
 | M1.4 | cuRobo 封装 | [M1.4_CuRoboWrapper.md](M1.4_CuRoboWrapper.md) | `arm_kin.py` | ☐ | 3 天 |
 | M1.5 | 全局图 + Dijkstra | [M1.5_Graph.md](M1.5_Graph.md) | `graph.py` | ☐ | 2 天 |
 | M1.6 | 增益 + 目标偏置 | [M1.6_Gain.md](M1.6_Gain.md) | `gain.py` | ☐ | 1 天 |
-| M1.7 | 单 cycle 探索 | [M1.7_SingleCycle.md](M1.7_SingleCycle.md) | `exploration.py` (核心) + `viz.py` | ☐ | 3 天 |
-| M1.8 | 多 cycle + 卡住回退 | [M1.8_MultiCycle.md](M1.8_MultiCycle.md) | `exploration.py` (扩展) | ☐ | 2 天 |
+| M1.7 | 单 cycle 探索 | [M1.7_SingleCycle.md](M1.7_SingleCycle.md) | `exploration.py` (核心) + `viz.py` | ✓ | 3 天 |
+| M1.8 | 多 cycle + 卡住回退 | [M1.8_MultiCycle.md](M1.8_MultiCycle.md) | `exploration.py` (扩展) | ✓ | 2 天 |
 | M1.9 | 切 Isaac Sim 真渲染 | [M1.9_IsaacSimDepth.md](M1.9_IsaacSimDepth.md) | `depth_source.py` (扩展) | ☐ | 2 天 |
 | M1.10 | 端到端 + 视频 | [M1.10_EndToEnd.md](M1.10_EndToEnd.md) | `run_phase1.py` | ☐ | 1 天 |
 
