@@ -38,7 +38,7 @@ bash setup_env.sh
 | `depth_source.py` | M1.1 | ☑ |
 | `mapping.py` | M1.2 | ☑ |
 | `observation_check.py` | M1.3 | ☑ |
-| `arm_kin.py` | M1.4 | ☐ |
+| `arm_kin.py` | M1.4 | ☑ |
 | `graph.py` | M1.5 | ☐ |
 | `gain.py` | M1.6 | ☐ |
 | `exploration.py` | M1.7 | ☐ |
