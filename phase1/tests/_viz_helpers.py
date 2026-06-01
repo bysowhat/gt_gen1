@@ -26,6 +26,7 @@ class SeamData:
     pkl_path: Path
     seam_line: np.ndarray         # (N, 3)
     seam_tangent: np.ndarray      # (N, 3)
+    seam_limits: np.ndarray       # (N, 2, 3) 焊缝处两侧表面法向量 (单位向量, 互相垂直)
     p_weld: np.ndarray            # (3,) 中点
     p_weld_idx: int
     tangent: np.ndarray           # (3,) p_weld 的切线
@@ -60,12 +61,14 @@ def load_seam_data(pkl_path: str | Path) -> SeamData:
         d = pickle.load(f)
     seam_line = np.asarray(d["seam_line"])
     seam_tangent = np.asarray(d["seam_tangent"])
+    seam_limits = np.asarray(d["seam_limits"])
     mid = int(d.get("middle", len(seam_line) // 2))
     seam_length = float(np.linalg.norm(np.diff(seam_line, axis=0), axis=1).sum())
     return SeamData(
         pkl_path=pkl_path,
         seam_line=seam_line,
         seam_tangent=seam_tangent,
+        seam_limits=seam_limits,
         p_weld=seam_line[mid],
         p_weld_idx=mid,
         tangent=seam_tangent[mid],

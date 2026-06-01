@@ -40,7 +40,7 @@ bash setup_env.sh
 | `observation_check.py` | M1.3 | ☑ |
 | `arm_kin.py` | M1.4 | ☑ |
 | `graph.py` | M1.5 | ☑ |
-| `gain.py` | M1.6 | ☐ |
+| `gain.py` | M1.6 | ☑ |
 | `exploration.py` | M1.7 | ☐ |
 | `viz.py` | M1.7+ | ☐ |
 | `config.py` | M1.7 | ☐ |

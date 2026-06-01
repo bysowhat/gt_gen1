@@ -19,6 +19,7 @@ from phase1.observation_check import (
     check_in_frustum,
     check_incidence,
     check_line_of_sight,
+    check_seam_wedge,
     is_valid_observation,
 )
 
@@ -263,7 +264,116 @@ def test_fail_at_incidence():
     assert r.distance_ok and r.in_frustum_ok and r.line_of_sight_ok
 
 
-# ---------------------------------------------------------------------- 性能
+# ---------------------------------------------------------------------- ⑤ wedge
+
+
+def _example_seam_limits_90():
+    """90° 凹角 (L 形): 一面方向 +x, 另一面方向 +z. 开口 90°, 朝 +x+z 象限."""
+    return np.array([
+        [1.0, 0.0, 0.0],   # d1 = +x (一面延伸方向)
+        [0.0, 0.0, 1.0],   # d2 = +z (另一面延伸方向)
+    ])
+
+
+def _example_seam_limits_45():
+    """45° 凹槽: 两面之间夹角 45° (锐角)."""
+    a = np.deg2rad(67.5)        # 让 bisector 大致朝 +x
+    b = np.deg2rad(22.5)
+    return np.array([
+        [np.cos(a), 0.0, np.sin(a)],
+        [np.cos(b), 0.0, np.sin(b)],
+    ])
+
+
+def _tangent_y():
+    """两个 fixture 都让 tangent 沿 +y, 所以 limits 在 xz 平面."""
+    return np.array([0.0, 1.0, 0.0])
+
+
+def test_wedge_90_in_open_side_pass():
+    """90° wedge: cam 在 +x +z 象限 (开口侧), 通过."""
+    vp = Viewpoint(pos=np.array([0.4, 0, 0.4]), dir=np.array([-1, 0, -1]))
+    ok, _ = check_seam_wedge(vp, np.zeros(3), _example_seam_limits_90(), _tangent_y())
+    assert ok
+
+
+def test_wedge_90_wrong_side_fail():
+    """90° wedge: cam 在 -x +z (跨过 +z 那条边界), 失败."""
+    vp = Viewpoint(pos=np.array([-0.4, 0, 0.4]), dir=np.array([1, 0, -1]))
+    ok, _ = check_seam_wedge(vp, np.zeros(3), _example_seam_limits_90(), _tangent_y())
+    assert not ok
+
+
+def test_wedge_90_opposite_side_fail():
+    """90° wedge: cam 在 -x -z (完全反向), 失败."""
+    vp = Viewpoint(pos=np.array([-0.4, 0, -0.4]), dir=np.array([1, 0, 1]))
+    ok, _ = check_seam_wedge(vp, np.zeros(3), _example_seam_limits_90(), _tangent_y())
+    assert not ok
+
+
+def test_wedge_45_narrow_pass():
+    """45° wedge: 在 bisector 方向 (45°), 远在 wedge 中心, 通过."""
+    # bisector = (limits[0] + limits[1]) / norm = (0.707, 0, 0.707)
+    # cam 沿 bisector 方向放在 (0.5, 0, 0.5), 应在 wedge 正中
+    vp = Viewpoint(pos=np.array([0.5, 0, 0.5]), dir=np.array([-1, 0, -1]))
+    ok, _ = check_seam_wedge(vp, np.zeros(3), _example_seam_limits_45(), _tangent_y())
+    assert ok
+
+
+def test_wedge_45_outside_narrow_fail():
+    """45° wedge: 在原 90° 检查会通过 (rel·d1>0 且 rel·d2>0), 但实际偏离 wedge 中线
+    超过 22.5°, 应失败. cam 在 (1, 0, 1) 方向 (45°), 而 limits 都集中在 +x 附近 (22.5°)."""
+    vp = Viewpoint(pos=np.array([0.4, 0, 0.4]), dir=np.array([-1, 0, -1]))
+    ok, _ = check_seam_wedge(vp, np.zeros(3), _example_seam_limits_45(), _tangent_y())
+    # bisector 在 22.5°+45°/2 = 45° 处? 让我重新算. limits 在 22.5° 和 67.5°,
+    # bisector 在 45°. 这个 cam 在 45° 方向, 应该在 wedge 内.
+    # 改个 test: cam 在 0° (+x), 应失败 (偏离中线 45°, 但 wedge 半角=22.5°)
+    vp2 = Viewpoint(pos=np.array([0.5, 0, 0.0]), dir=np.array([-1, 0, 0]))
+    ok2, _ = check_seam_wedge(vp2, np.zeros(3), _example_seam_limits_45(), _tangent_y())
+    assert not ok2
+
+
+def test_wedge_validation():
+    """seam_limits shape 错时报错."""
+    vp = Viewpoint(pos=np.array([0.4, 0, 0.4]), dir=np.array([-1, 0, -1]))
+    with pytest.raises(ValueError):
+        check_seam_wedge(vp, np.zeros(3), np.zeros((3, 3)))
+
+
+def test_is_valid_observation_with_wedge():
+    """主函数: 4 条都过 + wedge 失败, 返回 invalid (fail_reason=wedge)."""
+    p_seam, _, vm, intrin = make_test_setup()
+    sl = _example_seam_limits_90()
+    # cam 在 wedge 错侧 (-x +z 跨过边界), 距离 ok, frustum ok, LOS ok, incidence ok
+    vp = Viewpoint(pos=np.array([-0.4, 0, 0.4]), dir=np.array([1, 0, -1]),
+                   up=np.array([0, 0, 1]))
+    r = is_valid_observation(vp, p_seam, _tangent_y(), vm, intrin, seam_limits=sl)
+    assert not r.valid
+    assert r.fail_reason == "wedge"
+    assert r.distance_ok and r.in_frustum_ok and r.line_of_sight_ok and r.incidence_ok
+
+
+def test_is_valid_observation_skips_wedge_when_none():
+    """seam_limits=None 时跳过 wedge 检查 (向后兼容)."""
+    p_seam, _, vm, intrin = make_test_setup()
+    vp = Viewpoint(pos=np.array([-0.4, 0, 0.4]), dir=np.array([1, 0, -1]),
+                   up=np.array([0, 0, 1]))
+    r = is_valid_observation(vp, p_seam, _tangent_y(), vm, intrin, seam_limits=None)
+    assert r.valid
+
+
+def make_test_setup():
+    """需要的 fixtures 集中在这里, 给 wedge tests 用. tangent = +y."""
+    from phase1.depth_source import CameraIntrinsics
+    from phase1.mapping import VoxelMap, STATE_FREE
+    p_seam = np.zeros(3)
+    tangent = np.array([0, 1, 0])
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    vm = VoxelMap(bounds=np.array([[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]),
+                  resolution=0.05, device=device)
+    vm._state[:] = STATE_FREE
+    intrin = CameraIntrinsics.from_fov(86.0, 57.0, 480, 640)
+    return p_seam, tangent, vm, intrin
 
 
 def test_many_calls_throughput():
@@ -283,3 +393,6 @@ def test_many_calls_throughput():
     elapsed_ms = (time.time() - t0) * 1000
     print(f"\n  1000 calls: {elapsed_ms:.0f} ms total ({elapsed_ms/n:.2f} ms/call)")
     assert elapsed_ms < 2000, f"too slow: {elapsed_ms} ms total"
+
+
+# ---------------------------------------------------------------------- 性能

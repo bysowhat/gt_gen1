@@ -54,8 +54,10 @@ class ObservationResult:
     in_frustum_ok: bool
     line_of_sight_ok: bool
     incidence_ok: bool
+    wedge_ok: bool
     distance: float
     incidence_angle_deg: float
+    wedge_min_dot: float        # min((rel)·n1, (rel)·n2). >0 = 在 wedge 内
     fail_reason: Optional[str]
 
 
@@ -178,6 +180,77 @@ def check_incidence(
     return angle_min_deg <= angle_deg <= angle_max_deg, angle_deg
 
 
+def check_seam_wedge(
+    viewpoint: Viewpoint, p_seam: np.ndarray, seam_limits: np.ndarray,
+    tangent: np.ndarray | None = None,
+    margin_deg: float = 0.0,
+) -> tuple[bool, float]:
+    """⑤ 凹角 wedge: 相机必须在焊缝两侧"面方向"定义的开口 wedge 内.
+
+    `seam_limits.shape = (2, 3)`: 焊缝两侧的"面方向" (boundary_dirs, 单位向量).
+        d1, d2 都从 seam 指向开口外 (即 wedge 内). 它们之间的夹角就是 gap_deg
+        (开口角度): 90° 表示直角焊缝 (L 形), <90° 表示锐角凹槽, >90° 表示钝角.
+
+    判定: rel = cam_pos - P_seam 投影到 ⊥ tangent 平面, 必须落在
+        d1 和 d2 张成的 wedge 角内 (即与 bisector 的夹角 ≤ gap_deg/2).
+
+    Args:
+        tangent: 焊缝切线 (1D方向). 若 None, 不做投影 (假设 limits 已在 ⊥ tangent 平面).
+        margin_deg: 收紧 wedge 边界的角度余量 (度); 默认 0.
+                    >0: cam 必须严格在 wedge 内一定角度; <0: 允许稍微越界.
+
+    Returns:
+        (ok, cos_angle_to_bisector_minus_cos_half).
+        正值 = 在 wedge 内, 越大越居中.
+    """
+    p_seam = np.asarray(p_seam, dtype=np.float64).reshape(3)
+    sl = np.asarray(seam_limits, dtype=np.float64)
+    if sl.shape != (2, 3):
+        raise ValueError(f"seam_limits must be (2, 3), got {sl.shape}")
+
+    d1 = sl[0] / np.linalg.norm(sl[0])
+    d2 = sl[1] / np.linalg.norm(sl[1])
+
+    # 如果给了切线, 投影到 ⊥ tangent 平面 (理论上 limits 应该已经在这个平面里)
+    if tangent is not None:
+        t = np.asarray(tangent, dtype=np.float64).reshape(3)
+        t = t / np.linalg.norm(t)
+        d1 = d1 - np.dot(d1, t) * t
+        d2 = d2 - np.dot(d2, t) * t
+        n1 = np.linalg.norm(d1); n2 = np.linalg.norm(d2)
+        if n1 < 1e-9 or n2 < 1e-9:
+            return False, -1.0
+        d1 /= n1; d2 /= n2
+
+    rel = viewpoint.pos - p_seam
+    if tangent is not None:
+        rel = rel - np.dot(rel, t) * t
+    rel_norm = np.linalg.norm(rel)
+    if rel_norm < 1e-9:
+        return False, -1.0
+    rel /= rel_norm
+
+    # bisector = (d1 + d2) / norm; 方向是 wedge 中线
+    bis = d1 + d2
+    bn = np.linalg.norm(bis)
+    if bn < 1e-9:
+        # d1, d2 反向 (gap_deg = 180°), wedge 实际上是半空间; 用法向定向
+        # 退化情况: 不太可能出现, 用 d1 当 bisector 凑合
+        bis = d1
+    else:
+        bis /= bn
+
+    # gap_deg = 两 dir 夹角. half_angle = gap_deg / 2.
+    cos_gap = float(np.clip(np.dot(d1, d2), -1.0, 1.0))
+    gap_deg = float(np.degrees(np.arccos(cos_gap)))
+    half_angle_deg = gap_deg / 2.0 - margin_deg
+    cos_half = float(np.cos(np.radians(half_angle_deg)))
+
+    cos_to_bis = float(np.dot(rel, bis))
+    in_wedge = cos_to_bis >= cos_half
+    return in_wedge, cos_to_bis - cos_half
+
+
 # ---------------------------------------------------------------------- main
 
 
@@ -188,37 +261,58 @@ def is_valid_observation(
     voxel_map: "VoxelMap",
     intrinsics: "CameraIntrinsics",
     *,
+    seam_limits: Optional[np.ndarray] = None,
     d_min: float = 0.3,
     d_max: float = 0.6,
     incidence_min_deg: float = 30.0,
     incidence_max_deg: float = 90.0,
     los_unknown_as_block: bool = True,
 ) -> ObservationResult:
-    """主函数: 4 条 short-circuit 检查, 任一失败即返回."""
+    """主函数: 5 条 short-circuit 检查, 任一失败即返回.
+
+    5 条:
+      ①  距离        d_min ≤ ‖cam_pos - P_seam‖ ≤ d_max
+      ②  视锥        P_seam 投影到 (u,v) 在 [0,W) × [0,H) 且 z_cam>0
+      ③  视线        raycast(cam_pos → P_seam) 不撞 occupied (可选不穿 unknown)
+      ④  入射角      视线与焊缝切线夹角 ∈ [angle_min, angle_max]
+      ⑤  wedge       (可选) cam_pos 在 seam_limits 定义的两个表面法向开口侧.
+                     需要传 seam_limits=(2,3); 不传则跳过此检查.
+    """
     dist_ok, dist = check_distance(viewpoint, p_seam, d_min, d_max)
     if not dist_ok:
-        return ObservationResult(False, dist_ok, False, False, False,
-                                 dist, 0.0, "distance")
+        return ObservationResult(False, dist_ok, False, False, False, False,
+                                 dist, 0.0, 0.0, "distance")
 
     frustum_ok = check_in_frustum(viewpoint, p_seam, intrinsics)
     if not frustum_ok:
-        return ObservationResult(False, dist_ok, False, False, False,
-                                 dist, 0.0, "frustum")
+        return ObservationResult(False, dist_ok, False, False, False, False,
+                                 dist, 0.0, 0.0, "frustum")
 
     los_ok = check_line_of_sight(viewpoint, p_seam, voxel_map, los_unknown_as_block)
     if not los_ok:
-        return ObservationResult(False, dist_ok, frustum_ok, False, False,
-                                 dist, 0.0, "line_of_sight")
+        return ObservationResult(False, dist_ok, frustum_ok, False, False, False,
+                                 dist, 0.0, 0.0, "line_of_sight")
 
     inc_ok, inc_angle = check_incidence(
         viewpoint, p_seam, tangent, incidence_min_deg, incidence_max_deg,
     )
     if not inc_ok:
-        return ObservationResult(False, dist_ok, frustum_ok, los_ok, False,
-                                 dist, inc_angle, "incidence")
+        return ObservationResult(False, dist_ok, frustum_ok, los_ok, False, False,
+                                 dist, inc_angle, 0.0, "incidence")
 
-    return ObservationResult(True, True, True, True, True,
-                             dist, inc_angle, None)
+    if seam_limits is not None:
+        wedge_ok, min_dot = check_seam_wedge(
+            viewpoint, p_seam, seam_limits, tangent=tangent,
+        )
+        if not wedge_ok:
+            return ObservationResult(False, dist_ok, frustum_ok, los_ok,
+                                     inc_ok, False, dist, inc_angle, min_dot,
+                                     "wedge")
+    else:
+        wedge_ok, min_dot = True, 0.0
+
+    return ObservationResult(True, True, True, True, True, True,
+                             dist, inc_angle, min_dot, None)
 
 
 __all__ = [
@@ -229,4 +323,5 @@ __all__ = [
     "check_in_frustum",
     "check_line_of_sight",
     "check_incidence",
+    "check_seam_wedge",
 ]
