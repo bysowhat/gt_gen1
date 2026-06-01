@@ -53,11 +53,9 @@ class ObservationResult:
     distance_ok: bool
     in_frustum_ok: bool
     line_of_sight_ok: bool
-    incidence_ok: bool
     wedge_ok: bool
     distance: float
-    incidence_angle_deg: float
-    wedge_min_dot: float        # min((rel)·n1, (rel)·n2). >0 = 在 wedge 内
+    wedge_min_dot: float        # cos_to_bis - cos_half. >0 = 在 wedge 内
     fail_reason: Optional[str]
 
 
@@ -159,27 +157,6 @@ def check_line_of_sight(
     return True
 
 
-def check_incidence(
-    viewpoint: Viewpoint, p_seam: np.ndarray, tangent: np.ndarray,
-    angle_min_deg: float, angle_max_deg: float,
-) -> tuple[bool, float]:
-    """④ 入射角: 视线 (cam_pos→P_i) 与焊缝切线的夹角.
-
-    用 |cos(angle)| (因为切线方向有正反两个等价方向).
-    返回 angle ∈ [0°, 90°].
-    """
-    p_seam = np.asarray(p_seam, dtype=np.float64).reshape(3)
-    tangent = np.asarray(tangent, dtype=np.float64).reshape(3)
-    t_n = tangent / np.linalg.norm(tangent)
-
-    rel = p_seam - viewpoint.pos
-    rel_n = rel / np.linalg.norm(rel)
-    cos_a = abs(float(np.dot(rel_n, t_n)))
-    cos_a = float(np.clip(cos_a, -1.0, 1.0))
-    angle_deg = float(np.degrees(np.arccos(cos_a)))
-    return angle_min_deg <= angle_deg <= angle_max_deg, angle_deg
-
-
 def check_seam_wedge(
     viewpoint: Viewpoint, p_seam: np.ndarray, seam_limits: np.ndarray,
     tangent: np.ndarray | None = None,
@@ -264,55 +241,46 @@ def is_valid_observation(
     seam_limits: Optional[np.ndarray] = None,
     d_min: float = 0.3,
     d_max: float = 0.6,
-    incidence_min_deg: float = 30.0,
-    incidence_max_deg: float = 90.0,
     los_unknown_as_block: bool = True,
 ) -> ObservationResult:
-    """主函数: 5 条 short-circuit 检查, 任一失败即返回.
+    """主函数: 4 条 short-circuit 检查, 任一失败即返回.
 
-    5 条:
+    4 条:
       ①  距离        d_min ≤ ‖cam_pos - P_seam‖ ≤ d_max
       ②  视锥        P_seam 投影到 (u,v) 在 [0,W) × [0,H) 且 z_cam>0
       ③  视线        raycast(cam_pos → P_seam) 不撞 occupied (可选不穿 unknown)
-      ④  入射角      视线与焊缝切线夹角 ∈ [angle_min, angle_max]
-      ⑤  wedge       (可选) cam_pos 在 seam_limits 定义的两个表面法向开口侧.
-                     需要传 seam_limits=(2,3); 不传则跳过此检查.
+      ④  wedge       (可选) cam_pos 在 seam_limits 定义的开口 wedge 内.
+                     需要传 seam_limits=(2,3) + tangent; 不传 seam_limits 则跳过.
+
+    `tangent` 仍是必填参数(用作 wedge 投影到 ⊥ tangent 平面).
     """
     dist_ok, dist = check_distance(viewpoint, p_seam, d_min, d_max)
     if not dist_ok:
-        return ObservationResult(False, dist_ok, False, False, False, False,
-                                 dist, 0.0, 0.0, "distance")
+        return ObservationResult(False, dist_ok, False, False, False,
+                                 dist, 0.0, "distance")
 
     frustum_ok = check_in_frustum(viewpoint, p_seam, intrinsics)
     if not frustum_ok:
-        return ObservationResult(False, dist_ok, False, False, False, False,
-                                 dist, 0.0, 0.0, "frustum")
+        return ObservationResult(False, dist_ok, False, False, False,
+                                 dist, 0.0, "frustum")
 
     los_ok = check_line_of_sight(viewpoint, p_seam, voxel_map, los_unknown_as_block)
     if not los_ok:
-        return ObservationResult(False, dist_ok, frustum_ok, False, False, False,
-                                 dist, 0.0, 0.0, "line_of_sight")
-
-    inc_ok, inc_angle = check_incidence(
-        viewpoint, p_seam, tangent, incidence_min_deg, incidence_max_deg,
-    )
-    if not inc_ok:
-        return ObservationResult(False, dist_ok, frustum_ok, los_ok, False, False,
-                                 dist, inc_angle, 0.0, "incidence")
+        return ObservationResult(False, dist_ok, frustum_ok, False, False,
+                                 dist, 0.0, "line_of_sight")
 
     if seam_limits is not None:
         wedge_ok, min_dot = check_seam_wedge(
             viewpoint, p_seam, seam_limits, tangent=tangent,
         )
         if not wedge_ok:
-            return ObservationResult(False, dist_ok, frustum_ok, los_ok,
-                                     inc_ok, False, dist, inc_angle, min_dot,
-                                     "wedge")
+            return ObservationResult(False, dist_ok, frustum_ok, los_ok, False,
+                                     dist, min_dot, "wedge")
     else:
         wedge_ok, min_dot = True, 0.0
 
-    return ObservationResult(True, True, True, True, True, True,
-                             dist, inc_angle, min_dot, None)
+    return ObservationResult(True, True, True, True, True,
+                             dist, min_dot, None)
 
 
 __all__ = [
@@ -322,6 +290,5 @@ __all__ = [
     "check_distance",
     "check_in_frustum",
     "check_line_of_sight",
-    "check_incidence",
     "check_seam_wedge",
 ]

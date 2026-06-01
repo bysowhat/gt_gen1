@@ -5,7 +5,7 @@
     红色   ✗ distance 失败
     橙色   ✗ frustum 失败
     黄色   ✗ line_of_sight 失败
-    紫色   ✗ incidence 失败
+    紫色   ✗ (未使用)
 
 跑法:
     /home/a/miniforge3/envs/env_isaaclab/bin/python \
@@ -21,7 +21,6 @@
 合格标准:
     - 离 P_weld 太近 / 太远的 viewpoint 应是红色 (distance fail)
     - 在 P_weld 背面 (被工件挡住) 的 viewpoint 应是黄色 (line_of_sight fail)
-    - 沿焊缝切线方向看的 viewpoint 应是紫色 (incidence fail)
     - 中间一圈合规位置应是绿色
 """
 from __future__ import annotations
@@ -53,7 +52,6 @@ COLORS = {
     "distance":     [0.95, 0.20, 0.20],
     "frustum":      [1.00, 0.55, 0.10],
     "line_of_sight":[0.95, 0.85, 0.20],
-    "incidence":    [0.65, 0.30, 0.85],
 }
 
 
@@ -166,7 +164,6 @@ def main():
     print("  红色点         — ✗ distance 失败")
     print("  橙色点         — ✗ frustum 失败")
     print("  黄色点         — ✗ line_of_sight 失败")
-    print("  紫色点         — ✗ incidence 失败")
 
     if not args.no_window:
         o3d.visualization.draw_geometries(

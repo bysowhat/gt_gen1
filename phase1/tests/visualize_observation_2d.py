@@ -70,7 +70,6 @@ from phase1.observation_check import (
     Viewpoint,
     check_distance,
     check_in_frustum,
-    check_incidence,
     check_line_of_sight,
 )
 from phase1.tests._viz_helpers import load_seam_data, look_at
@@ -276,7 +275,6 @@ def main() -> int:
         "distance":     "01invalid_distance",
         "frustum":      "02invalid_frustum",
         "line_of_sight":"03invalid_los",
-        "incidence":    "04invalid_incidence",
     }
 
     counter = Counter()
@@ -287,15 +285,12 @@ def main() -> int:
         vp = Viewpoint(pos=pos, dir=cam_dir, up=np.array([0, 0, 1.0]))
         cam_pose = look_at(pos, seam.p_weld)
 
-        # 跑全部 4 条检查 (不 short-circuit, 收集所有失败)
+        # 跑全部 3 条检查 (不 short-circuit, 收集所有失败)
         dist_ok, dist = check_distance(vp, seam.p_weld, args.d_min, args.d_max)
         frustum_ok = check_in_frustum(vp, seam.p_weld, K)
         los_ok = check_line_of_sight(
             vp, seam.p_weld, vm,
             unknown_as_block=(args.mode == "strict"),
-        )
-        inc_ok, inc_angle = check_incidence(
-            vp, seam.p_weld, seam.tangent, 30.0, 90.0,
         )
 
         # 收集失败原因 (中文, 详细)
@@ -317,20 +312,12 @@ def main() -> int:
         if not los_ok:
             fail_reasons_zh.append("视线被遮挡(中间有障碍或穿过未知区)")
             fail_tags.append("视线被挡")
-        if not inc_ok:
-            if inc_angle < 30.0:
-                fail_reasons_zh.append(f"入射角太小({inc_angle:.1f}度, <30度)")
-                fail_tags.append(f"角度太小{inc_angle:.0f}度")
-            else:
-                fail_reasons_zh.append(f"入射角不合规({inc_angle:.1f}度)")
-                fail_tags.append(f"角度异常{inc_angle:.0f}度")
 
         is_valid = len(fail_reasons_zh) == 0
         first_fail = None if is_valid else (
             "distance" if not dist_ok else
             "frustum" if not frustum_ok else
-            "line_of_sight" if not los_ok else
-            "incidence"
+            "line_of_sight"
         )
         counter[first_fail] += 1
 
@@ -341,8 +328,7 @@ def main() -> int:
 
         # 标题 (中文)
         if is_valid:
-            title = (f"候选 #{i:03d}  ✓ 合格    "
-                     f"距离 = {dist:.3f}米   入射角 = {inc_angle:.1f}度")
+            title = (f"候选 #{i:03d}  ✓ 合格    距离 = {dist:.3f}米")
             color = "darkgreen"
         else:
             n = len(fail_reasons_zh)
@@ -353,7 +339,7 @@ def main() -> int:
 
         # 文件名 (中文, 列所有失败 tag)
         if is_valid:
-            fname = f"00合格_{i:03d}_距{dist:.2f}米_角{inc_angle:.0f}度.png"
+            fname = f"00合格_{i:03d}_距{dist:.2f}米.png"
         else:
             tags_str = "_".join(fail_tags)
             fname = f"01不合格_{i:03d}_{tags_str}.png"
@@ -366,10 +352,10 @@ def main() -> int:
 
     print()
     print(f"[stats]  mode = {args.mode}  (按首次失败的条目分类)")
-    for reason in [None, "distance", "frustum", "line_of_sight", "incidence"]:
+    for reason in [None, "distance", "frustum", "line_of_sight"]:
         n = counter.get(reason, 0)
         zh = {None: "✓ 合格", "distance": "✗ 距离", "frustum": "✗ 视锥",
-              "line_of_sight": "✗ 视线", "incidence": "✗ 入射角"}[reason]
+              "line_of_sight": "✗ 视线"}[reason]
         print(f"  {zh:<10s} {n}")
 
     print()

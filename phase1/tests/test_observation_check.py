@@ -17,7 +17,6 @@ from phase1.observation_check import (
     Viewpoint,
     check_distance,
     check_in_frustum,
-    check_incidence,
     check_line_of_sight,
     check_seam_wedge,
     is_valid_observation,
@@ -152,45 +151,6 @@ def test_los_unknown_allowed_when_disabled():
     assert check_line_of_sight(vp, np.zeros(3), vm, unknown_as_block=False)
 
 
-# ---------------------------------------------------------------------- ④ 入射角
-
-
-def test_incidence_perpendicular_pass():
-    """视线垂直于切线 (90°), 入射角最优."""
-    vp = Viewpoint(pos=[0, 0.4, 0], dir=[0, -1, 0])
-    p_seam = np.zeros(3)
-    tangent = np.array([1.0, 0, 0])
-    ok, ang = check_incidence(vp, p_seam, tangent, 30, 90)
-    assert ok and abs(ang - 90) < 0.5
-
-
-def test_incidence_parallel_fail():
-    """视线和切线平行 (0°), 失败."""
-    vp = Viewpoint(pos=[-0.4, 0, 0], dir=[1, 0, 0])
-    p_seam = np.zeros(3)
-    tangent = np.array([1.0, 0, 0])
-    ok, ang = check_incidence(vp, p_seam, tangent, 30, 90)
-    assert not ok and ang < 1
-
-
-def test_incidence_45_pass_in_range():
-    """45°, 在 [30, 90] 内通过."""
-    vp = Viewpoint(pos=[-0.4, 0.4, 0], dir=[1, -1, 0])
-    p_seam = np.zeros(3)
-    tangent = np.array([1.0, 0, 0])
-    ok, ang = check_incidence(vp, p_seam, tangent, 30, 90)
-    assert ok and 44 < ang < 46
-
-
-def test_incidence_uses_absolute():
-    """切线反向, 结果不变."""
-    vp = Viewpoint(pos=[0, 0.4, 0], dir=[0, -1, 0])
-    p_seam = np.zeros(3)
-    _, ang_pos = check_incidence(vp, p_seam, np.array([1.0, 0, 0]), 30, 90)
-    _, ang_neg = check_incidence(vp, p_seam, np.array([-1.0, 0, 0]), 30, 90)
-    assert abs(ang_pos - ang_neg) < 1e-6
-
-
 # ---------------------------------------------------------------------- 主函数
 
 
@@ -204,7 +164,7 @@ def test_valid_all_pass():
     assert r.valid, f"failed at: {r.fail_reason}"
     assert r.fail_reason is None
     assert r.distance_ok and r.in_frustum_ok
-    assert r.line_of_sight_ok and r.incidence_ok
+    assert r.line_of_sight_ok
 
 
 def test_short_circuit_distance():
@@ -249,19 +209,6 @@ def test_fail_at_line_of_sight():
     assert not r.valid
     assert r.fail_reason == "line_of_sight"
     assert r.distance_ok and r.in_frustum_ok and not r.line_of_sight_ok
-
-
-def test_fail_at_incidence():
-    """前三条过, 入射角失败 (相机沿切线方向看)."""
-    vp = Viewpoint(pos=[-0.4, 0, 0], dir=[1, 0, 0], up=[0, 0, 1])
-    p_seam = np.zeros(3)
-    tangent = np.array([1.0, 0, 0])  # 与视线平行 → 入射角 ≈ 0°
-    vm = _empty_free_map()
-    K = _intrin_default()
-    r = is_valid_observation(vp, p_seam, tangent, vm, K)
-    assert not r.valid
-    assert r.fail_reason == "incidence"
-    assert r.distance_ok and r.in_frustum_ok and r.line_of_sight_ok
 
 
 # ---------------------------------------------------------------------- ⑤ wedge
@@ -344,13 +291,13 @@ def test_is_valid_observation_with_wedge():
     """主函数: 4 条都过 + wedge 失败, 返回 invalid (fail_reason=wedge)."""
     p_seam, _, vm, intrin = make_test_setup()
     sl = _example_seam_limits_90()
-    # cam 在 wedge 错侧 (-x +z 跨过边界), 距离 ok, frustum ok, LOS ok, incidence ok
+    # cam 在 wedge 错侧 (-x +z 跨过边界), 距离 ok, frustum ok, LOS ok
     vp = Viewpoint(pos=np.array([-0.4, 0, 0.4]), dir=np.array([1, 0, -1]),
                    up=np.array([0, 0, 1]))
     r = is_valid_observation(vp, p_seam, _tangent_y(), vm, intrin, seam_limits=sl)
     assert not r.valid
     assert r.fail_reason == "wedge"
-    assert r.distance_ok and r.in_frustum_ok and r.line_of_sight_ok and r.incidence_ok
+    assert r.distance_ok and r.in_frustum_ok and r.line_of_sight_ok
 
 
 def test_is_valid_observation_skips_wedge_when_none():

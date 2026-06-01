@@ -36,7 +36,6 @@ from phase1.observation_check import (
     Viewpoint,
     check_distance,
     check_in_frustum,
-    check_incidence,
     check_line_of_sight,
     check_seam_wedge,
 )
@@ -185,30 +184,42 @@ def main():
         tgt_biases[i] = target_bias(pos, cam_dir, seam.p_weld)
         totals[i] = cfg.w_vol * vol_gains[i] + cfg.w_target * tgt_biases[i]
 
-        # M1.3 合格观测检查 (用 optimistic LOS: unknown 不当障碍, 只 occupied 挡)
-        # 这是 viz 用的简化, M1.7 真实运行可能 strict
+        # M1.3 合格观测检查
+        # viz 用 mesh ray-cast 做 ground-truth LOS (绕过体素离散化精度问题)
+        # M1.7 实战会用 voxel LOS, 这里 viz 看几何真实
         if not args.no_validity_filter:
             vp = Viewpoint(pos=pos, dir=cam_dir, up=cam_up)
             d_ok, _ = check_distance(vp, seam.p_weld, args.d_min, args.d_max)
             f_ok = check_in_frustum(vp, seam.p_weld, K) if d_ok else False
-            l_ok = check_line_of_sight(vp, seam.p_weld, vm,
-                                        unknown_as_block=args.strict_los) \
-                   if (d_ok and f_ok) else False
-            i_ok, _ = check_incidence(vp, seam.p_weld, seam.tangent, 30.0, 90.0) \
-                      if (d_ok and f_ok and l_ok) else (False, 0.0)
-            # ⑤ wedge (新加): 用 seam.seam_limits[mid] + tangent
-            if d_ok and f_ok and l_ok and i_ok:
+            # mesh-based LOS: 视线到 P_weld 之前不能撞 mesh
+            l_ok = False
+            if d_ok and f_ok:
+                rel = seam.p_weld - pos
+                dist_full = np.linalg.norm(rel)
+                dir_unit = rel / dist_full
+                locs, _, _ = sim.mesh.ray.intersects_location(
+                    ray_origins=pos.reshape(1, 3),
+                    ray_directions=dir_unit.reshape(1, 3),
+                    multiple_hits=True,
+                )
+                # 留 5mm 余量, 避免把 P_weld 自己的表面 hit 当障碍
+                n_blockers = sum(
+                    1 for loc in locs
+                    if np.linalg.norm(loc - pos) < dist_full - 0.005
+                )
+                l_ok = (n_blockers == 0)
+            # ④ wedge: 用 seam.seam_limits[mid] + tangent
+            if d_ok and f_ok and l_ok:
                 slim_mid = seam.seam_limits[seam.p_weld_idx]
                 w_ok, _ = check_seam_wedge(vp, seam.p_weld, slim_mid,
                                             tangent=seam.tangent)
             else:
                 w_ok = False
-            valid_flags[i] = d_ok and f_ok and l_ok and i_ok and w_ok
+            valid_flags[i] = d_ok and f_ok and l_ok and w_ok
             if not valid_flags[i]:
                 if not d_ok: fail_reasons[i] = "distance"
                 elif not f_ok: fail_reasons[i] = "frustum"
                 elif not l_ok: fail_reasons[i] = "line_of_sight"
-                elif not i_ok: fail_reasons[i] = "incidence"
                 else: fail_reasons[i] = "wedge"
         else:
             valid_flags[i] = True
@@ -216,7 +227,7 @@ def main():
     print(f"[gain] {args.n_candidates} candidates "
           f"({half} 朝目标 + {args.n_candidates - half} 随机朝向) "
           f"in {elapsed:.2f} s ({elapsed / args.n_candidates * 1000:.1f} ms/each)")
-    print(f"[validity] {valid_flags.sum()}/{args.n_candidates} 通过 4 条合格观测检查")
+    print(f"[validity] {valid_flags.sum()}/{args.n_candidates} 通过 合格观测检查")
     if not args.no_validity_filter:
         from collections import Counter
         c = Counter([r for r in fail_reasons if r])
@@ -253,7 +264,6 @@ def main():
         f_ok_ = check_in_frustum(vp_dbg, seam.p_weld, K)
         l_ok_strict = check_line_of_sight(vp_dbg, seam.p_weld, vm, True)
         l_ok_opt = check_line_of_sight(vp_dbg, seam.p_weld, vm, False)
-        i_ok_, ang_ = check_incidence(vp_dbg, seam.p_weld, seam.tangent, 30, 90)
         slim_dbg = seam.seam_limits[seam.p_weld_idx]
         w_ok_, mdot_ = check_seam_wedge(vp_dbg, seam.p_weld, slim_dbg,
                                          tangent=seam.tangent)
@@ -279,8 +289,7 @@ def main():
         print(f"  ③ LOS strict:     ok={l_ok_strict}")
         print(f"     LOS optimistic: ok={l_ok_opt}  (viz 用这个)")
         print(f"     trimesh ray-mesh: {len(locs)} hits, {n_hits_before_target} 在 P_weld 之前")
-        print(f"  ④ incidence:   ok={i_ok_}  angle={ang_:.1f}°")
-        print(f"  ⑤ wedge:       ok={w_ok_}  cos_to_bis - cos_half={mdot_:+.4f}")
+        print(f"  ④ wedge:       ok={w_ok_}  cos_to_bis - cos_half={mdot_:+.4f}")
         print(f"     gap_deg = {gap_deg:.1f}° (90°=L 形, <90°=锐角槽, >90°=钝角)")
         print(f"     d1={slim_dbg[0].round(3)}  d2={slim_dbg[1].round(3)}")
 
