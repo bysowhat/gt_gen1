@@ -41,7 +41,7 @@ bash setup_env.sh
 | `arm_kin.py` | M1.4 | ☑ |
 | `graph.py` | M1.5 | ☑ |
 | `gain.py` | M1.6 | ☑ |
-| `exploration.py` | M1.7 | ☐ |
+| `exploration.py` | M1.7 | ☑ |
 | `viz.py` | M1.7+ | ☐ |
-| `config.py` | M1.7 | ☐ |
+| `config.py` | M1.7 | ☑ |
 | `run_phase1.py` | M1.10 | ☐ |
