@@ -16,8 +16,8 @@ scene:                                  # 决策 C
 sensor:                                 # 决策 D + E
   mode: "self_raycast"                  # 自己对 mesh raycast，不依赖 Isaac 渲染
   max_depth_m: 3.0                      # raycast 深度上限 3 米（决策 D）
-  camera:                               # 左目相机（ur12e），参数来自 IsaacLab PinholeCameraCfg
-    name: "left"
+  camera:                               # 单个相机（无左右目），参数来自 IsaacLab PinholeCameraCfg
+    name: "camera"
     width: 960
     height: 540
     modalities: ["rgb", "depth"]
@@ -30,6 +30,8 @@ sensor:                                 # 决策 D + E
     # 推导像素内参 fx = focal_length * width / horizontal_aperture
     intrinsics: {fx: 477.4, fy: 477.4, cx: 480.0, cy: 270.0}
     # 安装：相对 Link6（注意不是 ee_link xiaoyu_tip_link）
+    # 【已可视化确认 2026-06-02】相机帧 = T_base_Link6 @ T(extrinsic_pos, extrinsic_quat_wxyz)
+    # 光学约定 OpenCV：+Z=视线朝前、+X 右、+Y 下；不套 USD 的 diag(1,-1,-1) 翻转
     mount_link: "Link6"
     extrinsic_pos: [-0.08318594, -0.01074588, 0.20808960]
     # 参考 ik_cam.py(L17) + gt_math.py：此 quat 按 (w,x,y,z) 解释（= cuRobo 约定，无需转换）
