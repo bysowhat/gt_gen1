@@ -1,0 +1,62 @@
+# GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
+
+robot:                                  # 决策 B
+  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
+  # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
+
+constraint:                             # 决策 A
+  scope: "whole_arm"                    # 整臂本体（整条臂扫掠体积 ⊆ FREE）
+
+scene:                                  # 决策 C
+  format: "obj_mesh"                    # 输入为 watertight .obj
+  example: "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj"
+  # 焊缝/目标位姿来源（hanfeng_* 字段）
+  weld_pkl_example: "/home/a/Datas/20251201/aligned_ifc_parts_7/BEAM_1GMGl500020p4pD3WmDJ8n_part.pkl"
+
+sensor:                                 # 决策 D + E
+  mode: "self_raycast"                  # 自己对 mesh raycast，不依赖 Isaac 渲染
+  max_depth_m: 3.0                      # raycast 深度上限 3 米（决策 D）
+  camera:                               # 左目相机（ur12e），参数来自 IsaacLab PinholeCameraCfg
+    name: "left"
+    width: 960
+    height: 540
+    modalities: ["rgb", "depth"]
+    # 针孔模型原始参数
+    focal_length: 4.01
+    focus_distance: 480.0
+    horizontal_aperture: 8.064
+    vertical_aperture: 4.5365
+    clipping_range: [1.0e-5, 1.0e3]     # 注意：实际 raycast 截断用 max_depth_m=3.0
+    # 推导像素内参 fx = focal_length * width / horizontal_aperture
+    intrinsics: {fx: 477.4, fy: 477.4, cx: 480.0, cy: 270.0}
+    # 安装：相对 Link6（注意不是 ee_link xiaoyu_tip_link）
+    mount_link: "Link6"
+    extrinsic_pos: [-0.08318594, -0.01074588, 0.20808960]
+    # 参考 ik_cam.py(L17) + gt_math.py：此 quat 按 (w,x,y,z) 解释（= cuRobo 约定，无需转换）
+    extrinsic_quat_wxyz: [0.67914898, -0.11969930, -0.21945439, -0.69012209]
+    reference: "/home/a/Projects/Github/kejian_benchmark/gt_benchmark_pose_fast"  # env/ik_cam.py, gt_math.py
+
+roi:                                    # 决策 H
+  mode: "reach_plus"                    # 机械臂可达范围再外扩
+  expand_m: 1.2
+  voxel_size_m: 0.02
+
+gt:                                     # 决策 G
+  format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定
+
+env:                                    # 决策 F
+  conda_env: "env_isaaclab"             # curobo 0.0.post1.dev24 / torch 2.7+cu128 / CUDA 可用
+
+# 以下参数留待对应步骤填实（先放占位/默认）
+params:
+  nbv:
+    k_lookahead: 6                      # B 取 P* 前方几个路点（Step 7）
+    standoff_d_m: [0.25, 0.35, 0.45]    # 站位距离档（Step 8）
+    n_view_dirs: 8                      # 每档观察方向数（Step 8）
+    lambda_cost: 0.0                    # 增益 vs 路径代价权重（Step 9）
+    version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
+  loop:
+    max_rounds: 200                     # 主循环最大轮次（Step 10）
+    stuck_rounds: 5                     # 连续无进展判卡死（Step 10）
+  swept:
+    interp_resolution_m: 0.01           # 扫掠体积插值精度（Step 6）
