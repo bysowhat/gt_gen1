@@ -1,4 +1,4 @@
-# GT 生成实现步骤（逐步追踪）
+# GT 生成实现步骤（逐步追踪） 
 
 实现 [`gt-generation-curobo-implementation.md`](./gt-generation-curobo-implementation.md)
 与 [`privileged-nbv.md`](./privileged-nbv.md) 的工程落地清单。
@@ -38,11 +38,18 @@
 
 ---
 
-## Step 1 — cuRobo 基础封装（IK + 规划，空世界）
+## Step 1 — cuRobo 基础封装（IK + 规划，空世界）  ✅ 已完成
 
-- [ ] 封装 `init_curobo / solve_ik / plan_to_pose / plan_to_config`
+- [x] 封装 `init_curobo / solve_ik / plan_to_pose / plan_to_config / fk`（`gt_gen/curobo_iface.py`）
 - **依赖**：Step 0
-- **验证**：空世界里从 `retract_config` 规划到目标位姿拿到平滑轨迹；IK 能解位姿。
+- **验证**：`scripts/verify_step1.py` → `STEP1_OK`（FK、IK 误差~0、plan_to_pose、plan_to_config 全过）。
+
+> ⚠️ **坑（已解决）**：MotionGen 内置 IK（`mg.solve_ik`/cuda-graph）对**远离 retract 的目标收敛差**
+> （位置误差 8–20cm），导致 `plan_single` 报 `IK_FAIL`。解决：handle 内建**专用多种子 IKSolver**
+> （`num_seeds=50`、`use_cuda_graph=False`、无世界，世界碰撞交给规划/扫掠检查），
+> `plan_to_pose` 改为 **IK→`plan_to_config`（关节空间规划）**。混用 `solve`/`solve_batch`
+> 会触发 cuda-graph "changing goal type" 报错，故 IK 统一用 `solve_batch`。
+> VOXEL 世界初始为全自由（ESDF=-max），Step 5 再灌障碍。
 
 ---
 
@@ -148,6 +155,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 ## 进度
 
 - [x] **Step 0** — 完成（`STEP0_OK`）
-- [ ] **Step 1** — 待开始（下一步）
+- [x] **Step 1** — 完成（`STEP1_OK`）
+- [ ] **Step 2** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。

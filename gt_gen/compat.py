@@ -37,3 +37,20 @@ def apply_warp_torch_shim() -> bool:
 
 # 导入即生效
 applied = apply_warp_torch_shim()
+
+
+def apply_trimesh_shim() -> bool:
+    """curobo geom/types.py 的 `import trimesh` 被注释掉了，但 get_trimesh_mesh 仍直接用
+    `trimesh.load(...)` → NameError。这里把 trimesh 注入 curobo.geom.types 命名空间。
+
+    须在 import curobo 之后调用（本函数会 import curobo.geom.types）。
+    """
+    try:
+        import trimesh
+        import trimesh.scene  # noqa: F401
+        import curobo.geom.types as ct
+        if not getattr(ct, "trimesh", None):
+            ct.trimesh = trimesh
+        return True
+    except Exception:
+        return False
