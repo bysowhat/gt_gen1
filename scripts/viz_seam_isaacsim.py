@@ -48,6 +48,7 @@ from helper import add_robot_to_scene  # noqa: E402  cuRobo 示例自带
 def main():
     data = np.load(args.traj, allow_pickle=True)
     positions = data["positions"]                       # (T,6)
+    positions = np.concatenate([positions, np.tile(positions[-1][None], (50,1))], axis=0)
     joint_names = [str(x) for x in data["joint_names"]]
     piece_pose_to_robot = np.asarray(data["piece_pose_to_robot"], dtype=float)
     robot_pos = np.asarray([0,0,0,1,0,0,0], dtype=float)
@@ -72,6 +73,19 @@ def main():
                 orientation=(piece_pose_to_robot[3:7]).tolist())
         except Exception as e:
             print("warn: 设置工件位姿失败:", e)
+        # 工件当纯视觉：关碰撞（机械臂直接穿过）+ 关刚体（不被推/不掉落，位姿恒定）
+        try:
+            from pxr import Usd, UsdPhysics
+            import omni.usd
+            stage = omni.usd.get_context().get_stage()
+            wp_prim = stage.GetPrimAtPath("/World/workpiece")
+            for p in Usd.PrimRange(wp_prim):
+                if p.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(p).GetCollisionEnabledAttr().Set(False)
+                if p.HasAPI(UsdPhysics.RigidBodyAPI):
+                    UsdPhysics.RigidBodyAPI(p).GetRigidBodyEnabledAttr().Set(False)
+        except Exception as e:
+            print("warn: 禁用工件物理失败:", e)
     else:
         print("warn: 未找到工件 usd:", usd_obj, "（跳过工件显示）")
 
