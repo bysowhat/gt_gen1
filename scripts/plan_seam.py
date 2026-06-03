@@ -50,11 +50,22 @@ def main():
     print("robot_pos(world):", np.round(robot_pos, 4))
     print("target joint_angles:", np.round(target, 4))
 
-    mesh = Mesh(
-        name="workpiece",
-        file_path=obj_path,
-        pose=[piece_pose[0], piece_pose[1], piece_pose[2], piece_pose[3], piece_pose[4], piece_pose[5], piece_pose[6]],
-    )
+    # 工件相对机械臂基座位姿 = inv(T_world_robot) ∘ T_world_piece（cuRobo Pose, wxyz）
+    import torch
+    from curobo.types.math import Pose
+
+    def _pose(p7):
+        return Pose(
+            position=torch.tensor([p7[:3]], dtype=torch.float32, device="cuda"),
+            quaternion=torch.tensor([p7[3:7]], dtype=torch.float32, device="cuda"),
+        )
+
+    robot_pos_inv = _pose(robot_pos).inverse()
+    T_robot_piece = robot_pos_inv.multiply(_pose(piece_pose))
+    mesh_pose = T_robot_piece.get_pose_vector()[0].detach().cpu().numpy().tolist()
+    print("工件@机械臂基座 pose [x,y,z,qw,qx,qy,qz]:", np.round(mesh_pose, 4))
+
+    mesh = Mesh(name="workpiece", file_path=obj_path, pose=mesh_pose)
     world = WorldConfig(mesh=[mesh])
 
     print("\n== init_curobo（MESH 世界含工件；焊枪 link 排除碰撞）==")
@@ -62,7 +73,8 @@ def main():
     #                    collision_checker_type=CollisionCheckerType.MESH,
     #                    drop_collision_links=["xiaoyu_accessory_link"])
     h = ci.init_curobo(cfg, world_model=world,
-                       collision_checker_type=CollisionCheckerType.MESH)
+                       collision_checker_type=CollisionCheckerType.MESH,
+                       drop_collision_links=["xiaoyu_accessory_link"])
 
     retract = cfg.retract_config
     print("\n== plan_to_config: retract -> joint_angles ==")
@@ -81,7 +93,7 @@ def main():
         joint_names=np.array(cfg.joint_names),
         retract=np.array(retract),
         target=np.array(target),
-        robot_pose=np.asarray(d["robot_pose"][0], dtype=float),
+        piece_pose_to_robot=mesh_pose,
         obj_path=obj_path,
         robot_usd=h.config.robot_cfg["robot_cfg"]["kinematics"]["usd_path"],
         dt=0.02,

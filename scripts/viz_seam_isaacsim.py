@@ -49,7 +49,8 @@ def main():
     data = np.load(args.traj, allow_pickle=True)
     positions = data["positions"]                       # (T,6)
     joint_names = [str(x) for x in data["joint_names"]]
-    robot_pos = np.asarray(data["robot_pose"], dtype=float)[:3]
+    piece_pose_to_robot = np.asarray(data["piece_pose_to_robot"], dtype=float)
+    robot_pos = np.asarray([0,0,0,1,0,0,0], dtype=float)
     obj_path = str(data["obj_path"])
     print("轨迹点数:", positions.shape, " 关节:", joint_names)
 
@@ -66,7 +67,9 @@ def main():
         add_reference_to_stage(usd_path=usd_obj, prim_path="/World/workpiece")
         try:
             from omni.isaac.core.prims import XFormPrim
-            XFormPrim("/World/workpiece").set_world_pose(position=(-robot_pos).tolist())
+            XFormPrim("/World/workpiece").set_world_pose(
+                position=(piece_pose_to_robot[:3]).tolist(),
+                orientation=(piece_pose_to_robot[3:7]).tolist())
         except Exception as e:
             print("warn: 设置工件位姿失败:", e)
     else:
