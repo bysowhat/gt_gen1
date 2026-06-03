@@ -51,7 +51,6 @@ def main():
     positions = np.concatenate([positions, np.tile(positions[-1][None], (50,1))], axis=0)
     joint_names = [str(x) for x in data["joint_names"]]
     piece_pose_to_robot = np.asarray(data["piece_pose_to_robot"], dtype=float)
-    robot_pos = np.asarray([0,0,0,1,0,0,0], dtype=float)
     obj_path = str(data["obj_path"])
     print("轨迹点数:", positions.shape, " 关节:", joint_names)
 

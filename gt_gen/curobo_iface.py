@@ -57,6 +57,8 @@ def init_curobo(
     world_model: Optional[Any] = None,
     collision_checker_type: Optional[Any] = None,
     drop_collision_links: Optional[Sequence[str]] = None,
+    position_threshold: float = 0.005,
+    rotation_threshold: float = 0.05,
 ) -> CuroboHandle:
     """初始化 MotionGen + warmup。
 
@@ -64,6 +66,9 @@ def init_curobo(
     可传 world_model（如含 obj mesh 的 WorldConfig）+ collision_checker_type 覆盖。
     drop_collision_links：从碰撞检查中剔除的 link（如焊枪 xiaoyu_accessory_link，
         允许其接触工件——焊接接触是预期的，机械臂本体仍避障）。
+    position_threshold：位置收敛门限（米，默认 5mm）。
+    rotation_threshold：朝向收敛门限（四元数测度，默认 0.05；越大越松）。
+        注意 cuRobo 在 position_threshold<=1mm 时会自动收紧，别设太小。
     """
     from curobo.types.base import TensorDeviceType
     from curobo.geom.sdf.world import CollisionCheckerType
@@ -117,6 +122,8 @@ def init_curobo(
         ta,
         collision_checker_type=checker,
         interpolation_dt=interpolation_dt,
+        position_threshold=position_threshold,
+        rotation_threshold=rotation_threshold,
     )
     mg = MotionGen(mg_cfg)
     mg.warmup(warmup_js_trajopt=False)
@@ -127,6 +134,8 @@ def init_curobo(
         robot_cfg, None, num_seeds=50,
         self_collision_check=True, self_collision_opt=True,
         use_cuda_graph=False, tensor_args=ta,
+        position_threshold=position_threshold,
+        rotation_threshold=rotation_threshold,
     )
     ik = IKSolver(ik_cfg)
 

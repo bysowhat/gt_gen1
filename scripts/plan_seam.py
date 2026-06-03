@@ -27,6 +27,39 @@ def find_obj(seam_path):
     raise FileNotFoundError(f"no obj in {d}")
 
 
+def seam_ee_pose(d, index=None):
+    """焊缝几何 -> 末端目标位姿（机械臂基座系）。返回 (pos[3], quat_wxyz[4])。
+
+    - 位置 = 焊缝中点（seam_line[middle]）。
+    - 接近轴（末端 x 轴）= -normalize(dir1+dir2)，即相交两面的角平分方向
+      （与 FK(joint_angles) 实测一致：末端 x 轴·角平分线 = -1）。
+    - 绕接近轴的自转(roll)是自由 DOF，这里用 seam_tangent 对齐作规范选择。
+    seam_line/seam_tangent/seam_limits 都在世界系，按 robot_pose 换算到基座系。
+    """
+    from scipy.spatial.transform import Rotation as Rsp
+
+    line = np.asarray(d["seam_line"], float)         # (N,3) world
+    tang = np.asarray(d["seam_tangent"], float)      # (N,3) world
+    limits = np.asarray(d["seam_limits"], float)     # (N,2,3) world
+    i = int(d.get("middle", len(line) // 2)) if index is None else index
+
+    rp = np.asarray(d["robot_pose"][0], float)       # [x,y,z,qw,qx,qy,qz]
+    Rwr = Rsp.from_quat(np.r_[rp[4:7], rp[3]]).as_matrix()   # wxyz -> xyzw
+    to_base_p = lambda p: Rwr.T @ (p - rp[:3])
+    to_base_v = lambda v: Rwr.T @ v
+
+    pos = to_base_p(line[i])
+    t = to_base_v(tang[i]); t /= np.linalg.norm(t)
+    d1 = to_base_v(limits[i, 0]); d2 = to_base_v(limits[i, 1])
+    bis = d1 + d2; bis /= np.linalg.norm(bis)
+    x = -bis                                          # 接近轴
+    y = t - np.dot(t, x) * x; y /= np.linalg.norm(y)  # 去掉沿 x 分量，对齐切向
+    z = np.cross(x, y)
+    R = np.column_stack([x, y, z])
+    q_xyzw = Rsp.from_matrix(R).as_quat()
+    return pos.tolist(), np.r_[q_xyzw[3], q_xyzw[:3]].tolist()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seam", default=DEFAULT_SEAM)
@@ -41,6 +74,8 @@ def main():
 
     cfg = load_config()
     d = pickle.load(open(args.seam, "rb"))
+    goal_pose = seam_ee_pose(d)
+
     target = np.asarray(d["joint_angles"], dtype=float).tolist()
     robot_pos = np.asarray(d["robot_pose"][0], dtype=float)
     piece_pose = np.asarray(d['piece_pose'][0], dtype=float)
@@ -72,13 +107,30 @@ def main():
     # h = ci.init_curobo(cfg, world_model=world,
     #                    collision_checker_type=CollisionCheckerType.MESH,
     #                    drop_collision_links=["xiaoyu_accessory_link"])
+    '''
+        ┌────────────────────┬────────────┐
+        │ rotation_threshold │ 对应角度 θ │
+        ├────────────────────┼────────────┤
+        │ 0.05（默认）        │ ≈ 5.7°     │
+        ├────────────────────┼────────────┤
+        │ 0.1                │ ≈ 11.5°    │
+        ├────────────────────┼────────────┤
+        │ 0.2                │ ≈ 23.1°    │
+        ├────────────────────┼────────────┤
+        │ 0.3                │ ≈ 34.9°    │
+        ├────────────────────┼────────────┤
+        │ 0.5                │ ≈ 60°      │
+        └────────────────────┴────────────┘
+    '''
     h = ci.init_curobo(cfg, world_model=world,
                        collision_checker_type=CollisionCheckerType.MESH,
-                       drop_collision_links=["xiaoyu_accessory_link"])
+                       drop_collision_links=["xiaoyu_accessory_link"],
+                       position_threshold=0.02, rotation_threshold=0.3)
 
     retract = cfg.retract_config
-    print("\n== plan_to_config: retract -> joint_angles ==")
-    res = ci.plan_to_config(h, retract, target, max_attempts=args.max_attempts)
+    print("\n== plan_to_pose: retract -> 焊缝几何位姿 ==")
+    # res = ci.plan_to_config(h, retract, target, max_attempts=args.max_attempts)
+    res = ci.plan_to_pose(h, retract, goal_pose, max_attempts=args.max_attempts)
     ok = res is not None and bool(res.success.item())
     print("success:", ok, " status:", getattr(res, "status", None))
     if not ok:
