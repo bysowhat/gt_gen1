@@ -121,23 +121,34 @@ def main():
         ├────────────────────┼────────────┤
         │ 0.5                │ ≈ 60°      │
         └────────────────────┴────────────┘
+        │ 1.0                │ ≈ 180°      │
+        └────────────────────┴────────────┘
     '''
     h = ci.init_curobo(cfg, world_model=world,
                        collision_checker_type=CollisionCheckerType.MESH,
                     #    drop_collision_links=["xiaoyu_accessory_link"],
-                       position_threshold=0.05, rotation_threshold=0.3)
-
-    # goal_pose 对应的关节角（对 goal_pose 解 IK；用 h.ik 多种子求解器）
-    goal_cfg = ci.ik_best_config(h, ci.solve_ik(h, goal_pose))
+                       position_threshold=0.05, rotation_threshold=0.5)
 
     retract = cfg.retract_config
+    metric = ci.free_pose_metric(h, free_rot=(0,))      # 放开焊枪绕接近轴自转
+
+    # goal_pose 对应的关节角（与规划用同一 metric，便于失败时诊断终点）
+    goal_cfg = ci.ik_best_config(h, ci.solve_ik(h, goal_pose, pose_cost_metric=metric))
+
     print("\n== plan_to_pose: retract -> 焊缝几何位姿 ==")
     # res = ci.plan_to_config(h, retract, target, max_attempts=args.max_attempts)
-    res = ci.plan_to_pose(h, retract, goal_pose, max_attempts=args.max_attempts)
+    res = ci.plan_to_pose(h, retract, goal_pose,
+                          max_attempts=args.max_attempts,
+                          pose_cost_metric=metric)
+    # res = ci.plan_to_pose2(h, retract, goal_pose, max_attempts=args.max_attempts)
+
     ok = res is not None and bool(res.success.item())
     print("success:", ok, " status:", getattr(res, "status", None))
     if not ok:
-        print("PLAN_FAIL")
+        if goal_cfg is None:
+            print("PLAN_FAIL: IK 解不出 goal_pose（无终点可检查）")
+        else:
+            print("PLAN_FAIL:", ci.explain_endpoints(h, retract, goal_cfg))
         return
 
     traj = res.get_interpolated_plan()

@@ -172,6 +172,24 @@ def plan_to_config(motion_gen, start_cfg, goal_cfg):
     ...  # 【按版本核对】是否有 plan_single 的 joint-goal 形式
 ```
 
+#### IK 多种子与多解轮询（`num_seeds` / `return_seeds`）
+
+实现上 `plan_to_pose` 没有直接用 `motion_gen.plan_single(pose)`（其内置 IK 对远离 retract 的目标收敛差，易 `IK_FAIL`），而是走 **自建多种子 IKSolver 求解 → 关节空间规划**，并对多个 IK 解做轮询。两个关键参数：
+
+| 参数 | 位置 | 含义 | cuRobo 默认 | 本项目取值 |
+|---|---|---|---|---|
+| `num_seeds` | `init_curobo` 建 `IKSolverConfig` 时 | 每个 IK 问题**并行优化的随机起点数** | 100 | **100** |
+| `return_seeds` | `plan_to_pose(num_solutions=...)` → `solve_ik(return_seeds=...)` | IK **返回前几个**收敛解（按位置误差升序） | 1 | **100** |
+
+约束：`return_seeds ≤ num_seeds`（cuRobo 内部若 `return_seeds>num_seeds` 会自动把 `num_seeds` 顶上去）。
+
+工作机制与坑：
+
+- **多种子**：cuRobo IK = 随机撒 `num_seeds` 个起始构型 → 各自梯度优化 → 取最好的 `return_seeds` 个返回。一个末端位姿有多组 IK 解（肘/腕翻转、放开 roll 后更多），多撒种子才能覆盖到。
+- **跨调用随机**：起点由伪随机生成器产生，其状态在每次 `solve_batch` 调用间推进，所以**同一 `goal_pose` 连续解多次，返回的解集/数量都会变**。对工作空间边缘、误差卡在阈值边缘的目标（如某些 seam），"过阈值的成功解数"会在 0 上下抖动 → 偶发 IK 无解。**调大 `num_seeds` 是缓解此抖动的主要手段**。
+- **多解轮询**：`plan_to_pose` 取所有 `success=True` 的解按误差升序，**逐个**送 `plan_to_config`，第一个规划成功即返回；避免"只挑位置误差最小的那一个解、恰好不可达/碰撞"。注意被 `position_threshold`/`rotation_threshold` 判失败的 near-miss 解会被 `ik_configs` 过滤掉、不参与轮询。
+- **放开 roll**：焊接时焊枪绕接近轴自转是自由 DOF，用 `free_pose_metric(free_rot=(0,))` 传入 `pose_cost_metric`，只放开末端 x 轴旋转、其余精确约束，能显著提高 IK 收敛与可达解数量。
+
 ---
 
 ## 6. 主循环（GT 生成，你写）
