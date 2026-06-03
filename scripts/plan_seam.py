@@ -124,13 +124,13 @@ def main():
     '''
     h = ci.init_curobo(cfg, world_model=world,
                        collision_checker_type=CollisionCheckerType.MESH,
-                       drop_collision_links=["xiaoyu_accessory_link"],
+                    #    drop_collision_links=["xiaoyu_accessory_link"],
                        position_threshold=0.02, rotation_threshold=0.3)
 
     retract = cfg.retract_config
     print("\n== plan_to_pose: retract -> 焊缝几何位姿 ==")
-    # res = ci.plan_to_config(h, retract, target, max_attempts=args.max_attempts)
-    res = ci.plan_to_pose(h, retract, goal_pose, max_attempts=args.max_attempts)
+    res = ci.plan_to_config(h, retract, target, max_attempts=args.max_attempts)
+    # res = ci.plan_to_pose(h, retract, goal_pose, max_attempts=args.max_attempts)
     ok = res is not None and bool(res.success.item())
     print("success:", ok, " status:", getattr(res, "status", None))
     if not ok:
