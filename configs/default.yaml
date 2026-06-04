@@ -38,10 +38,13 @@ sensor:                                 # 决策 D + E
     extrinsic_quat_wxyz: [0.67914898, -0.11969930, -0.21945439, -0.69012209]
     reference: "/home/a/Projects/Github/kejian_benchmark/gt_benchmark_pose_fast"  # env/ik_cam.py, gt_math.py
 
-roi:                                    # 决策 H
-  mode: "reach_plus"                    # 机械臂可达范围再外扩
-  expand_m: 1.2
-  voxel_size_m: 0.02
+roi:                                    # 决策 H —— ROI 盒（单一来源；init_curobo 与 build_roi_voxmap 都读这里）
+  # 由整臂可达工作空间实测（20000 随机关节角的碰撞球包围盒）+ 余量取整得到，见
+  # docs/implementation-steps.md「ROI 标定」。两网格(voxmap / cuRobo voxel 世界)同框、不再各填默认。
+  mode: "measured_box"                  # ROI 直接由 center/dims 给定（不再用 reach+expand 推算）
+  center: [0.1, 0.0, 0.65]              # ROI 盒中心（base 系，米）
+  dims: [3.8, 3.9, 3.6]                 # ROI 盒尺寸（米）
+  voxel_size_m: 0.04                    # 体素边长（米）
 
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定

@@ -110,19 +110,40 @@ def observe_and_update(voxmap, cam_pose, truth_scene):
 ```
 
 ### 4.2 把三态图同步进 cuRobo 碰撞世界（桶 C，核心接入点）
+
+> ✅ **已实现**：`gt_gen/collision_sync.py::sync_collision_world(handle, voxmap)`。
+> cuRobo VOXEL 世界用 **ESDF**（带符号距离场，约定**占据为正、自由为负**；初始全自由
+> = `-max_esdf_distance`）。同步流程：① 取 cuRobo voxel 中心(base 系)；② 在 voxmap 查三态，
+> **非 FREE = 占据**；③ `scipy.ndimage.distance_transform_edt` 从占据掩码算带符号 ESDF
+> （`d_in - d_out`，比二值填充有梯度，利于规划）；④ `update_voxel_data` 写回。
+
+**两套网格不是同一个东西**——一套是我维护的 `voxmap`，另一套是 cuRobo 内部的 voxel 碰撞网格。
+它们都覆盖大致同一块 ROI，但**各自独立离散化**。要把 voxmap 的占据状态传给 cuRobo，有两种做法：
+
+**① 按下标对齐（未采用）**
+假设 `voxmap[i,j,k]` 和 cuRobo 的 `voxel[i,j,k]` 是同一个格子，直接把整个数组拷过去。
+- 前提苛刻：两套网格必须**形状完全相同**、每个格子的**物理中心也完全重合**。
+- 任何一处不符就会**整体错位**——把 (i,j,k) 的占据贴到空间上另一个位置的格子上，碰撞世界全乱。
+
+**② 按中心查表（已采用）**
+不假设下标对应。对 cuRobo 的**每一个**体素，取它的**中心世界坐标** `p`，反过来问 voxmap：
+「`p` 这个点你那边是什么状态？」
 ```python
-def sync_collision_world(motion_gen, voxmap):
-    # 悲观：非 FREE（OCCUPIED ∪ UNKNOWN）= 占据
-    occ = (voxmap != FREE)
-    # 【按版本核对】通过 motion_gen.world_coll_checker 更新 voxel 占据/ESDF
-    motion_gen.world_coll_checker.update_voxel_data(occ, ...)
-    # 或重建 WorldConfig 后 motion_gen.update_world(world_cfg)
+centers = cuRobo 体素中心 (base 系)                      # vg.create_xyzr_tensor(transform_to_origin=True)
+states  = voxmap.get(voxmap.world_to_voxel(centers))     # 按世界坐标查（空间查询，非下标拷贝）
+occ     = (states != FREE)                               # 非 FREE = 占据
 ```
+这是**空间位置查询**，不是数组下标拷贝。好处：
+- 两套网格**分辨率/范围/中心都无需逐一相等**（cuRobo 每轴 `1+floor(dim/voxel)`，voxmap 用 `round`，
+  例如 `dim=2,voxel=0.02` → cuRobo 101³ vs voxmap 100³，差一也不影响）；
+- cuRobo 边缘多出的体素中心若**落在 voxmap 范围外**，`voxmap.get` 按约定返回 `UNKNOWN` → 当占据，
+  落在**保守安全**的一侧（地图外宁可当障碍挡住，绝不误当自由放行）。
 
 > 这是 cuRobo 与 MoveIt 的唯一接入差异点：voxel 世界让你**逐体素**设占据，
 > 实现「未知=障碍」干净直接。
 
 ---
+
 
 ## 5. 探索大脑原语（你写）
 

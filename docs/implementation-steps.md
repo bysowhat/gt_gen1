@@ -23,7 +23,38 @@
       装在 **Link6**，pos+quat(**wxyz**) 见 `configs/default.yaml`；参考 `kejian_benchmark/gt_benchmark_pose_fast`
 - [x] **决策 F**：`env_isaaclab`（curobo 0.0.post1.dev24 / torch 2.7+cu128 / CUDA ✓）
 - [x] **决策 G**：用本项目**自定义** GT 格式（不沿用 traj.pkl），schema 在 Step 11 定
-- [x] **决策 H**：ROI = 可达范围 + 1.2 m，分辨率 2 cm
+- [x] **决策 H**：ROI = 整臂可达工作空间实测包围盒 + 余量（见下「ROI 标定」），分辨率 4 cm
+
+### ROI 标定（决策 H 落实）
+
+**实测**（20000 个随机关节角，整臂碰撞球的 base 系包围盒）：
+
+| 轴 | 整臂可达范围(含球半径) | 跨度 |
+|-----|------------------------|--------|
+| x   | −1.61 → 1.84 m         | 3.45 m |
+| y   | −1.80 → 1.85 m         | 3.65 m |
+| z   | −0.98 → 2.29 m         | 3.28 m |
+
+- 距 base 最大半径 ≈ **2.30 m**（末端最远可达 2.33 m，z 最高 2.32 → 焊缝 z=1.78 在可达范围内 ✓）。
+- 关节限位受限（非整圈）：j1∈[−0.78,3.92]、j2∈[−2.60,0.36]、j3∈[−0.08,2.54]、j4∈[−3.30,−0.25]……
+  所以可达区不是完整球，而是约 **3.5×3.6×3.3 m** 的盒子。
+
+**确定的 ROI**（实测包围盒 + ~0.15–0.2 m 余量取整）：
+
+```yaml
+roi:
+  center: [0.1, 0.0, 0.65]     # base 系，米
+  dims:   [3.8, 3.9, 3.6]      # 米
+  voxel_size_m: 0.04
+```
+
+- 覆盖检查：x 0.1±1.9=[−1.8,2.0] ⊇[−1.61,1.84] ✓；y ±1.95 ⊇[−1.80,1.85] ✓；z 0.65±1.8=[−1.15,2.45] ⊇[−0.98,2.29] ✓。
+- 体素数 ≈ 95×98×90 ≈ **0.84M**（voxel=0.04；uint8 <1 MB），sync 的 ESDF 距离变换 <1 s。
+  （0.02 m 会到 ~6.7M、sync 偏慢；焊接精度要求高时可再调细。）
+
+**单一 ROI 来源**：`roi.center/dims/voxel_size_m` 是唯一事实来源，`init_curobo` 的 cuRobo voxel
+世界与 `build_roi_voxmap` 都从它读 → 两网格**同框**（`build_roi_voxmap` 默认再外扩 1 体素，
+包住 cuRobo 每轴 `1+floor(dim/voxel)` 的"+1"边界层）。已验证同框下 voxmap↔cuRobo 占据 100% 吻合、差 0。
 
 **产出**：`configs/default.yaml`、`gt_gen/`（各步函数桩 + `config.py` + `compat.py`）、
 `scripts/verify_step0.py`。
@@ -103,11 +134,22 @@
 
 ---
 
-## Step 5 — voxmap → cuRobo 碰撞世界同步（未知=障碍）
+## Step 5 — voxmap → cuRobo 碰撞世界同步（未知=障碍）  ✅ 已完成
 
-- [ ] `sync_collision_world`：把「OCCUPIED ∪ UNKNOWN」灌进 cuRobo voxel 碰撞世界
+- [x] `sync_collision_world`：把「OCCUPIED ∪ UNKNOWN」灌进 cuRobo voxel 碰撞世界
+      （`gt_gen/collision_sync.py`）
 - **依赖**：Step 1、2
-- **验证**：伸进 UNKNOWN 的构型判碰撞；该区观测变 FREE 后同构型变无碰撞。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step5.py` → `STEP5_OK`
+      （全 UNKNOWN 同步 → retract/q2 均判碰撞；标 FREE retract 区 → retract 无碰撞、q2 仍碰撞；
+      再标 FREE q2 区 → q2 无碰撞）。
+
+> **实现**：cuRobo VOXEL 世界用 **ESDF**（带符号距离场，约定**占据为正、自由为负**，
+> 见 `WorldVoxelCollision.get_sphere_distance(compute_esdf)`；初始全自由 = `-max_esdf_distance`）。
+> `sync_collision_world`：① 取 cuRobo voxel 中心(base 系，`create_xyzr_tensor(transform_to_origin)`)；
+> ② 在 voxmap 查三态，**非 FREE = 占据**；③ `scipy.ndimage.distance_transform_edt` 从占据掩码算
+> 带符号 ESDF（`d_in - d_out`，比二值填充有梯度，利于规划）；④ `update_voxel_data` 写回。
+> 按**中心查表**而非按下标对齐，故 voxmap 与 cuRobo 网格分辨率/范围无需逐一相等（cuRobo 每轴
+> `1+floor(dim/voxel)`，voxmap 用 `round`，差一不影响）。全占据/全自由有快捷分支。
 
 ---
 
@@ -185,6 +227,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 - [x] **Step 2** — 完成（`STEP2_OK`）
 - [x] **Step 3** — 完成（`STEP3_OK`）
 - [x] **Step 4** — 完成（`STEP4_OK`）
-- [ ] **Step 5** — 待开始（下一步）
+- [x] **Step 5** — 完成（`STEP5_OK`）
+- [ ] **Step 6** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。

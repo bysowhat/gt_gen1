@@ -132,16 +132,16 @@ class ThreeStateVoxelMap:
         return self.voxel_to_world(ii)
 
 
-def build_roi_voxmap(config, reach_radius: float,
-                     center: Optional[Sequence[float]] = None) -> ThreeStateVoxelMap:
-    """按 ROI = 可达范围 + expand_m、分辨率 voxel_size_m 构建空地图（全 UNKNOWN）。
+def build_roi_voxmap(config, margin_voxels: int = 1) -> ThreeStateVoxelMap:
+    """按 config.roi（单一 ROI 来源：center/dims/voxel_size_m）构建空地图（全 UNKNOWN）。
 
-    ROI 取以 `center`（默认 base 原点）为中心、半边长 = reach_radius + expand_m 的立方体。
-    保守：多出的（如地面以下）体素永远观测不到、保持 UNKNOWN，不影响正确性。
+    与 init_curobo 的 cuRobo voxel 世界**同框**（同 center/dims/voxel）。额外向外扩 margin_voxels
+    个体素，使 voxmap 比 cuRobo 网格稍大，包住其每轴 `1+floor(dim/voxel)` 多出的"+1"边界层
+    （否则那层落在 voxmap 外 → 越界判 UNKNOWN→占据，在 ROI 边界形成多余"墙"）。
     """
-    half = float(reach_radius) + config.roi_expand_m
     vs = config.voxel_size_m
-    c = np.zeros(3) if center is None else np.asarray(center, dtype=np.float64).reshape(3)
-    origin = c - half
-    size = np.full(3, 2.0 * half)
+    center = np.asarray(config.roi_center, dtype=np.float64).reshape(3)
+    dims = np.asarray(config.roi_dims, dtype=np.float64).reshape(3)
+    size = dims + 2.0 * margin_voxels * vs
+    origin = center - 0.5 * size
     return ThreeStateVoxelMap(origin=origin, size_xyz=size, voxel_size=vs)

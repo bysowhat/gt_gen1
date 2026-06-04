@@ -76,17 +76,16 @@ def main():
     assert occ_pts.shape == (c[OCCUPIED], 3)
     print("non_free_mask 与 counts 自洽 OK")
 
-    # 6) build_roi_voxmap（从 config 的 expand_m / voxel_size_m）
+    # 6) build_roi_voxmap（单一 ROI 来源：config.roi 的 center/dims/voxel_size_m）
     print("\n== build_roi_voxmap ==")
     cfg = load_config()
-    reach = 1.3  # UR12e 近似可达半径（占位，主循环里按实际传）
-    roi = build_roi_voxmap(cfg, reach_radius=reach)
-    half = reach + cfg.roi_expand_m
-    exp_n = int(round(2 * half / cfg.voxel_size_m))
-    print(f"reach={reach} expand={cfg.roi_expand_m} voxel={cfg.voxel_size_m} -> "
-          f"shape={roi.shape} (~{roi.num_voxels/1e6:.1f}M voxels)")
-    assert roi.shape == (exp_n, exp_n, exp_n), roi.shape
-    assert np.allclose(roi.center, [0, 0, 0]), "默认以 base 原点为中心"
+    roi = build_roi_voxmap(cfg)                        # 默认外扩 1 体素
+    dims = np.asarray(cfg.roi_dims); vs = cfg.voxel_size_m
+    exp = tuple(int(round((dims[k] + 2 * vs) / vs)) for k in range(3))
+    print(f"roi center={cfg.roi_center} dims={cfg.roi_dims} voxel={vs} -> "
+          f"shape={roi.shape} (~{roi.num_voxels/1e6:.2f}M voxels)")
+    assert roi.shape == exp, (roi.shape, exp)
+    assert np.allclose(roi.center, cfg.roi_center, atol=vs), (roi.center, cfg.roi_center)
     assert roi.counts()[UNKNOWN] == roi.num_voxels
 
     # 7) 可视化（可选）：交互式 3D 窗口（可旋转/缩放）

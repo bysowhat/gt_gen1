@@ -108,8 +108,8 @@ def init_curobo(
     robot_cfg = rd["robot_cfg"]
 
     vs = float(config.voxel_size_m)
-    dims = list(roi_dims) if roi_dims is not None else [3.0, 3.0, 3.0]
-    center = list(roi_center) if roi_center is not None else [0.0, 0.0, 1.0]
+    dims = list(roi_dims) if roi_dims is not None else list(config.roi_dims)
+    center = list(roi_center) if roi_center is not None else list(config.roi_center)
     pose = center + [1.0, 0.0, 0.0, 0.0]
 
     if world_model is not None:

@@ -62,8 +62,18 @@ class Config:
         return float(self.raw["roi"]["voxel_size_m"])
 
     @property
+    def roi_center(self) -> list:
+        """ROI 盒中心（base 系，米）——单一 ROI 来源。"""
+        return list(self.raw["roi"]["center"])
+
+    @property
+    def roi_dims(self) -> list:
+        """ROI 盒尺寸（米）——单一 ROI 来源。"""
+        return list(self.raw["roi"]["dims"])
+
+    @property
     def roi_expand_m(self) -> float:
-        return float(self.raw["roi"]["expand_m"])
+        return float(self.raw["roi"].get("expand_m", 0.0))
 
     # ---- cuRobo IK / 规划 ----
     @property
