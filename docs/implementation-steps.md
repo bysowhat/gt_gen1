@@ -69,11 +69,21 @@
 
 ---
 
-## Step 3 — 传感器模拟（raycast 真值场景）
+## Step 3 — 传感器模拟（raycast 真值场景）  ✅ 已完成
 
-- [ ] 给定相机位姿 + 内参 + 真值场景，raycast 出穿过/命中体素
+- [x] 给定相机位姿 + 内参 + 真值场景，raycast 出穿过/命中体素
+      （`gt_gen/sensor.py`：`load_camera_model` / `build_kinematics` / `link6_pose` /
+      `camera_pose_from_config` / `load_truth_scene` / `raycast_observe`）
 - **依赖**：Step 0
-- **验证**：简单场景里 raycast 结果（FREE / 命中 OCCUPIED）符合预期。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step3.py [--viz]` → `STEP3_OK`
+      （合成墙场景：大墙全命中 occ z≈D / free z<D / 都在 max_depth；max_depth 截断无命中；
+      小墙部分命中；`camera_pose_from_config` 的 R 正交·det=1·相机-Link6 偏移=外参模长）。
+
+> **设计**：`raycast_observe` 是**纯几何**（相机位姿 4x4 + 内参 + base 系 trimesh），输出
+> base 系点 `(free_points, occ_points)`——free=各射线 near→min(命中距,max_depth) 前一格采样，
+> occ=命中距≤max_depth 的命中点；**体素化交给 Step 4**（故 Step 3 只依赖 Step 0、可独立快测）。
+> 射线方向 OpenCV 光学帧 `d=normalize([(u-cx)/fx,(v-cy)/fy,1])`→`R` 转 base；
+> 相机位姿 `T_base_cam = T_base_Link6 @ T(extrinsic)`，FK 用轻量 `CudaRobotModel`（不起 MotionGen）。
 
 ---
 
@@ -165,6 +175,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 - [x] **Step 0** — 完成（`STEP0_OK`）
 - [x] **Step 1** — 完成（`STEP1_OK`）
 - [x] **Step 2** — 完成（`STEP2_OK`）
-- [ ] **Step 3** — 待开始（下一步）
+- [x] **Step 3** — 完成（`STEP3_OK`）
+- [ ] **Step 4** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。
