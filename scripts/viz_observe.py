@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--out", default="/tmp/observe")
     ap.add_argument("--stride", type=int, default=10)
     ap.add_argument("--draw_free", action="store_true", help="同时画绿色 FREE 体素")
+    ap.add_argument("--seed", type=int, default=0, help="选不同的一组分开位姿")
     args = ap.parse_args()
 
     from gt_gen.config import load_config
@@ -141,9 +142,10 @@ def main():
     if len(cands) < 3:
         print("候选不足 3 个，放宽阈值/换 seam 重试"); return
 
-    # 最远点采样：选臂质心两两离得最开的 3 个
+    # 最远点采样：选相机端两两离得最开的 3 个；--seed 选不同起点 → 不同的一组关节角
     pos = np.array([c["cen"] for c in cands])
-    idx = [int(np.argmax(np.linalg.norm(pos - pos.mean(0), axis=1)))]
+    rank = np.argsort(-np.linalg.norm(pos - pos.mean(0), axis=1))   # 离质心由远到近
+    idx = [int(rank[args.seed % len(cands)])]
     while len(idx) < 3:
         dmin = np.min(np.linalg.norm(pos[:, None, :] - pos[idx], axis=2), axis=1)
         dmin[idx] = -1.0
@@ -156,14 +158,16 @@ def main():
         print(f"  位姿{i}: 相机端={np.round(c['cen'],3)} occ={c['occ']}")
     print(f"  相机端间距: {d01:.2f} / {d02:.2f} / {d12:.2f} m（固定底座，下半截必然重叠）")
 
-    # voxmap 只覆盖焊缝周边；3 位姿累积观测；同时记录各相机视野锥的可视深度
+    # voxmap 只覆盖焊缝周边；3 位姿累积观测。每个位姿的命中点单独留存(按相机颜色绘制)
+    from gt_gen.mapping import commit_observation
     half = 0.9
     vm = ThreeStateVoxelMap(origin=target - half, size_xyz=(2 * half,) * 3, voxel_size=cfg.voxel_size_m)
     print("\nvoxmap:", vm.shape, " 累积观测 3 个位姿 ...")
     zfars = []
     for c in chosen:
-        r = observe_and_update(vm, c["Tcam"], cm, scene, cm["max_depth"], pixel_stride=args.stride)
-        _, occ = sensor.raycast_observe(c["Tcam"], cm, scene, cm["max_depth"], pixel_stride=24)
+        free, occ = sensor.raycast_observe(c["Tcam"], cm, scene, cm["max_depth"], pixel_stride=args.stride)
+        r = commit_observation(vm, free, occ)
+        c["occ_pts"] = occ
         cp = c["Tcam"][:3, 3]
         zfars.append(float(np.median(np.linalg.norm(occ - cp, axis=1))) if occ.shape[0] else 0.8)
         print("  写入:", r)
@@ -176,23 +180,31 @@ def main():
     # 工件 mesh（浅灰，未观测处即裸露此色）
     work = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(np.asarray(scene.vertices)),
                                      o3d.utility.Vector3iVector(np.asarray(scene.faces)))
-    work.paint_uniform_color([0.75, 0.75, 0.75]); work.compute_vertex_normals()
+    work.paint_uniform_color([0.78, 0.78, 0.78]); work.compute_vertex_normals()
     geoms.append(("work", work, "defaultLit"))
-    # 被观测到的工件表面 = 红色 OCCUPIED 体素
-    occ_ctr = vm.state_centers(OCCUPIED)
-    if occ_ctr.shape[0]:
-        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(occ_ctr))
-        pc.paint_uniform_color([0.92, 0.12, 0.12])
-        geoms.append(("occ", pc, "defaultUnlit"))
     if args.draw_free:
         fp = vm.state_centers(FREE)
         if fp.shape[0] > 40000:
             fp = fp[np.linspace(0, fp.shape[0] - 1, 40000).astype(int)]
         pcf = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(fp))
-        pcf.paint_uniform_color([0.35, 0.8, 0.4])
+        pcf.paint_uniform_color([0.55, 0.85, 0.6])
         geoms.append(("free", pcf, "defaultUnlit"))
-    # 3 个位姿的机械臂碰撞球（3 色）+ 相机视野锥（同色）
+    # 3 个位姿：机械臂碰撞球 + 视野锥 + 被该相机观测到的表面点，三者同色
     for i, c in enumerate(chosen):
+        op = c["occ_pts"]
+        if op.shape[0]:
+            pco = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(op))
+            pco.paint_uniform_color(ARM_COLORS[i])
+            geoms.append((f"occ{i}", pco, "defaultUnlit"))
+            # 命中点 ↔ 相机光心 连线（同色，下采样避免糊）
+            cam_c = c["Tcam"][:3, 3]
+            sub = op if op.shape[0] <= 60 else op[np.linspace(0, op.shape[0] - 1, 60).astype(int)]
+            pts = np.vstack([cam_c, sub])
+            lines = [[0, k + 1] for k in range(sub.shape[0])]
+            ls = o3d.geometry.LineSet(o3d.utility.Vector3dVector(pts),
+                                      o3d.utility.Vector2iVector(lines))
+            ls.paint_uniform_color(ARM_COLORS[i])
+            geoms.append((f"rays{i}", ls, "unlitLine"))
         sph = fk_spheres(h, c["q"])
         merged = o3d.geometry.TriangleMesh()
         for s in sph:
@@ -215,7 +227,7 @@ def main():
         rd.scene.set_background([1, 1, 1, 1])
         for name, g, shader in geoms:
             mat = rendering.MaterialRecord(); mat.shader = shader
-            mat.point_size = 11.0 if name == "occ" else 6.0
+            mat.point_size = 11.0 if name.startswith("occ") else 6.0
             mat.line_width = 4.0
             rd.scene.add_geometry(name, g, mat)
         ctr = target

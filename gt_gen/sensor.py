@@ -133,14 +133,17 @@ def raycast_observe(camera_pose, camera_model, truth_scene, max_depth,
     nray = d_base.shape[0]
     origins = np.tile(org, (nray, 1))
 
+    # multiple_hits=True：取回每条射线【全部】交点，再在下面保留最近的一个。
+    # （trimesh 纯 Python 求交在 multiple_hits=False 时只给一个交点且不保证最近，
+    #  对工字梁等多层薄壁会误把远侧内壁当命中 → 必须自己挑最近。）
     locs, idx_ray, _ = truth_scene.ray.intersects_location(
-        origins, d_base, multiple_hits=False)
+        origins, d_base, multiple_hits=True)
 
     t_hit = np.full(nray, np.inf)
     hit_loc = np.zeros((nray, 3))
     if len(idx_ray):
         dist = np.linalg.norm(locs - origins[idx_ray], axis=1)
-        # 按距离降序写入 → 每条射线最近命中最后写、获胜（防 multiple_hits 残留）
+        # 按距离降序写入 → 每条射线最近命中最后写、获胜
         for k in np.argsort(dist)[::-1]:
             r = int(idx_ray[k])
             t_hit[r] = dist[k]
