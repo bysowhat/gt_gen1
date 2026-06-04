@@ -53,11 +53,19 @@
 
 ---
 
-## Step 2 — 三态体素地图数据结构
+## Step 2 — 三态体素地图数据结构  ✅ 已完成
 
-- [ ] ROI 网格 `FREE/OCCUPIED/UNKNOWN`；初始全 UNKNOWN；坐标互转；增删查
+- [x] ROI 网格 `FREE/OCCUPIED/UNKNOWN`；初始全 UNKNOWN；坐标互转；增删查
+      （`gt_gen/voxmap.py`：`ThreeStateVoxelMap` + `build_roi_voxmap`）
 - **依赖**：Step 0
-- **验证**：建图、set/get、坐标转换正确；能简单可视化。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step2.py [--viz]` → `STEP2_OK`
+      （建图/形状、2000 点坐标 round-trip、越界 get→UNKNOWN/set 跳过、单个+批量 set-get、
+      `non_free_mask` 与 `counts` 自洽、`build_roi_voxmap` 形状与中心；`--viz` 出 `/tmp/voxmap.png`）。
+
+> **约定**：坐标系 = 机械臂 `base_link`（与 cuRobo 规划世界一致，Step 5 同步最省事）；
+> `origin`=体素 [0,0,0] 最小角，`voxel_to_world` 返回体素**中心**；另暴露 `.center`
+> 供 Step 5 映射到 cuRobo 的 center-based VoxelGrid。越界 `get`→UNKNOWN（仍属非 FREE，保守）。
+> 所有查询/设置方法支持单个 `(3,)` 或批量 `(N,3)`。
 
 ---
 
@@ -156,6 +164,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 
 - [x] **Step 0** — 完成（`STEP0_OK`）
 - [x] **Step 1** — 完成（`STEP1_OK`）
-- [ ] **Step 2** — 待开始（下一步）
+- [x] **Step 2** — 完成（`STEP2_OK`）
+- [ ] **Step 3** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。
