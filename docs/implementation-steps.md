@@ -87,11 +87,19 @@
 
 ---
 
-## Step 4 — 观测更新 `observe_and_update`
+## Step 4 — 观测更新 `observe_and_update`  ✅ 已完成
 
-- [ ] 把 Step 3 结果合并进三态图（穿过→FREE，命中→OCCUPIED）
+- [x] 把 Step 3 结果合并进三态图（穿过→FREE，命中→OCCUPIED）
+      （`gt_gen/mapping.py`：`observe_and_update` + `commit_observation`）
 - **依赖**：Step 2、3
-- **验证**：一次观测后地图正确更新；多次可累积。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step4.py [--viz]` → `STEP4_OK`
+      （单次观测：occ 贴墙 z≈0.97 / free 在墙前 / 墙后仍 UNKNOWN；
+      再观测墙撤走：OCCUPIED 不降级、墙后 UNKNOWN→FREE、UNKNOWN 单调减少）。
+
+> **合并策略（OCCUPIED 粘滞，保守避障）**：occ 点无条件置 OCCUPIED（允许 UNKNOWN/FREE→OCC）；
+> free 点只把【当前非 OCCUPIED】体素置 FREE（绝不降级已知障碍）；单次观测内先 free 后 occ
+> 保证命中体素最终为 OCCUPIED。离散化下边界体素会被不同射线判定冲突，粘滞保证「宁可多障碍、绝不少障碍」。
+> `free_step` 默认取 `voxmap.voxel_size`（沿射线约每体素一采样）。
 
 ---
 
@@ -176,6 +184,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 - [x] **Step 1** — 完成（`STEP1_OK`）
 - [x] **Step 2** — 完成（`STEP2_OK`）
 - [x] **Step 3** — 完成（`STEP3_OK`）
-- [ ] **Step 4** — 待开始（下一步）
+- [x] **Step 4** — 完成（`STEP4_OK`）
+- [ ] **Step 5** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。
