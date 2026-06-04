@@ -153,11 +153,19 @@ roi:
 
 ---
 
-## Step 6 — 整臂扫掠体积 + `motion_stays_in_free`
+## Step 6 — 整臂扫掠体积 + `motion_stays_in_free`  ✅ 已完成
 
-- [ ] 算 `qi→qi+1` 整臂扫掠体积，判断是否 ⊆ FREE
+- [x] 算 `qi→qi+1` 整臂扫掠体积，判断是否 ⊆ FREE
+      （`gt_gen/swept.py`：`swept_volume` + `motion_stays_in_free`）
 - **依赖**：Step 2（+ 决策 A 的碰撞球配置）
-- **验证**：全在自由区的运动通过；伸进未知的被拒。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step6.py` → `STEP6_OK`
+      （全 UNKNOWN→运动被拒；扫掠体积标 FREE→通过；扫掠区放 1 个 OCCUPIED→又被拒；零位移自由→通过）。
+
+> **做法**：q_from→q_to 关节空间线性插值，子步数按"任一碰撞球单步位移 ≤ 分辨率"定（不漏体素，
+> 分辨率默认取 `voxmap.voxel_size`）；逐步批量 FK 整臂碰撞球（决策 A=whole_arm），每球**保守**覆盖
+> 其 AABB 与球相交的所有体素（中心到球心 ≤ r + 半个体素对角线）→ 并集 = 扫掠体积。
+> 判定：扫掠体积内**只要有一个非 FREE**（OCCUPIED 或 UNKNOWN，含越界按 UNKNOWN）→ 该段不通过。
+> 这是保守探索的核心闸门：只执行"整条臂扫掠体积已确认全自由"的运动。
 
 ---
 
@@ -228,6 +236,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 - [x] **Step 3** — 完成（`STEP3_OK`）
 - [x] **Step 4** — 完成（`STEP4_OK`）
 - [x] **Step 5** — 完成（`STEP5_OK`）
-- [ ] **Step 6** — 待开始（下一步）
+- [x] **Step 6** — 完成（`STEP6_OK`）
+- [ ] **Step 7** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。
