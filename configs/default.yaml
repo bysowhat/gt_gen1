@@ -49,6 +49,10 @@ gt:                                     # 决策 G
 env:                                    # 决策 F
   conda_env: "env_isaaclab"             # curobo 0.0.post1.dev24 / torch 2.7+cu128 / CUDA 可用
 
+planner:                                # cuRobo IK / 规划参数（见 curobo_iface）
+  ik_num_seeds: 100                     # 每个 IK 问题并行优化的随机起点数（cuRobo 默认 100）
+  ik_return_seeds: 100                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
+
 # 以下参数留待对应步骤填实（先放占位/默认）
 params:
   nbv:

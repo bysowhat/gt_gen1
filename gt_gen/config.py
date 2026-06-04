@@ -65,6 +65,15 @@ class Config:
     def roi_expand_m(self) -> float:
         return float(self.raw["roi"]["expand_m"])
 
+    # ---- cuRobo IK / 规划 ----
+    @property
+    def ik_num_seeds(self) -> int:
+        return int(self.raw.get("planner", {}).get("ik_num_seeds", 100))
+
+    @property
+    def ik_return_seeds(self) -> int:
+        return int(self.raw.get("planner", {}).get("ik_return_seeds", 100))
+
     @property
     def params(self) -> dict:
         return self.raw.get("params", {})

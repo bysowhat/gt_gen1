@@ -59,6 +59,7 @@ def init_curobo(
     drop_collision_links: Optional[Sequence[str]] = None,
     position_threshold: float = 0.005,
     rotation_threshold: float = 0.05,
+    num_seeds: Optional[int] = None,
 ) -> CuroboHandle:
     """初始化 MotionGen + warmup。
 
@@ -69,6 +70,7 @@ def init_curobo(
     position_threshold：位置收敛门限（米，默认 5mm）。
     rotation_threshold：朝向收敛门限（四元数测度，默认 0.05；越大越松）。
         注意 cuRobo 在 position_threshold<=1mm 时会自动收紧，别设太小。
+    num_seeds：IK 并行优化的随机起点数；None 时取 config.ik_num_seeds（default.yaml）。
     """
     from curobo.types.base import TensorDeviceType
     from curobo.geom.sdf.world import CollisionCheckerType
@@ -134,8 +136,10 @@ def init_curobo(
     #   IK 跨调用随机撒种，边缘目标的"过阈值解数"会抖动，提高 num_seeds 可缓解。
     #   plan_to_pose 的 num_solutions(=return_seeds) 须 ≤ num_seeds。详见
     #   docs/gt-generation-curobo-implementation.md「IK 多种子与多解轮询」。
+    if num_seeds is None:
+        num_seeds = config.ik_num_seeds
     ik_cfg = IKSolverConfig.load_from_robot_config(
-        robot_cfg, None, num_seeds=100,
+        robot_cfg, None, num_seeds=num_seeds,
         self_collision_check=True, self_collision_opt=True,
         use_cuda_graph=False, tensor_args=ta,
         position_threshold=position_threshold,
@@ -218,15 +222,17 @@ def ik_best_config(handle: CuroboHandle, ik_result):
 
 
 def plan_to_pose(handle: CuroboHandle, start_cfg, goal_pose, max_attempts: int = 5,
-                 pose_cost_metric=None, num_solutions: int = 100):
+                 pose_cost_metric=None, num_solutions: Optional[int] = None):
     """规划 start_cfg -> goal_pose：IK 求【多个】解，按误差升序逐个尝试关节规划，
     第一个成功的即返回（避免"只挑一个 IK 解、恰好不可达/碰撞"的问题）。
 
     pose_cost_metric：可选，传给 IK 放开某些轴（如 free_pose_metric(free_rot=(0,))）。
-    num_solutions：最多尝试多少个 IK 解。
+    num_solutions：最多尝试多少个 IK 解；None 时取 config.ik_return_seeds（default.yaml）。
     返回：成功的 MotionGenResult；全失败返回最后一次的 MotionGenResult（便于诊断）；
         IK 完全无解返回 None。
     """
+    if num_solutions is None:
+        num_solutions = handle.config.ik_return_seeds
     res_ik = solve_ik(handle, goal_pose, pose_cost_metric=pose_cost_metric,
                       return_seeds=num_solutions)
     cands = ik_configs(handle, res_ik)
