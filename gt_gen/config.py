@@ -77,8 +77,18 @@ class Config:
 
     @property
     def init_free_dq(self) -> float:
-        """初始引导 FREE 空间：retract 各关节活动半幅（rad）。见 docs/initial-free-space.md。"""
+        """初始引导 FREE 空间（关节扫掠法）：retract 各关节活动半幅（rad）。见 docs/initial-free-space.md。"""
         return float(self.raw.get("init_free", {}).get("dq_rad", 0.10))
+
+    @property
+    def init_free_cyl_radius(self) -> float:
+        """初始引导 FREE 空间（圆柱体法）：圆柱半径（米）。见 docs/initial-free-space.md。"""
+        return float(self.raw.get("init_free", {}).get("cyl_radius_m", 0.60))
+
+    @property
+    def init_free_cyl_height(self) -> float:
+        """初始引导 FREE 空间（圆柱体法）：圆柱高度（米，从 base_link 平面 z=0 往上）。"""
+        return float(self.raw.get("init_free", {}).get("cyl_height_m", 1.50))
 
     # ---- cuRobo IK / 规划 ----
     @property

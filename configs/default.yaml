@@ -50,7 +50,9 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
   # 末端相机初始视野极小，voxmap 全 UNKNOWN 时整臂扫掠必含 UNKNOWN → reach_pt=0，机械臂动不了。
   # 故在 retract（固定安全 home）邻域把"各关节小幅 ±dq 活动"整臂扫过的体素预标 FREE，让其能起步。
   # dq 由 tmp/plan_seam 轨迹标定：0.05rad 即 122/122 条起步(reach_idx≥4)，取 0.10rad 留余量。
-  dq_rad: 0.10                          # retract 各关节活动半幅（rad）
+  dq_rad: 0.10                          # 关节扫掠法：retract 各关节活动半幅（rad）
+  cyl_radius_m: 0.60                    # 圆柱体法：半径（米，轴过 base 原点 x=y=0）
+  cyl_height_m: 1.80                    # 圆柱体法：高度（米，从 base_link 平面 z=0 往上）
 
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定
