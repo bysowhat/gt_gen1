@@ -3,7 +3,7 @@
 被测函数（逐步补充）：
   - verify_plan_on_truth     → 验证 curobo_iface.plan_on_truth，并按 plan_seam 的 npz 格式保存供可视化
   - verify_compute_reach_pt  → 验证 reach_b.compute_reach_pt（方式1 carve_first_n + 方式2 初始引导 FREE 空间）
-  - (待补) verify_compute_blocking_B / ...
+  - verify_compute_blocking_B→ 验证 reach_b.compute_blocking_B（reach_pt 前方 k 段的 UNKNOWN=B；--viz 橙色显示 B）
 
 运行：
   conda run -n env_isaaclab python scripts/verify_step7_my.py --out /tmp/seam_traj_step7.npz
@@ -162,9 +162,70 @@ def verify_compute_reach_pt(ctx):
         viz_voxmap_arm(ctx, vm_init, ctx.retract)             # 方式2：初始引导 FREE 空间
 
 
-def viz_voxmap_arm(ctx, vm, q, spheres=None):
+def verify_compute_blocking_B(ctx):
+    """验证 reach_b.compute_blocking_B：reach_pt 前方 k 段扫掠里【仍 UNKNOWN】的体素 = B。
+
+    构造：P* 前 n=T//2 段整臂横扫标 FREE（=> reach_idx=n），取 k=params.nbv.k_lookahead 算 B。
+    判据：① B 非空且全为 UNKNOWN（既非已知 FREE 也非真障碍 OCCUPIED）；
+         ② B ⊆ reach_pt 前方 k 段的整臂扫掠体积（"卡住下一步只因没看过"的那批格子）；
+         ③ 整条 P* 横扫标 FREE（reach 到终点）→ 前方无未知 → B 为空。
+    """
+    from gt_gen.voxmap import build_roi_voxmap, FREE, UNKNOWN
+    from gt_gen.swept import swept_volume
+    from gt_gen.reach_b import compute_reach_pt, compute_blocking_B
+
+    P = ctx.p_star
+    assert P is not None, "需先有 P*（verify_plan_on_truth 应先跑）"
+    T = len(P)
+    k = int(ctx.cfg.params.get("nbv", {}).get("k_lookahead", 6))
+    print("\n== verify compute_blocking_B ==  (P* 路点", T, " k_lookahead=", k, ")")
+
+    def carve_first_n(n):
+        vm = build_roi_voxmap(ctx.cfg)                       # 全 UNKNOWN
+        for i in range(n):
+            vm.set_many(swept_volume(ctx.h, vm, P[i], P[i + 1]), FREE)
+        return vm
+
+    # 前半段 FREE → reach 停在未知前沿；取前方 k 段的 UNKNOWN = B
+    n = T // 2
+    vm = carve_first_n(n)
+    reach_idx = compute_reach_pt(ctx.h, vm, P)
+    assert reach_idx == n, f"reach_idx 应 = {n}，实际 {reach_idx}"
+    B = compute_blocking_B(ctx.h, vm, P, reach_idx, k)
+
+    viz_voxmap_arm(ctx, vm, P[reach_idx], b_cells=vm.voxel_to_world(B),
+                       title=f"step7 阻塞段B(橙{B.shape[0]}格) reach_idx={reach_idx} k={k}")
+
+
+    # ① 非空 + 全 UNKNOWN
+    assert B.shape[0] > 0, "前方未知区不应为空"
+    assert np.all(np.asarray(vm.get(B)) == UNKNOWN), "B 含非 UNKNOWN 体素"
+    # ② B ⊆ 前方 k 段扫掠体积
+    end = min(reach_idx + k, T - 1)
+    swept = set()
+    for i in range(reach_idx, end):
+        for c in map(tuple, swept_volume(ctx.h, vm, P[i], P[i + 1])):
+            swept.add(c)
+    assert all(tuple(b) in swept for b in B), "B 超出前方 k 段扫掠体积"
+    print(f"  reach_idx={reach_idx} 前方 {end-reach_idx} 段 → B={B.shape[0]} 格 全UNKNOWN ✓ 且 ⊆扫掠体积 ✓")
+
+    # ③ 整条 FREE → B 空
+    vm_full = carve_first_n(T - 1)
+    ri_full = compute_reach_pt(ctx.h, vm_full, P)
+    B_full = compute_blocking_B(ctx.h, vm_full, P, ri_full, k)
+    assert B_full.shape[0] == 0, f"整条FREE应 B=0，实际 {B_full.shape[0]}"
+    print(f"  整条横扫FREE → reach_idx={ri_full} B={B_full.shape[0]} ✓")
+
+    # 可视化 B（open3d 交互窗口；橙色不透明格 = 待观测的阻塞未知区）：
+    if getattr(ctx, "viz", False):
+        viz_voxmap_arm(ctx, vm, P[reach_idx], b_cells=vm.voxel_to_world(B),
+                       title=f"step7 阻塞段B(橙{B.shape[0]}格) reach_idx={reach_idx} k={k}")
+
+
+def viz_voxmap_arm(ctx, vm, q, spheres=None, b_cells=None, title=None):
     """open3d 交互窗口可视化网格 + 机械臂本地碰撞球：
     voxmap 的 FREE(蓝)/OCCUPIED(红) 格(半透明实心) + 构型 q 的整臂碰撞球(绿) + ROI 线框 + base 轴。
+    b_cells：可选 (M,3) base 系中心坐标，作为阻塞段 B 用橙色不透明格子叠加显示。
     （交互窗口，可旋转/缩放；不存图。需本机有显示器。）
     """
     import open3d as o3d
@@ -206,6 +267,9 @@ def viz_voxmap_arm(ctx, vm, q, spheres=None):
     if oc.shape[0]:
         om = cells_mesh(oc); om.paint_uniform_color([0.92, 0.12, 0.12])   # OCCUPIED 不透明实心
         geoms.append(("occ", om, "lit", None))
+    if b_cells is not None and len(b_cells):
+        bm = cells_mesh(np.asarray(b_cells)); bm.paint_uniform_color([1.0, 0.55, 0.0])  # B=橙不透明
+        geoms.append(("B", bm, "lit", None))
     aabb = o3d.geometry.LineSet.create_from_axis_aligned_bounding_box(
         o3d.geometry.AxisAlignedBoundingBox(vm.origin, vm.upper)); aabb.paint_uniform_color([0.6, 0.6, 0.6])
     geoms += [("roi", aabb, "line", None),
@@ -222,7 +286,7 @@ def viz_voxmap_arm(ctx, vm, q, spheres=None):
             mat.shader = "defaultLit"
         items.append({"name": name, "geometry": g, "material": mat})
     print("  打开 open3d 交互窗口（关闭窗口后继续）...")
-    o3d.visualization.draw(items, title="step7 网格(蓝FREE/红OCC) + 碰撞球(绿)",
+    o3d.visualization.draw(items, title=title or "step7 网格(蓝FREE/红OCC) + 碰撞球(绿)",
                            width=1400, height=1000, bg_color=(1.0, 1.0, 1.0, 1.0))
 
 
@@ -240,6 +304,7 @@ def main():
     # —— 每行验证一个被测函数（后续按需追加）——
     verify_plan_on_truth(ctx)
     verify_compute_reach_pt(ctx)
+    verify_compute_blocking_B(ctx)
 
     print("\nVERIFY_STEP7_MY_OK")
 
