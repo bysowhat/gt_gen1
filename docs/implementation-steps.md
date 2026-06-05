@@ -169,11 +169,21 @@ roi:
 
 ---
 
-## Step 7 — `reach_pt` + 阻塞段 `B` 计算
+## Step 7 — `reach_pt` + 阻塞段 `B` 计算  ✅ 已完成
 
-- [ ] `plan_on_truth` 求 P\*；向前扫求 `reach_pt`；取前方一小段 UNKNOWN 为 `B`
+- [x] `plan_on_truth` 求 P\*；向前扫求 `reach_pt`；取前方一小段 UNKNOWN 为 `B`
+      （`curobo_iface.plan_on_truth` + `reach_b.compute_reach_pt` / `compute_blocking_B`）
 - **依赖**：Step 1、2、6
-- **验证**：`reach_pt` 停在未知前沿；`B` 是下一段未知体素（可视化对照）。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step7.py` → `STEP7_OK`
+      （真值上 P* 规划到**由 pkl 几何算的 `goal_pose`**(`seam_ee_pose`，放开 roll 的 metric，非 pkl 关节角)，
+      P*=78 点：全 UNKNOWN→reach_idx=0、B=1025；前半 FREE→reach_idx=39 停在未知前沿、B=454；
+      整条 FREE→reach_idx=77 到终点、B=0；B 全为 UNKNOWN 体素）。
+
+> **要点**：`plan_on_truth(handle, start, goal, pose_cost_metric=)` 须用【真值 world】(含真实障碍 mesh)的
+> handle——P* 在已知全部障碍下规划，挡住探索的只会是 UNKNOWN。goal 可为关节角或**末端位姿**
+> (pos,quat_wxyz)；位姿走 `plan_to_pose`(可放开 roll)。`compute_reach_pt` 用 `motion_stays_in_free`
+> 沿 P* 向前扫，首个非 FREE 段前停；`compute_blocking_B` 取 reach_pt 前方 k(=`params.nbv.k_lookahead`) 段
+> 扫掠体积里**仍 UNKNOWN** 的体素（不含 FREE/OCCUPIED）= "卡住下一步、只因没看过"的格子（滑动窗口）。
 
 ---
 
@@ -237,6 +247,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 - [x] **Step 4** — 完成（`STEP4_OK`）
 - [x] **Step 5** — 完成（`STEP5_OK`）
 - [x] **Step 6** — 完成（`STEP6_OK`）
-- [ ] **Step 7** — 待开始（下一步）
+- [x] **Step 7** — 完成（`STEP7_OK`）
+- [ ] **Step 8** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。

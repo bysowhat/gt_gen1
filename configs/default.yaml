@@ -46,6 +46,12 @@ roi:                                    # 决策 H —— ROI 盒（单一来源
   dims: [3.8, 3.9, 3.6]                 # ROI 盒尺寸（米）
   voxel_size_m: 0.04                    # 体素边长（米）
 
+init_free:                              # 初始引导 FREE 空间（见 docs/initial-free-space.md）
+  # 末端相机初始视野极小，voxmap 全 UNKNOWN 时整臂扫掠必含 UNKNOWN → reach_pt=0，机械臂动不了。
+  # 故在 retract（固定安全 home）邻域把"各关节小幅 ±dq 活动"整臂扫过的体素预标 FREE，让其能起步。
+  # dq 由 tmp/plan_seam 轨迹标定：0.05rad 即 122/122 条起步(reach_idx≥4)，取 0.10rad 留余量。
+  dq_rad: 0.10                          # retract 各关节活动半幅（rad）
+
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定
 
@@ -55,6 +61,9 @@ env:                                    # 决策 F
 planner:                                # cuRobo IK / 规划参数（见 curobo_iface）
   ik_num_seeds: 100                     # 每个 IK 问题并行优化的随机起点数（cuRobo 默认 100）
   ik_return_seeds: 100                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
+  position_threshold: 0.05              # 位置收敛门限（米）；init_curobo 不传时用此值
+  rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
+  drop_collision_links: []  # 碰撞检查剔除的 link（焊枪允许接触工件）
 
 # 以下参数留待对应步骤填实（先放占位/默认）
 params:

@@ -75,6 +75,11 @@ class Config:
     def roi_expand_m(self) -> float:
         return float(self.raw["roi"].get("expand_m", 0.0))
 
+    @property
+    def init_free_dq(self) -> float:
+        """初始引导 FREE 空间：retract 各关节活动半幅（rad）。见 docs/initial-free-space.md。"""
+        return float(self.raw.get("init_free", {}).get("dq_rad", 0.10))
+
     # ---- cuRobo IK / 规划 ----
     @property
     def ik_num_seeds(self) -> int:
@@ -83,6 +88,19 @@ class Config:
     @property
     def ik_return_seeds(self) -> int:
         return int(self.raw.get("planner", {}).get("ik_return_seeds", 100))
+
+    @property
+    def position_threshold(self) -> float:
+        return float(self.raw.get("planner", {}).get("position_threshold", 0.05))
+
+    @property
+    def rotation_threshold(self) -> float:
+        return float(self.raw.get("planner", {}).get("rotation_threshold", 0.5))
+
+    @property
+    def drop_collision_links(self) -> list:
+        # 空列表/缺省/null 都表示"一个都不 drop"
+        return list(self.raw.get("planner", {}).get("drop_collision_links") or [])
 
     @property
     def params(self) -> dict:

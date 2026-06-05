@@ -57,18 +57,20 @@ def init_curobo(
     world_model: Optional[Any] = None,
     collision_checker_type: Optional[Any] = None,
     drop_collision_links: Optional[Sequence[str]] = None,
-    position_threshold: float = 0.005,
-    rotation_threshold: float = 0.05,
+    position_threshold: Optional[float] = None,
+    rotation_threshold: Optional[float] = None,
     num_seeds: Optional[int] = None,
 ) -> CuroboHandle:
     """初始化 MotionGen + warmup。
 
     默认：VOXEL 全自由世界（roi_dims/roi_center 占位，Step 2 精化）。
     可传 world_model（如含 obj mesh 的 WorldConfig）+ collision_checker_type 覆盖。
+    drop_collision_links / position_threshold / rotation_threshold：不传(None)时从
+        default.yaml 的 planner 段读取（见 config）；显式传入则覆盖。
     drop_collision_links：从碰撞检查中剔除的 link（如焊枪 xiaoyu_accessory_link，
         允许其接触工件——焊接接触是预期的，机械臂本体仍避障）。
-    position_threshold：位置收敛门限（米，默认 5mm）。
-    rotation_threshold：朝向收敛门限（四元数测度，默认 0.05；越大越松）。
+    position_threshold：位置收敛门限（米）。
+    rotation_threshold：朝向收敛门限（四元数测度；越大越松）。
         注意 cuRobo 在 position_threshold<=1mm 时会自动收紧，别设太小。
     num_seeds：IK 并行优化的随机起点数；None 时取 config.ik_num_seeds（default.yaml）。
     """
@@ -79,6 +81,14 @@ def init_curobo(
     from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 
     gt_gen.compat.apply_trimesh_shim()  # 修 curobo geom/types.py 缺 trimesh 导入
+
+    # 未显式指定的规划参数从 default.yaml 的 planner 段取（单一来源）
+    if position_threshold is None:
+        position_threshold = config.position_threshold
+    if rotation_threshold is None:
+        rotation_threshold = config.rotation_threshold
+    if drop_collision_links is None:
+        drop_collision_links = config.drop_collision_links
 
     ta = TensorDeviceType()
     rd = load_yaml(config.robot_cfg_path)
@@ -308,6 +318,28 @@ def explain_endpoints(handle: CuroboHandle, start_cfg, goal_cfg):
     return " | ".join(parts)
 
 
-def plan_on_truth(handle, start_cfg, goal_cfg, truth_scene):
-    """在真值场景上规划全知最优路径 P*。见 Step 7。"""
-    raise NotImplementedError("Step 7")
+def plan_on_truth(handle, start_cfg, goal, max_attempts: int = 10, pose_cost_metric=None):
+    """在真值场景上规划全知最优路径 P*。见 Step 7。
+
+    handle 须用【真值 world】(含真实障碍 mesh)初始化——P* 在已知全部障碍下规划，
+    挡住探索的只会是 UNKNOWN，不是真障碍。
+    goal 可为关节构型(长度=dof)或末端位姿 (pos[3], quat_wxyz[4])；后者走 plan_to_pose
+    （可传 pose_cost_metric，如 free_pose_metric 放开 roll）。
+    返回插值后的关节序列 (T, dof) numpy；失败 None。
+    """
+    def _is_pose(g):
+        try:
+            return len(g) == 2 and len(g[0]) == 3 and len(g[1]) == 4
+        except TypeError:
+            return False
+
+    if _is_pose(goal):
+        res = plan_to_pose(handle, start_cfg, goal, max_attempts=max_attempts,
+                           pose_cost_metric=pose_cost_metric)
+    else:
+        raise ValueError('plan on joints: fail easily')
+        res = plan_to_config(handle, start_cfg, goal, max_attempts=max_attempts)
+    if res is None or not bool(res.success.item()):
+        return None
+    return res.get_interpolated_plan().position.detach().cpu().numpy()
+
