@@ -65,14 +65,19 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
   ik_return_seeds: 100                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
   position_threshold: 0.05              # 位置收敛门限（米）；init_curobo 不传时用此值
   rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
-  drop_collision_links: []  # 碰撞检查剔除的 link（焊枪允许接触工件）
+  drop_collision_links: []  # 从碰撞检查剔除的 link（单一来源：init_curobo 不传时读这里）。空=不剔除任何 link，焊枪也参与避障
 
 # 以下参数留待对应步骤填实（先放占位/默认）
 params:
   nbv:
     k_lookahead: 6                      # B 取 P* 前方几个路点（Step 7）
-    standoff_d_m: [0.25, 0.35, 0.45]    # 站位距离档（Step 8）
+    standoff_d_m: [0.55, 0.75, 0.95]    # 站位距离档（Step 8）
     n_view_dirs: 8                      # 每档观察方向数（Step 8）
+    max_look_deg: 20                    # 候选看向校验：相机光轴对准 T 的最大夹角°（Step 8，兜 cuRobo 朝向阈值偏松）
+    cluster:                            # 阻塞段 B 聚类（Step 8，scipy 层次聚类 linkage+fcluster）
+      max: 3                            # 最多簇数（超出则保留最大的簇心 + 全部点重指派到最近簇心覆盖）
+      link_dist_m: 0.15                 # 距离阈值（fcluster criterion='distance' 的 t）：簇内最近邻间距 ≤ 此值归一簇
+      method: "single"                  # linkage 连接法：single(链式,适合连通体素块)/complete/average/ward
     lambda_cost: 0.0                    # 增益 vs 路径代价权重（Step 9）
     version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
   loop:

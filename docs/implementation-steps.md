@@ -187,11 +187,30 @@ roi:
 
 ---
 
-## Step 8 — 候选视点生成
+## Step 8 — 候选视点生成  ✅ 已完成
 
-- [ ] `cluster_centroids(B)` → `standoff_poses_looking_at` → IK → 保守可达性过滤
+- [x] `cluster_centroids(B)` → `standoff_poses_looking_at` → 眼在手 IK → 保守可达性过滤
+      （`gt_gen/candidates.py`：`cluster_centroids` / `standoff_poses_looking_at` /
+      `look_at_pose` / `generate_candidates` → `Candidate` 列表）
 - **依赖**：Step 1、2、7
-- **验证**：候选朝向 B、站位在 FREE 区、从当前位姿可达。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step8.py [--viz]` → `VERIFY_STEP8_OK`
+      （冷启动 seam_22：初始圆柱 FREE 罩住 retract、cur_cfg=retract、沿 P* reach_idx=8/56、B=172。
+      4 个 verify_* 各验一函数：① cluster_centroids 聚 1 簇心且在 B 包围盒内、无空簇；
+      ② standoff_poses_looking_at 生成 10 个位姿，眼在 FREE/光轴对准 T/视线通/站距合档/旋转正交；
+      ③ look_at_pose 平移=p/光轴对准 T/正交/X水平Y朝下/T 投影到画幅中心/退化仍正交；
+      ④ generate_candidates 端到端产 5 个候选，逐个朝 B(≤20°)、IK 误差≤4.6mm、整臂扫掠⊆FREE 可达、
+      自碰撞 OK、眼在 FREE。`--viz` 每个函数分步/逐窗用 open3d 展示几何。聚类参数取自 default.yaml.cluster）。
+
+> **眼在手关键**：cuRobo IK 解的是 `ee_link`(xiaoyu_tip_link)，而相机挂在 `Link6`。要让
+> **相机**到达某位姿 `T_base_cam`，须先换算成对应 **ee_link** 位姿再 IK：
+> `T_base_ee = T_base_cam @ T_cam_ee`，其中 `T_cam_ee` 是 cam→ee 的固定刚体变换（与构型无关，
+> 用任一构型 FK 一次性求出）。候选三关过滤：①IK 有解（关节限位+自碰撞，handle.ik）；
+> ②真实 FK 光轴对准 T（兜 cuRobo 朝向阈值偏松，默认 ≤20°）；③`motion_stays_in_free`
+> 当前构型→候选整臂扫掠 ⊆ FREE（保守，走不到的丢）。
+> **初始 FREE 基础**：候选的站位/视线/可达都建立在初始引导 FREE 空间之上——冷启动用
+> **圆柱体法** `set_initial_free_cylinder`（参数取自 `default.yaml` 的 `init_free.cyl_*`）罩住
+> retract 整臂；这正是反复确认过的「眼在手可达视点常很有限」难点：候选基本是在初始 FREE
+> 块内小幅重定向去看 B。**坑/接 stuck**：若无任何可达候选 → 主循环转「就近揭示」兜底（§6）。
 
 ---
 
@@ -248,6 +267,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 - [x] **Step 5** — 完成（`STEP5_OK`）
 - [x] **Step 6** — 完成（`STEP6_OK`）
 - [x] **Step 7** — 完成（`STEP7_OK`）
-- [ ] **Step 8** — 待开始（下一步）
+- [x] **Step 8** — 完成（`STEP8_OK`）
+- [ ] **Step 9** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。

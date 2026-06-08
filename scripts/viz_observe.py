@@ -121,8 +121,7 @@ def main():
     # cuRobo handle（工件当障碍，焊枪排除；用于 FK；含 IK 备用）
     world = WorldConfig(mesh=[Mesh(name="workpiece", file_path=obj_path, pose=mp)])
     print("\n初始化 cuRobo（含工件 MESH）...")
-    h = ci.init_curobo(cfg, world_model=world, collision_checker_type=CollisionCheckerType.MESH,
-                       drop_collision_links=["xiaoyu_accessory_link"])
+    h = ci.init_curobo(cfg, world_model=world, collision_checker_type=CollisionCheckerType.MESH)
 
     # 大范围扰动 base-yaw 等 → 让三臂在空间上完全分开（仅验证观测，不要求可达焊缝）
     base_q = np.asarray(d["joint_angles"], float)

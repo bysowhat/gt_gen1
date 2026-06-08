@@ -93,7 +93,7 @@ def init_curobo(
     ta = TensorDeviceType()
     rd = load_yaml(config.robot_cfg_path)
     kin = rd["robot_cfg"]["kinematics"]
-    kin["link_names"] = ["Link6"]  # 供相机 FK
+    kin["link_names"] = ["Link6", "xiaoyu_flange_link"]  # Link6 供相机 FK；flange 供 Step8 半球轴锚点
 
     if drop_collision_links:
         drop = set(drop_collision_links)
