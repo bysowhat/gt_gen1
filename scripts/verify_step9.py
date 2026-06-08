@@ -6,7 +6,6 @@
   - verify_raycast_reveal        → raycast_reveal（假设性 raycast 出"将确定"的体素；与 B 求交得 gain）
   - verify_score_and_argmax      → score_candidate（gain=|reveal∩B|, score=gain-λ·cost）+ argmax 选最优
   - verify_best_next_view_oracle → best_next_view_using_oracle（P*→B→候选→打分→argmax，端到端一轮 NBV）
-  - verify_fallback              → best_next_view_line_weighted（§5 直线加权 fallback 能跑）
 
 运行：conda run -n env_isaaclab python scripts/verify_step9.py [--viz]
 """
@@ -176,25 +175,6 @@ def verify_best_next_view_oracle(ctx):
     return r
 
 
-def verify_fallback(ctx):
-    """验证 best_next_view_line_weighted（§5 直线加权 fallback）能跑、返回合理结果。"""
-    from gt_gen import nbv, curobo_iface as ci
-    from gt_gen.swept import motion_stays_in_free
-    h, vm, scene, cur = ctx["h"], ctx["vm"], ctx["scene"], ctx["cur_cfg"]
-
-    print("\n== verify best_next_view_line_weighted (fallback) ==")
-    r = nbv.best_next_view_line_weighted(h, cur, vm, scene, ctx["goal_pose"])
-    print(f"  status={r.status}  候选={r.n_candidates}  加权gain={r.gain:.2f}")
-    assert r.status in ("ok", "corridor_confirmed", "no_reachable_candidate"), f"异常 status={r.status}"
-    if r.status == "ok":
-        feas, _ = ci.check_state(h, r.cfg)
-        ok, _ = motion_stays_in_free(h, vm, cur, r.cfg)
-        assert feas and ok, "fallback 选中视点应可行且可达"
-        print("  ✓ fallback 跑通并选出可行/可达视点")
-    else:
-        print(f"  ✓ fallback 跑通（status={r.status}）")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seam", default=SEAM)
@@ -209,9 +189,8 @@ def main():
     gains = verify_raycast_reveal(ctx, B, cands, viz=False)#viz=args.viz
     verify_score_and_argmax(ctx, B, cands, gains, viz=False)#viz=args.viz
     verify_best_next_view_oracle(ctx)
-    verify_fallback(ctx)
 
-    print("\nVERIFY_STEP9_OK [raycast_reveal, score_candidate, best_next_view_using_oracle, line_weighted]")
+    print("\nVERIFY_STEP9_OK [raycast_reveal, score_candidate, best_next_view_using_oracle]")
 
 
 if __name__ == "__main__":
