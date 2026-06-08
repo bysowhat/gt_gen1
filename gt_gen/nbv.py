@@ -1,6 +1,6 @@
-"""Step 9: 特权 NBV 打分与选择。
+"""Step 9: 特权 NBV 打分与选择（oracle-path 版）。
 
-见 privileged-nbv.md §4.5 ④（打分选择）、§5（v1 直线加权 fallback）、§8 顶层伪代码。
+见 privileged-nbv.md §4.5 ④（打分选择）、§8 顶层伪代码。
 
 一轮 NBV：Step 7 给出阻塞段 B（卡住下一步、只因没看过的 UNKNOWN 体素），Step 8 给出一批
 "看得见 B、又走得到"的候选构型；本步对每个候选【向真值场景做假设性 raycast】，算它能揭开
