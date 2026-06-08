@@ -63,7 +63,8 @@ def build_scene(args):
     h = ci.init_curobo(cfg, world_model=world, collision_checker_type=CollisionCheckerType.MESH)
 
     metric = ci.free_pose_metric(h, free_rot=(0,))
-    P = ci.plan_on_truth(h, cfg.retract_config, goal_pose, max_attempts=20, pose_cost_metric=metric)
+    P = ci.plan_on_truth(h, cfg.retract_config, goal_pose, max_attempts=cfg.plan_max_attempts,
+                         pose_cost_metric=metric)
     assert P is not None, "真值上 P* 规划失败"
     print(f"P* 路点数: {P.shape}")
 

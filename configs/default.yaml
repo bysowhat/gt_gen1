@@ -65,6 +65,7 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
   ik_return_seeds: 100                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
   position_threshold: 0.05              # 位置收敛门限（米）；init_curobo 不传时用此值
   rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
+  max_attempts: 20                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
   drop_collision_links: []  # 从碰撞检查剔除的 link（单一来源：init_curobo 不传时读这里）。空=不剔除任何 link，焊枪也参与避障
 
 # 以下参数留待对应步骤填实（先放占位/默认）

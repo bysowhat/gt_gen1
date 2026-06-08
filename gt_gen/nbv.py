@@ -113,7 +113,8 @@ def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
     # 1) 真值上的全知最优路径 P*（外部已算好则直接用）
     P = p_star
     if P is None:
-        P = ci.plan_on_truth(handle, cur_cfg, goal_pose, max_attempts=20, pose_cost_metric=pose_cost_metric)
+        P = ci.plan_on_truth(handle, cur_cfg, goal_pose, max_attempts=cfg.plan_max_attempts,
+                             pose_cost_metric=pose_cost_metric)
     if P is None:
         return NBVResult("scene_infeasible")
 

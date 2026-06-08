@@ -108,6 +108,11 @@ class Config:
         return float(self.raw.get("planner", {}).get("rotation_threshold", 0.5))
 
     @property
+    def plan_max_attempts(self) -> int:
+        """plan_on_truth / plan_to_pose 的最大规划尝试次数（planner.max_attempts，单一来源）。"""
+        return int(self.raw.get("planner", {}).get("max_attempts", 20))
+
+    @property
     def drop_collision_links(self) -> list:
         # 空列表/缺省/null 都表示"一个都不 drop"
         return list(self.raw.get("planner", {}).get("drop_collision_links") or [])
