@@ -214,11 +214,23 @@ roi:
 
 ---
 
-## Step 9 — 特权 NBV 打分与选择
+## Step 9 — 特权 NBV 打分与选择  ✅ 已完成
 
-- [ ] `raycast_reveal`（假设性）→ `gain = reveal ∩ B` → `score` → argmax；含 v1 直线加权 fallback
+- [x] `raycast_reveal`（假设性）→ `gain = reveal ∩ B` → `score` → argmax；含 v1 直线加权 fallback
+      （`gt_gen/nbv.py`：`raycast_reveal` / `score_candidate` / `best_next_view_using_oracle` /
+      `best_next_view_line_weighted` → `NBVResult`）
 - **依赖**：Step 3、7、8
-- **验证**：选出的视点揭开 B 最多；fallback 路径也能跑。
+- **验证**：`conda run -n env_isaaclab python scripts/verify_step9.py [--viz]` → `VERIFY_STEP9_OK`
+      （冷启动 seam_22，|B|=172、5 候选：① raycast_reveal 各候选 reveal 非空在界内、reveal∩B gain
+      =[164,164,170,170,170]；② score_candidate λ=0 时 score=gain、argmax 选 gain=170；
+      ③ best_next_view_using_oracle 端到端 status=ok、选中 cfg 揭开 B 170、自碰撞OK、可达；
+      ④ 直线加权 fallback 跑通。`--viz` 显示选中视点 + 揭开的 B(绿)/未揭开(橙) + FOV 视锥）。
+
+> **要点**：④的 raycast 是【假设性】的——从候选相机位姿对真值 mesh 投射、算"将确定"的体素，
+> `gain = |reveal ∩ B|`，**不改地图**（真正改图是主循环 ⑥）；真值 mesh 的遮挡天然处理（被挡的 B
+> 不算揭开）。`score = gain − λ·path_cost`（λ=`params.nbv.lambda_cost`，默认 0 → 纯比揭开量）。
+> **P\* 注入**：`best_next_view_using_oracle(..., p_star=)` 支持外部传入真值最优路——主循环每轮算
+> 一次 P* 注入即可，既省一次规划又避免 cuRobo 多种子的随机抖动（不传则函数内部自行规划）。
 
 ---
 
@@ -268,6 +280,7 @@ Step2+A → Step6(扫掠) → Step7(reach_pt/B) → Step8(候选) → Step9(NBV�
 - [x] **Step 6** — 完成（`STEP6_OK`）
 - [x] **Step 7** — 完成（`STEP7_OK`）
 - [x] **Step 8** — 完成（`STEP8_OK`）
-- [ ] **Step 9** — 待开始（下一步）
+- [x] **Step 9** — 完成（`VERIFY_STEP9_OK`）
+- [ ] **Step 10** — 待开始（下一步）
 
 每完成一步在对应小节打勾并在此记录。

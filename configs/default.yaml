@@ -78,7 +78,7 @@ params:
       max: 3                            # 最多簇数（超出则保留最大的簇心 + 全部点重指派到最近簇心覆盖）
       link_dist_m: 0.15                 # 距离阈值（fcluster criterion='distance' 的 t）：簇内最近邻间距 ≤ 此值归一簇
       method: "single"                  # linkage 连接法：single(链式,适合连通体素块)/complete/average/ward
-    lambda_cost: 0.0                    # 增益 vs 路径代价权重（Step 9）
+    lambda_cost: 0.1                    # 增益 vs 路径代价权重（Step 9）
     version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
   loop:
     max_rounds: 200                     # 主循环最大轮次（Step 10）

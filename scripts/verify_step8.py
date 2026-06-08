@@ -79,7 +79,7 @@ def build_scene(args):
     reach_idx = compute_reach_pt(h, vm, P)
     print(f"reach_idx={reach_idx}/{len(P)-1}（从 retract 沿 P* 扫到圆柱边界停下，cur_cfg=retract）")
     return dict(cfg=cfg, h=h, P=P, vm=vm, cam=cam, scene=scene, obj=obj, mp=mp,
-                cur_cfg=cur_cfg, reach_idx=reach_idx)
+                cur_cfg=cur_cfg, reach_idx=reach_idx, goal_pose=goal_pose)
 
 
 # ============ open3d 可视化小工具（各 verify_* 共用） ============
