@@ -52,6 +52,8 @@ def main():
     joint_names = [str(x) for x in data["joint_names"]]
     piece_pose_to_robot = np.asarray(data["piece_pose_to_robot"], dtype=float)
     obj_path = str(data["obj_path"])
+    seam_mid = np.asarray(data["seam_mid"], float) if "seam_mid" in data else None
+    seam_bisector = np.asarray(data["seam_bisector"], float) if "seam_bisector" in data else None
     print("轨迹点数:", positions.shape, " 关节:", joint_names)
 
     cfg = load_config()
@@ -90,6 +92,37 @@ def main():
 
     robot, robot_prim_path = add_robot_to_scene(robot_cfg, world)
 
+    # 焊缝中点处两面方向相加的方向（base 系，机器人在原点）：用 debug_draw 画红色箭头线
+    draw = None
+    if seam_mid is not None and seam_bisector is not None:
+        try:
+            try:
+                from omni.isaac.debug_draw import _debug_draw
+            except ImportError:
+                from isaacsim.util.debug_draw import _debug_draw
+            draw = _debug_draw.acquire_debug_draw_interface()
+        except Exception as e:
+            print("warn: debug_draw 不可用，跳过方向显示:", e)
+
+    _L = 0.15  # 箭头长度(m)
+    def _draw_tangent():
+        if draw is None:
+            return
+        t = seam_bisector / (np.linalg.norm(seam_bisector) + 1e-9)
+        p0 = seam_mid
+        p1 = seam_mid + _L * t
+        # 箭头两翼：在切向两侧各回折一段
+        ref = np.array([0.0, 0.0, 1.0]) if abs(t[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        side = np.cross(t, ref); side /= (np.linalg.norm(side) + 1e-9)
+        h = 0.3 * _L
+        w0 = p1 - h * t + h * side
+        w1 = p1 - h * t - h * side
+        col = (1.0, 0.1, 0.1, 1.0)
+        starts = [p0.tolist(), p1.tolist(), p1.tolist()]
+        ends = [p1.tolist(), w0.tolist(), w1.tolist()]
+        draw.clear_lines()
+        draw.draw_lines(starts, ends, [col] * 3, [4] * 3)
+
     world.reset()
     robot.initialize() if hasattr(robot, "initialize") else None
     idx_list = [robot.get_dof_index(j) for j in joint_names]
@@ -104,6 +137,7 @@ def main():
         world.step(render=not args.headless)
         if not world.is_playing():
             continue
+        _draw_tangent()
         if i < len(positions):
             robot.set_joint_positions(positions[i], idx_list)
             i += 1

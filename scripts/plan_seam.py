@@ -27,8 +27,15 @@ def find_obj(seam_path):
     raise FileNotFoundError(f"no obj in {d}")
 
 
-def seam_ee_pose(d, index=None):
-    """焊缝几何 -> 末端目标位姿（机械臂基座系）。返回 (pos[3], quat_wxyz[4])。
+def seam_ee_pose(d, index=None, offset_m=0.0):
+    """焊缝几何 -> 末端目标位姿（机械臂基座系）。
+
+    返回 ((pos[3], quat_wxyz[4]), dbg)，dbg = {"seam_mid": 中点(base),
+    "seam_bisector": seam_limits 两个面方向向量相加后的单位方向(base)}，
+    供可视化焊缝中点处两面角平分方向用。
+
+    offset_m: 沿 seam_bisector 方向把目标位置平移的距离(米)，正值远离工件
+      （standoff），0 表示落在焊缝中点。
 
     - 位置 = 焊缝中点（seam_line[middle]）。
     - 接近轴（末端 x 轴）= -normalize(dir1+dir2)，即相交两面的角平分方向
@@ -48,16 +55,19 @@ def seam_ee_pose(d, index=None):
     to_base_p = lambda p: Rwr.T @ (p - rp[:3])
     to_base_v = lambda v: Rwr.T @ v
 
-    pos = to_base_p(line[i])
+    mid = to_base_p(line[i])
     t = to_base_v(tang[i]); t /= np.linalg.norm(t)
     d1 = to_base_v(limits[i, 0]); d2 = to_base_v(limits[i, 1])
     bis = d1 + d2; bis /= np.linalg.norm(bis)
+    pos = mid + offset_m * bis                        # 沿角平分方向平移目标
     x = -bis                                          # 接近轴
     y = t - np.dot(t, x) * x; y /= np.linalg.norm(y)  # 去掉沿 x 分量，对齐切向
     z = np.cross(x, y)
     R = np.column_stack([x, y, z])
     q_xyzw = Rsp.from_matrix(R).as_quat()
-    return pos.tolist(), np.r_[q_xyzw[3], q_xyzw[:3]].tolist()
+    pose = (pos.tolist(), np.r_[q_xyzw[3], q_xyzw[:3]].tolist())
+    dbg = {"seam_mid": mid.tolist(), "seam_bisector": bis.tolist()}
+    return pose, dbg
 
 
 def main():
@@ -65,6 +75,8 @@ def main():
     ap.add_argument("--seam", default=DEFAULT_SEAM)
     ap.add_argument("--out", default="/tmp/seam_traj.npz")
     ap.add_argument("--max_attempts", type=int, default=20)
+    ap.add_argument("--offset_cm", type=float, default=0.0,
+                    help="目标沿两面角平分方向(bis)平移的距离(cm)，正值远离工件")
     args = ap.parse_args()
 
     from gt_gen.config import load_config
@@ -74,7 +86,7 @@ def main():
 
     cfg = load_config()
     d = pickle.load(open(args.seam, "rb"))
-    goal_pose = seam_ee_pose(d)
+    goal_pose, seam_dbg = seam_ee_pose(d, offset_m=args.offset_cm / 100.0)
 
     target = np.asarray(d["joint_angles"], dtype=float).tolist()
     robot_pos = np.asarray(d["robot_pose"][0], dtype=float)
@@ -160,6 +172,8 @@ def main():
         retract=np.array(retract),
         target=np.array(target),
         piece_pose_to_robot=mesh_pose,
+        seam_mid=np.array(seam_dbg["seam_mid"]),
+        seam_bisector=np.array(seam_dbg["seam_bisector"]),
         obj_path=obj_path,
         robot_usd=h.config.robot_cfg["robot_cfg"]["kinematics"]["usd_path"],
         dt=0.02,
