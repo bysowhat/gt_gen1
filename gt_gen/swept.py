@@ -25,14 +25,17 @@ _fk_spheres_batch = fk_spheres_batch   # 兼容内部旧名
 
 
 def voxelize_spheres(voxmap, spheres) -> np.ndarray:
-    """把一组碰撞球 (M,4 xyz+r) 保守体素化到 voxmap：返回覆盖的体素下标 (M,3)（去重、在界内）。
+    """把一组碰撞球 (M,4 xyz+r) 体素化到 voxmap：返回真正与球相交的体素下标 (M,3)（去重、在界内）。
 
-    每球覆盖其 AABB 与球相交的所有体素（中心到球心 ≤ r + 半个体素对角线）。
+    判据为精确的「球-AABB(体素立方体)相交」：球心到体素盒的最近距离 ≤ r 才算覆盖
+    （逐轴 clamp：d_k = max(0, |c_k - ctr_k| - vs/2)，∑d_k² ≤ r²）。
+    候选枚举仍用 r + 半体对角线 框 AABB（保证候选集是超集、不漏），再用精确判据剔除"只擦到角外"的体素。
     """
     spheres = np.asarray(spheres, float)
     spheres = spheres[spheres[:, 3] > 1e-4]
     vs = voxmap.voxel_size
-    pad = 0.5 * vs * np.sqrt(3.0)
+    half = 0.5 * vs                          # 体素半边长（精确判据用）
+    pad = 0.5 * vs * np.sqrt(3.0)            # 半体对角线，仅用于框候选 AABB（超集、不漏）
     occ = set()
     for c0, c1, c2, r in spheres:
         c = np.array([c0, c1, c2]); R = r + pad
@@ -41,7 +44,8 @@ def voxelize_spheres(voxmap, spheres) -> np.ndarray:
         ii, jj, kk = np.meshgrid(*rs, indexing="ij")
         idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], 1)
         ctr = voxmap.voxel_to_world(idx)
-        for t in map(tuple, idx[np.linalg.norm(ctr - c, axis=1) <= R]):
+        d = np.maximum(0.0, np.abs(ctr - c) - half)              # 逐轴超出体素盒的距离 (M,3)
+        for t in map(tuple, idx[(d * d).sum(axis=1) <= r * r]):  # 精确球-AABB 相交
             occ.add(t)
     if not occ:
         return np.empty((0, 3), dtype=np.int64)

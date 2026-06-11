@@ -63,7 +63,7 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
         _observe(voxmap, h_expl, traj[i], camera_model, truth_scene, max_depth, pixel_stride)
     _observe(voxmap, h_expl, traj[-1], camera_model, truth_scene, max_depth, pixel_stride)
 
-    # _debug_viz_voxmap(voxmap, h_expl, traj[-1], truth_scene, show_unknown=True, transparent=False)  # 本段走完后的 voxmap 三态（含灰 UNKNOWN）
+    _debug_viz_voxmap(voxmap, h_expl, traj[-1], truth_scene, show_unknown=True, transparent=False)  # 本段走完后的 voxmap 三态（含灰 UNKNOWN）
     return traj[1:]                                   # 去掉与上一段重复的首点
 
 
