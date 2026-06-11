@@ -74,9 +74,9 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
   ik_return_seeds: 100                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
   position_threshold: 0.05              # 位置收敛门限（米）；init_curobo 不传时用此值
   rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
-  max_attempts: 20                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
+  max_attempts: 300                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
   drop_collision_links: []  # 从碰撞检查剔除的 link（单一来源：init_curobo 不传时读这里）。空=不剔除任何 link，焊枪也参与避障
-  voxel_inflate_voxels: 1   # sync_collision_world 把「非 FREE」障碍向 FREE 膨胀的体素层数。
+  voxel_inflate_voxels: 0   # sync_collision_world 把「非 FREE」障碍向 FREE 膨胀的体素层数。
                             # cuRobo voxel 规划只保证球心避障，而保守判据 motion_stays_in_free 对整臂扫掠
                             # 做 (r+√3/2·voxel) 过近似 → 差约 1 体素。膨胀 1 层使 cuRobo 规划留出一致余量，
                             # 保证 GT 整臂扫掠真正 ⊆ FREE（0 擦边 UNKNOWN）。
@@ -97,6 +97,6 @@ params:
   loop:
     max_rounds: 200                     # 主循环最大轮次（Step 10）
     stuck_rounds: 5                     # 连续无进展判卡死（Step 10）
-    observe_every_n: 10                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
+    observe_every_n: 3                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
     interp_resolution_m: 0.01           # 扫掠体积插值精度（Step 6）

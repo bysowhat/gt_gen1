@@ -35,17 +35,27 @@ def commit_observation(voxmap, free_points, occ_points, sticky_occupied: bool = 
 
 
 def observe_and_update(voxmap, camera_pose, camera_model, truth_scene, max_depth,
-                       pixel_stride: int = 16, free_step: Optional[float] = None,
+                       pixel_stride: Optional[int] = None, free_step: Optional[float] = None,
                        sticky_occupied: bool = True) -> dict:
-    """实拍一次：raycast → 穿过的体素标 FREE、命中点标 OCCUPIED，提交进 voxmap。
+    """实拍一次（warp 视锥体素雕刻）：视锥内体素连相机中心判遮挡 → 提交进 voxmap。
 
-    free_step 默认取 voxmap.voxel_size（沿射线约每体素一采样）。返回生效体素数 dict。
+    走 sensor.carve_observe 拿 (free_idx, occ_idx) 体素下标，按粘滞策略写状态：
+      free → 只写当前非 OCCUPIED 的格（不降级已知障碍）；occ → 无条件、且在 free 之后 → 覆盖。
+    产实心 FREE（扛得住 sync inflate=1），优于旧 trimesh 稀疏射线。返回生效体素数 dict。
+
+    pixel_stride / free_step：已废弃（旧 trimesh 路径形参），保留仅为兼容调用方，忽略。
     """
-    from gt_gen.sensor import raycast_observe
+    from gt_gen.sensor import carve_observe
+    from gt_gen.voxmap import FREE, OCCUPIED
 
-    if free_step is None:
-        free_step = voxmap.voxel_size
-    free_pts, occ_pts = raycast_observe(
-        camera_pose, camera_model, truth_scene, max_depth,
-        pixel_stride=pixel_stride, free_step=free_step)
-    return commit_observation(voxmap, free_pts, occ_pts, sticky_occupied=sticky_occupied)
+    free_idx, occ_idx = carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth)
+
+    nf = no = 0
+    if free_idx.shape[0]:
+        if sticky_occupied:
+            free_idx = free_idx[voxmap.get(free_idx) != OCCUPIED]   # 不降级已知障碍
+        if free_idx.shape[0]:
+            nf = voxmap.set_many(free_idx, FREE)
+    if occ_idx.shape[0]:
+        no = voxmap.set_many(occ_idx, OCCUPIED)                     # 无条件、free 之后 → 覆盖
+    return {"free": int(nf), "occ": int(no)}

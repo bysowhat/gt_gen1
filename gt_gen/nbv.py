@@ -40,26 +40,20 @@ class NBVResult:
 # ---------------- 假设性 raycast 与打分 ----------------
 
 def raycast_reveal(voxmap, camera_pose, camera_model, truth_scene,
-                   max_depth: Optional[float] = None, pixel_stride: int = 16) -> np.ndarray:
-    """假设性 raycast：从 camera_pose 向真值场景投射，返回该视点【将确定】的体素下标 (M,3)（不改地图）。
+                   max_depth: Optional[float] = None, pixel_stride: Optional[int] = None) -> np.ndarray:
+    """假设性观测（warp 视锥体素雕刻）：从 camera_pose 向真值场景投射，返回该视点【将确定】的体素下标 (M,3)（不改地图）。
 
-    = voxelize(穿过的 free 采样点 ∪ 命中的 occ 点)，只保留在 voxmap 界内、去重。
-    真值 mesh 的遮挡天然处理：射线被障碍挡住就停，障碍后的体素不会被算作"将确定"。
+    = unique(FREE 体素 ∪ OCCUPIED 体素)，均已在 voxmap 界内。
+    真值 mesh 的遮挡天然处理：被障碍挡住的体素归 UNKNOWN，不算"将确定"。
+    pixel_stride 已废弃（旧 trimesh 形参），保留仅为兼容，忽略。
     """
-    from gt_gen.sensor import raycast_observe
+    from gt_gen.sensor import carve_observe
 
-    if max_depth is None:
-        max_depth = float(camera_model.get("max_depth", 3.0))
-    free_pts, occ_pts = raycast_observe(camera_pose, camera_model, truth_scene, max_depth,
-                                        pixel_stride=pixel_stride)
-    chunks = [p for p in (free_pts, occ_pts) if len(p)]
+    free_idx, occ_idx = carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth)
+    chunks = [a for a in (free_idx, occ_idx) if a.shape[0]]
     if not chunks:
         return np.empty((0, 3), dtype=np.int64)
-    idx = voxmap.world_to_voxel(np.concatenate(chunks, axis=0))
-    idx = idx[voxmap.in_bounds(idx)]
-    if idx.shape[0] == 0:
-        return np.empty((0, 3), dtype=np.int64)
-    return np.unique(idx, axis=0)
+    return np.unique(np.concatenate(chunks, axis=0), axis=0)
 
 
 def _count_intersection(reveal, B) -> int:
