@@ -122,6 +122,16 @@ def init_curobo(
     center = list(roi_center) if roi_center is not None else list(config.roi_center)
     pose = center + [1.0, 0.0, 0.0, 0.0]
 
+    # 每个 voxel 世界维度必须是 voxel_size 的整数倍：cuRobo CUDA 核 robust_floor(dim/voxel)+1
+    # 与 Python get_grid_shape 在半体素(x.5)时取整不一致，会令该轴体素索引错位（占据沿轴抹开）。
+    # config.roi_dims 已吸附；这里再断言一道，防止显式传入 roi_dims 时漏掉。
+    for ax, d in zip("xyz", dims):
+        n = d / vs
+        assert abs(n - round(n)) < 1e-4, (
+            f"voxel 世界 {ax} 维 {d}m 不是 voxel_size({vs}m) 整数倍 (={n:.3f})，"
+            f"会触发 cuRobo 栅格维度取整不一致→占据错位；请吸附到整数倍")
+
+
     if world_model is not None:
         checker = collision_checker_type or CollisionCheckerType.MESH
     else:

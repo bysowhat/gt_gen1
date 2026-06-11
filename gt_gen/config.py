@@ -68,12 +68,26 @@ class Config:
 
     @property
     def roi_dims(self) -> list:
-        """ROI 盒尺寸（米）——单一 ROI 来源。"""
-        return list(self.raw["roi"]["dims"])
+        """ROI 盒尺寸（米）——单一 ROI 来源。
+
+        每轴吸附到 voxel_size 的整数倍后返回。原因：cuRobo voxel 碰撞核（CUDA）用
+        robust_floor(dim/voxel)+1 现算栅格维度，与 Python 端 get_grid_shape 在【半体素】
+        （dim/voxel 落在 x.5）时取整不一致（CUDA round-half-away 保留、Python floor），
+        会让该轴的体素索引步长差 1 → 占据沿该轴整体错位/抹开 → 规划起点假碰撞。
+        取整数倍可彻底规避（见 docs/step10-precise-obstacle-notes / diag）。
+        """
+        vs = self.voxel_size_m
+        return [int(round(float(d) / vs)) * vs for d in self.raw["roi"]["dims"]]
+
 
     @property
     def roi_expand_m(self) -> float:
         return float(self.raw["roi"].get("expand_m", 0.0))
+
+    @property
+    def goal_standoff_m(self) -> float:
+        """末端目标沿 bisector 后退的 standoff 距离（米）。见 default.yaml goal.standoff_cm。"""
+        return float(self.raw.get("goal", {}).get("standoff_cm", 0.0)) / 100.0
 
     @property
     def init_free_dq(self) -> float:
@@ -116,6 +130,11 @@ class Config:
     def drop_collision_links(self) -> list:
         # 空列表/缺省/null 都表示"一个都不 drop"
         return list(self.raw.get("planner", {}).get("drop_collision_links") or [])
+
+    @property
+    def voxel_inflate_voxels(self) -> int:
+        """sync_collision_world 把非 FREE 障碍向 FREE 膨胀的体素层数（保守余量，见 default.yaml）。"""
+        return int(self.raw.get("planner", {}).get("voxel_inflate_voxels", 1))
 
     @property
     def params(self) -> dict:

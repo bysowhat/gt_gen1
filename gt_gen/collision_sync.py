@@ -31,16 +31,26 @@ def _world_centers(handle, vg):
     return local @ quat_wxyz_to_R(pose[3:7]).T + pose[:3]
 
 
-def sync_collision_world(handle, voxmap) -> dict:
+def sync_collision_world(handle, voxmap, inflate_voxels=None) -> dict:
     """把 voxmap 的 (OCCUPIED ∪ UNKNOWN) 灌进 cuRobo 的 voxel 碰撞世界。
 
-    返回 {'occupied':.., 'free':..} —— cuRobo 网格中判为占据/自由的体素数。
+    inflate_voxels：把「非 FREE」掩码向 FREE 膨胀的体素层数（默认取
+        handle.config.voxel_inflate_voxels，default.yaml planner.voxel_inflate_voxels=1）。
+        作用：cuRobo voxel 规划器按 ESDF 只保证球心避障，而保守判据 motion_stays_in_free
+        对整臂扫掠做 (r + √3/2·voxel) 的过近似，二者差约 1 体素 → cuRobo 规划的路径会贴着
+        FREE/UNKNOWN 边界擦过几格 UNKNOWN（实测仅边界~1%格、0 真值碰撞）。把执行世界的障碍
+        膨胀 1 层，使 cuRobo 规划留出与判据一致的余量 → GT 整臂扫掠真正 ⊆ FREE。
+
+    返回 {'occupied':.., 'free':..} —— cuRobo 网格中判为占据/自由的体素数（膨胀后）。
     """
     import numpy as np
     import torch
     from scipy import ndimage
 
     from gt_gen.voxmap import FREE
+
+    if inflate_voxels is None:
+        inflate_voxels = int(getattr(handle.config, "voxel_inflate_voxels", 1))
 
     checker = handle.mg.world_coll_checker
     name = handle.voxel["name"]
@@ -50,6 +60,11 @@ def sync_collision_world(handle, voxmap) -> dict:
     centers = _world_centers(handle, vg)
     states = np.asarray(voxmap.get(voxmap.world_to_voxel(centers)))
     occ = (states != FREE).reshape(shape)                   # 非 FREE = 占据（保守）
+
+    # 障碍膨胀：把非 FREE 向 FREE 扩 inflate_voxels 层（26 邻接，覆盖对角），给 cuRobo 规划留余量。
+    if inflate_voxels and occ.any() and not occ.all():
+        st3 = ndimage.generate_binary_structure(3, 3)      # 3x3x3 全连通（含对角）
+        occ = ndimage.binary_dilation(occ, structure=st3, iterations=int(inflate_voxels))
 
     vs = float(vg.voxel_size)
     mx = float(torch.as_tensor(checker.max_esdf_distance).reshape(-1)[0].item())

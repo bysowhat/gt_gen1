@@ -50,7 +50,7 @@ def build_scene(args):
     d = pickle.load(open(args.seam, "rb"))
     robot_pose = np.asarray(d["robot_pose"][0], float)
     piece_pose = np.asarray(d["piece_pose"][0], float)
-    goal_pose = seam_ee_pose(d)
+    goal_pose, _ = seam_ee_pose(d)
     obj = sorted(glob.glob(os.path.dirname(args.seam) + "/*_watertight.obj"))[0]
 
     def _p(p7):

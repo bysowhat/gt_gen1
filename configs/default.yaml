@@ -43,8 +43,17 @@ roi:                                    # 决策 H —— ROI 盒（单一来源
   # docs/implementation-steps.md「ROI 标定」。两网格(voxmap / cuRobo voxel 世界)同框、不再各填默认。
   mode: "measured_box"                  # ROI 直接由 center/dims 给定（不再用 reach+expand 推算）
   center: [0.1, 0.0, 0.65]              # ROI 盒中心（base 系，米）
-  dims: [3.8, 3.9, 3.6]                 # ROI 盒尺寸（米）
+  dims: [3.8, 3.92, 3.6]                # ROI 盒尺寸（米）。每轴须为 voxel_size 整数倍：
+                                        #   3.8/0.04=95, 3.92/0.04=98, 3.6/0.04=90（皆整数）。
+                                        #   半体素(如 3.9→97.5)会触发 cuRobo CUDA/Python 栅格维度取整
+                                        #   不一致 → voxel 占据沿该轴错位（见 config.roi_dims 注释）。
+                                        #   config.roi_dims 会再吸附一次作兜底。
   voxel_size_m: 0.04                    # 体素边长（米）
+
+goal:                                   # 末端目标相对焊缝的摆放（Step 10）
+  standoff_cm: 10.0                     # 沿两面角平分方向(bisector, 背离工件)后退的 standoff 距离(cm)
+                                        # 目的：目标离工件表面够远(>体素膨胀带)，纯 voxel 探索世界不会误判碰撞；
+                                        # GT 轨迹终点即停在此 standoff 位姿（不再向表面靠近）。
 
 init_free:                              # 初始引导 FREE 空间（见 docs/initial-free-space.md）
   # 末端相机初始视野极小，voxmap 全 UNKNOWN 时整臂扫掠必含 UNKNOWN → reach_pt=0，机械臂动不了。
@@ -67,6 +76,10 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
   rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
   max_attempts: 20                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
   drop_collision_links: []  # 从碰撞检查剔除的 link（单一来源：init_curobo 不传时读这里）。空=不剔除任何 link，焊枪也参与避障
+  voxel_inflate_voxels: 1   # sync_collision_world 把「非 FREE」障碍向 FREE 膨胀的体素层数。
+                            # cuRobo voxel 规划只保证球心避障，而保守判据 motion_stays_in_free 对整臂扫掠
+                            # 做 (r+√3/2·voxel) 过近似 → 差约 1 体素。膨胀 1 层使 cuRobo 规划留出一致余量，
+                            # 保证 GT 整臂扫掠真正 ⊆ FREE（0 擦边 UNKNOWN）。
 
 # 以下参数留待对应步骤填实（先放占位/默认）
 params:
@@ -84,5 +97,6 @@ params:
   loop:
     max_rounds: 200                     # 主循环最大轮次（Step 10）
     stuck_rounds: 5                     # 连续无进展判卡死（Step 10）
+    observe_every_n: 10                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
     interp_resolution_m: 0.01           # 扫掠体积插值精度（Step 6）
