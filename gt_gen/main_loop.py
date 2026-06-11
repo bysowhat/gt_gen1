@@ -63,7 +63,7 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
         _observe(voxmap, h_expl, traj[i], camera_model, truth_scene, max_depth, pixel_stride)
     _observe(voxmap, h_expl, traj[-1], camera_model, truth_scene, max_depth, pixel_stride)
 
-    _debug_viz_voxmap(voxmap, h_expl, traj[-1], truth_scene, show_unknown=True, transparent=False)  # 本段走完后的 voxmap 三态（含灰 UNKNOWN）
+    # _debug_viz_voxmap(voxmap, h_expl, traj[-1], truth_scene, show_unknown=True, transparent=False)  # 本段走完后的 voxmap 三态（含灰 UNKNOWN）
     return traj[1:]                                   # 去掉与上一段重复的首点
 
 
@@ -538,7 +538,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                                         params=params, camera_model=camera_model,
                                         pose_cost_metric=metric, p_star=P)
         # _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
-        _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
+        # _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
         info["status_seq"].append(r.status)
         info["n_B"].append(int(r.n_B))#r.n_B:本轮阻塞段B的体素个数
         if P is not None and info["P_len"] is None:

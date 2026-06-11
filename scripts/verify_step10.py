@@ -139,6 +139,29 @@ def verify_generate_gt(ctx, viz):
     return GT, status, info
 
 
+def _save_gt(ctx, GT, out):
+    """把整条 GT + 场景信息存成 npz，可直接喂 scripts/viz_seam_isaacsim.py 播放轨迹。
+
+    键与 scripts/plan_seam.py 的输出对齐（viz 直接消费）：
+      positions (T,dof) 关节轨迹、joint_names、piece_pose_to_robot(工件@基座 wxyz)、
+      obj_path(viz 据此换 .usd)、seam_mid/seam_bisector(焊缝中点+角平分方向, base 系)。
+    不存时间戳（GT 只是构型序列，节拍由 viz 的 --fps 决定）。
+    """
+    cfg, seam_dbg = ctx["cfg"], ctx["seam_dbg"]
+    positions = np.asarray([np.asarray(q, float) for q in GT])     # (T,dof)
+    np.savez(
+        out,
+        positions=positions,
+        joint_names=np.array(cfg.joint_names),
+        piece_pose_to_robot=np.asarray(ctx["mp"], float),
+        obj_path=ctx["obj"],
+        seam_mid=np.asarray(seam_dbg["seam_mid"], float),
+        seam_bisector=np.asarray(seam_dbg["seam_bisector"], float),
+    )
+    print(f"  ✓ GT 已存: {out}  (positions={positions.shape})")
+    print(f"    可视化: conda run -n env_isaaclab python scripts/viz_seam_isaacsim.py --traj {out}")
+
+
 def _viz_collision_world(ctx, stage):
     """可视化 sync_collision_world 前/后 h_expl(voxel) 的占据情况——目视核对 voxmap 的「非 FREE」
     是否被正确灌进 cuRobo（历史 Y 轴帧错位 bug 的人工复核口）。
@@ -217,10 +240,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seam", default=SEAM)
     ap.add_argument("--viz", action="store_true", help="弹 open3d 窗口看整条 GT（需显示器，默认关）")
+    ap.add_argument("--out", default="/tmp/seam_traj_step10.npz",
+                    help="GT 存盘路径（npz，可直接喂 scripts/viz_seam_isaacsim.py）")
     args = ap.parse_args()
 
     ctx = build_scene_step10(args)
-    verify_generate_gt(ctx, args.viz)
+    GT, _, _ = verify_generate_gt(ctx, args.viz)
+    _save_gt(ctx, GT, args.out)
 
     print("\nVERIFY_STEP10_OK [generate_gt: reached, 0 保守违例, 0 真值碰撞, 终点≈standoff goal]")
 
