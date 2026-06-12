@@ -21,6 +21,6 @@ for part_dir in "$ROOT"/*/; do
             continue
         fi
         echo "=== Processing ${part}__${sname} ==="
-        python scripts/plan_seam.py --seam "$seam" --max_attempts "$MAX_ATTEMPTS" --out "$out"
+        python scripts/plan_seam.py --seam "$seam" --max_attempts "$MAX_ATTEMPTS" --out "$out" --offset_cm 10
     done
 done
