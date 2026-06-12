@@ -2,6 +2,7 @@
 
 robot:                                  # 决策 B
   cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
+  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
 
 constraint:                             # 决策 A
