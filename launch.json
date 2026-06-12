@@ -1,0 +1,158 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "viz_seam_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_seam_isaacsim.py",
+            "console": "int1egratedTerminal",
+            "args": [
+                // "--traj", "/tmp/seam_traj.npz",
+                // "--traj", "/tmp/seam_traj_step7.npz",
+                "--traj", "/tmp/seam_traj_step10.npz",
+            ]
+        },
+        {
+            "name": "plan_seam",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/plan_seam.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
+                "--max_attempts", "200",
+                "--offset_cm", "10",
+            ]
+        },
+        {
+            "name": "viz_spheres_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_spheres_isaacsim.py",
+            "console": "integratedTerminal",
+            "args": [
+            ]
+        },
+        {
+            "name": "viz_collision_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_collision_isaacsim.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_25.pkl",
+                // "--joints", "1.5708,-2.0072,1.3613,-0.96,-1.5708,0.0"
+                "--joints", "0.004129787441343069, -0.13427050411701202, -0.07581812143325806, -0.24959824979305267, -2.1436455249786377, -4.133333206176758"
+                // "--joints", "-0.19431450963020325, -0.288407564163208, 0.014963937923312187, -0.36761409044265747, -1.8780711889266968, -3.2579421997070312"
+            ]
+        },
+        {
+            "name": "verify_step7",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/verify_step7.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_24.pkl",
+            ]
+        },
+        {
+            "name": "calibrate_init_free",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/calibrate_init_free.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--check-workpiece", 
+                "--n-workpiece", "3",
+                "--viz"
+            ]
+        },
+        {
+            "name": "verify_step8",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/verify_step8.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
+                "--viz"
+            ]
+        },
+        {
+            "name": "verify_step9",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/verify_step9.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
+                "--viz"
+            ]
+        },
+        {
+            "name": "verify_step10",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/verify_step10.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
+                "--viz"
+            ]
+        },
+        {
+            "name": "proto_warp_carve",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/proto_warp_carve.py",
+            "console": "integratedTerminal",
+            "args": [
+            ]
+        },
+        {
+            "name": "viz_obstacles_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_obstacles_isaacsim.py",
+            "console": "integratedTerminal",
+            "args": [
+                // 一次性平铺全部 15 种障碍（网格排布 + 控制台打印「编号|类别|障碍|anchor」图例）：
+                "--all",
+                // 可选附加：--cols 列数(默认5)、--pitch 间距(默认1.6m)、--anchor 网格原点。
+                // ---- 或：注释掉上面的 --all，取消注释下面某一行，单独调试该障碍 ----
+                // 取消注释某一行即可调试该障碍（参数均为完整默认值，可改）。anchor=base 系锚点(米)。
+                // open_box / box_with_pipe 的盒体尺寸 size 走独立的 --size x,y,z（--params 传不了三元组）。
+                // "--obstacle", "plate",          "--anchor", "0.6,0,0.7", "--params", "length=0.8,width=0.6,thickness=0.02,tilt_deg=0.0",
+                // "--obstacle", "l_bracket",      "--anchor", "0.6,0,0.7", "--params", "length=0.6,width=0.5,thickness=0.02",
+                // "--obstacle", "u_channel",      "--anchor", "0.6,0,0.7", "--params", "length=0.6,width=0.5,height=0.4,thickness=0.02",
+                // "--obstacle", "open_box",       "--anchor", "0.6,0,0.7", "--size", "0.6,0.6,0.6", "--params", "wall=0.02,open_face=front",
+                // "--obstacle", "pipe",           "--anchor", "0.6,0,0.7", "--params", "length=1.0,radius=0.05,axis=y",
+                // "--obstacle", "parallel_pipes", "--anchor", "0.6,0,0.7", "--params", "n=3,length=1.0,radius=0.05,gap=0.2,axis=y,stack=z",
+                // "--obstacle", "crossed_pipes",  "--anchor", "0.6,0,0.7", "--params", "length=1.0,radius=0.05,cross_deg=90.0",
+                // "--obstacle", "box_beam",       "--anchor", "0.6,0,0.7", "--params", "length=1.0,side=0.1,axis=y",
+                // "--obstacle", "rect_frame",     "--anchor", "0.6,0,0.7", "--params", "width=0.8,height=0.8,beam=0.08",
+                // "--obstacle", "gantry",         "--anchor", "0.6,0,0.7", "--params", "span=0.8,height=1.0,post=0.08,beam=0.1",
+                // "--obstacle", "braced_frame",   "--anchor", "0.6,0,0.7", "--params", "width=0.8,height=0.8,beam=0.08,brace=0.06",
+                // "--obstacle", "tripod",         "--anchor", "0.6,0,0.7", "--params", "height=0.9,base_half=0.35,rod=0.05",
+                // "--obstacle", "steps",          "--anchor", "0.6,0,0.7", "--params", "n=3,rise=0.15,run=0.25,width=0.6",
+                // "--obstacle", "box_with_pipe",  "--anchor", "0.6,0,0.7", "--size", "0.7,0.7,0.7", "--params", "wall=0.02,open_face=front,pipe_radius=0.05",
+                // "--obstacle", "frame_with_brace","--anchor", "0.6,0,0.7", "--params", "width=0.8,height=0.8,beam=0.08,brace=0.06",
+            ]
+        },
+
+
+    ]
+}
