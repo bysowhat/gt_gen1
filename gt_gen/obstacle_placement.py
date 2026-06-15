@@ -126,6 +126,80 @@ def _inside_init_free(p, cfg) -> bool:
     return r < cfg.init_free_cyl_radius and 0.0 <= float(p[2]) <= cfg.init_free_cyl_height
 
 
+def _prim_bounding_sphere(p) -> Tuple[np.ndarray, float]:
+    """障碍 prim 的包围球 (球心 xyz, 半径)。球心取 prim.pose 平移；半径取保守外接半径。
+
+    Box  : 半对角线 = ½·‖dims‖；Tube: 沿局部 Z 的圆柱外接球 = hypot(radius, ½·height)。
+    包围球是保守外估 → 用它判 init_free 清空只会偏严（多推一点），不会漏判。
+    """
+    c = np.asarray(p.pose[:3], float)
+    if isinstance(p, ob.Box):
+        rb = 0.5 * float(np.linalg.norm(np.asarray(p.dims, float)))
+    else:                                                # Tube
+        rb = float(math.hypot(float(p.radius), 0.5 * float(p.height)))
+    return c, rb
+
+
+def _init_free_push_dir(prims, cfg, tangent) -> Optional[np.ndarray]:
+    """外推方向：与 init_free 圆柱 z 段 [0,cyl_h] 重叠的各 prim 包围球心的水平质心的「外向径向」单位向量。
+
+    · 无 prim 与圆柱 z 段重叠 → 返回 None（整只障碍在圆柱上/下方，无需外推）；
+    · 质心几乎压在轴线上(hypot≈0) → 退化为「路径切向的水平垂线」（保证仍横挡走廊地往外推）。
+    """
+    cyl_h = float(cfg.init_free_cyl_height)
+    pts = []
+    for p in prims:
+        c, rb = _prim_bounding_sphere(p)
+        if c[2] + rb < 0.0 or c[2] - rb > cyl_h:         # z 向无重叠 → 与圆柱无交
+            continue
+        pts.append(c[:2])
+    if not pts:
+        return None
+    ctr = np.mean(np.asarray(pts, float), axis=0)
+    nrm = float(np.linalg.norm(ctr))
+    if nrm > 1e-6:
+        return np.array([ctr[0] / nrm, ctr[1] / nrm, 0.0])
+    d = np.array([float(tangent[1]), -float(tangent[0]), 0.0])   # 切向的水平垂线
+    nn = float(np.linalg.norm(d))
+    return d / nn if nn > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+
+def _init_free_clear_distance(prims, cfg, u_xy) -> float:
+    """沿水平单位方向 u 把整只障碍刚好推出 init_free 圆柱所需的【精确】平移距离 d≥0（一次解析求解）。
+
+    平移只在 xy 内 → 各 prim 的 z 不变 → 与圆柱 z 段 [0,cyl_h] 的重叠集恒定，故可一次算准、无需迭代。
+    对每个与圆柱 z 段重叠的 prim 包围球 (球心 c, 半径 rb)，令 R=cyl_r+rb，要求平移后水平距离 ≥ R：
+        |c_xy + d·u|² ≥ R²  ⟺  d² + 2(c_xy·u)·d + (|c_xy|² − R²) ≥ 0
+    记 b=c_xy·u、e=|c_xy|²−R²、判别式 disc=b²−e：
+      · disc ≤ 0 → 沿 u 该 prim 对任意 d 都不侵入（含已在外且不会再进入），门限 0；
+      · disc > 0 → 取较大根 d_hi = −b+√disc 为该 prim 的清空门限（d≥d_hi 即落在清空区）。
+    d = max(0, max_i d_hi)。因 d≥每个 prim 的 d_hi，所有 prim 同时清空——一次到位、零迭代。
+    """
+    cyl_r = float(cfg.init_free_cyl_radius)
+    cyl_h = float(cfg.init_free_cyl_height)
+    u = np.asarray(u_xy, float)[:2]
+    nu = float(np.linalg.norm(u))
+    if nu < 1e-9:
+        return 0.0
+    u = u / nu
+    d_req = 0.0
+    for p in prims:
+        c, rb = _prim_bounding_sphere(p)
+        if c[2] + rb < 0.0 or c[2] - rb > cyl_h:         # z 向无重叠 → 与圆柱无交
+            continue
+        cxy = c[:2]
+        Rr = cyl_r + rb
+        b = float(cxy @ u)
+        e = float(cxy @ cxy) - Rr * Rr
+        disc = b * b - e
+        if disc <= 0.0:                                  # 沿 u 永不侵入
+            continue
+        d_hi = -b + math.sqrt(disc)
+        if d_hi > d_req:
+            d_req = d_hi
+    return d_req
+
+
 # ------------------------------------------------------------------ 障碍尺寸（按走廊管半径）
 def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
                ) -> Tuple[dict, Tuple[float, float, float]]:
@@ -222,7 +296,8 @@ def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
 
 # ------------------------------------------------------------------ 底层放置（M=1）
 def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos_frac,
-                      jitter_vec, thickness, cfg, goal_pos):
+                      jitter_vec, thickness, cfg, goal_pos,
+                      workpiece_mesh=None, retract=None, debug_show: bool = False):
     """在 link 的扫掠走廊里放 1 个障碍（参数驱动、确定性）。返回 (prims, anchor, meta)；被排除区否决则返回 None。
 
     per_wp:
@@ -250,7 +325,10 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
     - pos_frac∈[0,1] 映射到 obstacle_placement.pos_t_window 内的路点 → 取该路点该 link 的扫掠球；
     - anchor = 这些球心均值 + jitter_vec；估走廊管半径 tube_r 与跨度 span(=2·tube_r·size_scale)；
     - 朝向：把障碍正面(+X)对齐该处路径切向，叠加 angle_deg 绕切向自转；
-    - 排除：anchor 落入 init_free 圆柱、或距 goal < goal_clearance → 否决（返回 None）。
+    - init_free：不再「anchor 落入就否决重抽」，而是按整只障碍的真实几何（逐 prim 包围球）解析地
+      沿径向把障碍整体外推到刚好清空圆柱（保证障碍全部在 init 外）。仅当走廊中心本身就在圆柱内、
+      或外推到挡不住走廊时才返回 None。
+    - 排除：走廊中心落入 init_free 圆柱、或外推后距 goal < goal_clearance → 否决（返回 None）。
     """
     op = cfg.obstacle_placement
     if link not in per_wp:
@@ -265,10 +343,9 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
     radii = sph[t, :, 3]
     anchor = centers.mean(axis=0) + np.asarray(jitter_vec, float)
 
-    # 排除区（文档「不建议位置」）
+    # 走廊中心点本身就落在 init_free 内 → 该处走廊穿过初始空间，无法「既挡住走廊又整只在 init 外」，
+    # 放弃此路点（上层换 pos_frac 即可；纯几何判断、无 cuRobo 调用，不浪费验证配额）。
     if _inside_init_free(anchor, cfg):
-        return None
-    if float(np.linalg.norm(anchor - np.asarray(goal_pos, float))) < op["goal_clearance_m"]:
         return None
     if len(centers) == 0:
         return None
@@ -287,14 +364,37 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
     shape, local_off = _shape_for(otype, span, tube_r, cfg=cfg, th=thickness)
     # local_off 在 anchor 朝向系下偏置 anchor（让以角/底为锚的结构主体压在走廊上）
     anchor_eff = anchor + R.from_euler("xyz", rpy, degrees=True).apply(np.asarray(local_off, float))
-    if _inside_init_free(anchor_eff, cfg):
+
+    # —— 保证整只障碍（所有 prim 的真实几何，不只 anchor）都在 init_free 圆柱之外 ——
+    # init_free 是已知解析圆柱、外推只在 xy（不改 z）→ 各 prim 与圆柱 z 段的重叠集恒定，
+    # 故【一次解析求解】即可：选定外推方向 u 后，对每个 prim 解二次式取较大根、取最大值得到精确清空距离，
+    # 一步推到位，不再「随机摆→撞 init→重抽」、也不迭代。
+    prims = ob.build(otype, anchor_eff.tolist(), anchor_rpy_deg=tuple(rpy), **shape)
+    # 外推前的「初始」摆放可视化（与 search_placement 里那次同款；用于肉眼比对外推前/后）
+    # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
+    #                     cfg=cfg, retract=retract,
+    #                     title=f"{link}/{otype} 初始(未外推)")
+
+    u = _init_free_push_dir(prims, cfg, tangent)             # None=无 prim 与圆柱 z 段重叠，无需外推
+    push_total = _init_free_clear_distance(prims, cfg, u) if u is not None else 0.0
+    if push_total > 1e-6:
+        if push_total > tube_r + 0.5 * span:                 # 推太远→已离开走廊、挡不住路径 → 放弃此处
+            return None
+        anchor_eff = anchor_eff + u * (push_total + 1e-2)    # 一次推到位（+1mm 余量）
+        prims = ob.build(otype, anchor_eff.tolist(), anchor_rpy_deg=tuple(rpy), **shape)
+        # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
+        #                     cfg=cfg, retract=retract,
+        #                     title=f"{link}/{otype} 外推后(已清空)")
+
+    # 外推后再校验与 goal 的间距（不要紧贴焊缝）
+    if float(np.linalg.norm(anchor_eff - np.asarray(goal_pos, float))) < op["goal_clearance_m"]:
         return None
 
-    prims = ob.build(otype, anchor_eff.tolist(), anchor_rpy_deg=tuple(rpy), **shape)
     meta = dict(link=link, otype=otype, anchor=anchor_eff.tolist(), tangent=tangent.tolist(),
                 tube_r=tube_r, span=span, t=t, size_scale=float(size_scale),
                 angle_deg=float(angle_deg), pos_frac=float(pos_frac),
-                jitter=list(map(float, jitter_vec)), thickness=float(thickness), shape=shape)
+                jitter=list(map(float, jitter_vec)), thickness=float(thickness),
+                shape=shape, init_free_push=float(push_total))
     return prims, anchor_eff, meta
 
 
@@ -468,6 +568,21 @@ def _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
         except Exception as e:
             print(f"[debug-o3d] 初始碰撞球计算失败：{e}")
 
+    # init_free 引导圆柱（青色线框）：轴过 base 原点(x=y=0)、半径 cyl_r、z∈[0, cyl_h]。
+    # 障碍整只应在此圆柱外（push-to-clear 的目标）；线框不遮挡，便于看障碍是否贴外缘。
+    if cfg is not None:
+        try:
+            cyl_r = float(cfg.init_free_cyl_radius)
+            cyl_h = float(cfg.init_free_cyl_height)
+            cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=cyl_r, height=cyl_h,
+                                                            resolution=32)
+            cyl.translate((0.0, 0.0, cyl_h / 2.0))           # create_cylinder 居中于原点 → 抬到 z∈[0,h]
+            cyl_ls = o3d.geometry.LineSet.create_from_triangle_mesh(cyl)
+            cyl_ls.paint_uniform_color([0.0, 0.75, 0.75])
+            geoms.append(cyl_ls)
+        except Exception as e:
+            print(f"[debug-o3d] init_free 圆柱可视化失败：{e}")
+
     print(f"[debug-o3d] 显示场景「{title}」(关闭窗口继续)；"
           f"障碍原语 {len(prims)} 个，走廊球 {0 if sph is None else len(sph)} 路点，"
           f"初始碰撞球 {n_init} 个。")
@@ -498,16 +613,18 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
         placed = place_in_corridor(per_wp, origin, link, otype, size_scale=size_scale,
                                    angle_deg=angle_deg, pos_frac=pos_frac,
                                    jitter_vec=jitter_vec, thickness=thickness,
-                                   cfg=cfg, goal_pos=goal_pose[0])
+                                   cfg=cfg, goal_pos=goal_pose[0],
+                                   workpiece_mesh=workpiece_mesh, retract=retract,
+                                   debug_show=True)
         if placed is None:                                # 落在排除区 → 换位置重采
             last = "excluded"
             continue
         prims, anchor, meta = placed
         world = build_world(workpiece_mesh, prims)
         handle.mg.update_world(world)
-        _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
-                            cfg=cfg, retract=retract,
-                            title=f"{link}/{otype} attempt{attempt + 1}")
+        # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
+        #                     cfg=cfg, retract=retract,
+        #                     title=f"{link}/{otype} attempt{attempt + 1}")
         v = validate_scene(handle, traj_default, retract, goal_pose, metric, cfg)
         last = v["fail_reason"]
         if v["ok"]:
