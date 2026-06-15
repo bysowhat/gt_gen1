@@ -140,6 +140,45 @@ def _prim_bounding_sphere(p) -> Tuple[np.ndarray, float]:
     return c, rb
 
 
+def _point_solid_dist2(prim, pts) -> np.ndarray:
+    """一批世界点 pts(N,3) 到 prim【实体】的最短距离²（点在实体内部为 0）。
+
+    精确判据(非包围球)：把世界点变换到 prim 局部系 loc = Rᵀ(p−c)，再按实体类型算「各方向外溢量」：
+      · Box (OBB，dims=全边长)：半边长 he=dims/2，over_i=max(0,|loc_i|−he_i)，dist²=Σ over_i²；
+      · Tube (轴沿局部 +Z，半径 r、半高 h/2)：径向 ρ=hypot(loc_x,loc_y)，
+        d_r=max(0,ρ−r)、d_z=max(0,|loc_z|−h/2)，dist²=d_r²+d_z²。
+    两者都是「点到正交乘积区域」的精确最短距离（径向⊥轴向、各轴互相⊥，分量可分别取）。
+    """
+    c = np.asarray(prim.pose[:3], float)
+    qw, qx, qy, qz = prim.pose[3:7]                       # wxyz
+    Rm = R.from_quat([qx, qy, qz, qw]).as_matrix()        # world←local
+    loc = (np.asarray(pts, float) - c) @ Rm               # 世界点→局部系：Rᵀ(p−c)
+    if isinstance(prim, ob.Box):
+        he = 0.5 * np.asarray(prim.dims, float)           # 半边长
+        over = np.maximum(np.abs(loc) - he, 0.0)          # 各轴外溢
+        return np.sum(over * over, axis=1)
+    # Tube：有限实心圆柱
+    radial = np.hypot(loc[:, 0], loc[:, 1])
+    d_r = np.maximum(radial - float(prim.radius), 0.0)
+    d_z = np.maximum(np.abs(loc[:, 2]) - 0.5 * float(prim.height), 0.0)
+    return d_r * d_r + d_z * d_z
+
+
+def _overlaps_sweep(prims, sph_link) -> bool:
+    """障碍是否与该 link 扫掠球【真有交集】（精确 点-实体 距离，非包围球近似）。
+
+    sph_link: (T,S,4) 该 link 沿默认轨迹的全部扫掠球 [x,y,z,r]。把球心摊平成 (N,3)，对每个 prim 用
+    _point_solid_dist2 求各球心到实体的最短距离²，存在某球 dist² ≤ r² 即「障碍嵌进扫掠管」→ True。
+    """
+    balls = np.asarray(sph_link, float).reshape(-1, 4)
+    bc, br = balls[:, :3], balls[:, 3]                    # (N,3),(N,)
+    for p in prims:
+        d2 = _point_solid_dist2(p, bc)
+        if np.any(d2 <= br * br):
+            return True
+    return False
+
+
 def _init_free_push_dir(prims, cfg, tangent) -> Optional[np.ndarray]:
     """外推方向：与 init_free 圆柱 z 段 [0,cyl_h] 重叠的各 prim 包围球心的水平质心的「外向径向」单位向量。
 
@@ -371,20 +410,24 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
     # 一步推到位，不再「随机摆→撞 init→重抽」、也不迭代。
     prims = ob.build(otype, anchor_eff.tolist(), anchor_rpy_deg=tuple(rpy), **shape)
     # 外推前的「初始」摆放可视化（与 search_placement 里那次同款；用于肉眼比对外推前/后）
-    # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
-    #                     cfg=cfg, retract=retract,
-    #                     title=f"{link}/{otype} 初始(未外推)")
+    _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
+                        cfg=cfg, retract=retract,
+                        title=f"{link}/{otype} 初始(未外推)")
 
     u = _init_free_push_dir(prims, cfg, tangent)             # None=无 prim 与圆柱 z 段重叠，无需外推
     push_total = _init_free_clear_distance(prims, cfg, u) if u is not None else 0.0
     if push_total > 1e-6:
-        if push_total > tube_r + 0.5 * span:                 # 推太远→已离开走廊、挡不住路径 → 放弃此处
-            return None
         anchor_eff = anchor_eff + u * (push_total + 1e-2)    # 一次推到位（+1mm 余量）
         prims = ob.build(otype, anchor_eff.tolist(), anchor_rpy_deg=tuple(rpy), **shape)
-        # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
-        #                     cfg=cfg, retract=retract,
-        #                     title=f"{link}/{otype} 外推后(已清空)")
+        _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
+                            cfg=cfg, retract=retract,
+                            title=f"{link}/{otype} 外推后(已清空)")
+
+    # 几何自检：障碍最终摆放必须与该 link 扫掠管【真有交集】（精确 点-实体 距离，非包围球）。
+    # 否则（如被 init_free 外推出走廊、或 jitter 偏出）放过去也只会以 too_weak 失败 → 早退省一次 cuRobo 验证。
+    # 注意：与工件 mesh 是否重叠不作判定（工件本是已知障碍，嵌进去不影响「挡路+有绕行」）。
+    if not _overlaps_sweep(prims, sph):
+        return None
 
     # 外推后再校验与 goal 的间距（不要紧贴焊缝）
     if float(np.linalg.norm(anchor_eff - np.asarray(goal_pos, float))) < op["goal_clearance_m"]:
@@ -623,9 +666,9 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
         prims, anchor, meta = placed
         world = build_world(workpiece_mesh, prims)
         handle.mg.update_world(world)
-        # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
-        #                     cfg=cfg, retract=retract,
-        #                     title=f"{link}/{otype} attempt{attempt + 1}")
+        _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
+                            cfg=cfg, retract=retract,
+                            title=f"{link}/{otype} attempt{attempt + 1}")
         v = validate_scene(handle, traj_default, retract, goal_pose, metric, cfg)
         last = v["fail_reason"]
         if v["ok"]:
