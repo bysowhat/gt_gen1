@@ -147,6 +147,7 @@ class Config:
         op = dict(self.raw.get("obstacle_placement", {}))
         op.setdefault("max_per_scene", 1)
         op.setdefault("max_attempts", 20)
+        op.setdefault("detour_max_attempts", 30)
         op.setdefault("key_links",
                       ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"])
         op.setdefault("pos_t_window", [0.25, 0.85])

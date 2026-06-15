@@ -106,7 +106,11 @@ obstacle_placement:                     # 沿「关键 link 扫掠走廊」自�
   # 底层 place_in_corridor 按参数（link/类型/尺寸/角度/位置）放 ≤M 个障碍；上层 search_placement
   # 失败就改尺寸/角度/位置重试至 N 次。判定「合适」三条件：①默认路径碰撞 ②仍有绕行解 ③绕行明显不同。
   max_per_scene: 1                      # M：每个场景最多障碍数（先实现 M=1）
-  max_attempts: 20                      # N：单个 (link,type) 放置失败后的最大重试次数
+  max_attempts: 200                      # N：单个 (link,type) 放置失败后的最大重试次数
+  detour_max_attempts: 30               # 绕行可行性判定(detour_exists)的 plan 尝试次数。
+                                        # 独立于 planner.max_attempts(=200，那是产最终 GT 用的余量)；
+                                        # 这里只判「是否存在绕行解」，无需跑满 → 取小值大幅提速
+                                        # （障碍挡死时是最坏情况：ik_return_seeds 个候选 × 此值，全失败才返回）。
   key_links: ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"]
   pos_t_window: [0.25, 0.85]            # 选 anchor 的默认轨迹时间窗（避开起点 init_free 段与终点焊缝段）
   goal_clearance_m: 0.25               # anchor 距 goal 位置的最小距离（不要紧贴焊缝）

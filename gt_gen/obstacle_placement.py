@@ -476,7 +476,8 @@ def validate_scene(handle, traj_default, retract, goal_pose, metric, cfg) -> dic
     collides, n_bad = path_collides(handle, traj_default)
     if not collides:
         return dict(ok=False, fail_reason="too_weak", n_bad=0, dist=0.0, detour_traj=None)
-    ok2, traj2 = detour_exists(handle, retract, goal_pose, metric, cfg.plan_max_attempts)
+    ok2, traj2 = detour_exists(handle, retract, goal_pose, metric,
+                               int(op["detour_max_attempts"]))
     if not ok2:
         return dict(ok=False, fail_reason="no_solution", n_bad=n_bad, dist=0.0, detour_traj=None)
     okd, dist = is_detour_different(traj_default, traj2, op["detour_min_joint_rad"])
