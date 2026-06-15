@@ -101,3 +101,17 @@ params:
     observe_every_n: 3                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
     interp_resolution_m: 0.01           # 扫掠体积插值精度（Step 6）
+
+obstacle_placement:                     # 沿「关键 link 扫掠走廊」自动放障碍（见 docs/障碍物位置.md）
+  # 底层 place_in_corridor 按参数（link/类型/尺寸/角度/位置）放 ≤M 个障碍；上层 search_placement
+  # 失败就改尺寸/角度/位置重试至 N 次。判定「合适」三条件：①默认路径碰撞 ②仍有绕行解 ③绕行明显不同。
+  max_per_scene: 1                      # M：每个场景最多障碍数（先实现 M=1）
+  max_attempts: 20                      # N：单个 (link,type) 放置失败后的最大重试次数
+  key_links: ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"]
+  pos_t_window: [0.25, 0.85]            # 选 anchor 的默认轨迹时间窗（避开起点 init_free 段与终点焊缝段）
+  goal_clearance_m: 0.25               # anchor 距 goal 位置的最小距离（不要紧贴焊缝）
+  size_scale_range: [0.6, 1.6]          # 障碍尺寸相对局部走廊管半径的缩放采样区间
+  angle_jitter_deg: 180                  # 角度扰动幅度（度）
+  pos_jitter_m: 0.40                    # 位置扰动幅度（米）
+  detour_min_joint_rad: 0.3            # 条件③：绕行 vs 默认的关节空间最大偏差阈值（rad）
+  obstacle_types: []                    # 空=用 obstacles.list_obstacles() 全部 15 种

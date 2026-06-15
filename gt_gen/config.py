@@ -140,6 +140,25 @@ class Config:
     def params(self) -> dict:
         return self.raw.get("params", {})
 
+    # ---- 障碍物自动放置（见 docs/障碍物位置.md, gt_gen/obstacle_placement.py） ----
+    @property
+    def obstacle_placement(self) -> dict:
+        """obstacle_placement 段（单一来源）。缺省给出与 default.yaml 一致的兜底。"""
+        op = dict(self.raw.get("obstacle_placement", {}))
+        op.setdefault("max_per_scene", 1)
+        op.setdefault("max_attempts", 20)
+        op.setdefault("key_links",
+                      ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"])
+        op.setdefault("pos_t_window", [0.25, 0.85])
+        op.setdefault("goal_clearance_m", 0.25)
+        op.setdefault("size_scale_range", [0.6, 1.6])
+        op.setdefault("angle_jitter_deg", 30.0)
+        op.setdefault("pos_jitter_m", 0.10)
+        op.setdefault("detour_min_joint_rad", 0.30)
+        op.setdefault("obstacle_types", [])
+        return op
+
+
 
 def load_config(path: str = DEFAULT_CONFIG) -> Config:
     with open(path, "r") as f:
