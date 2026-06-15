@@ -1,0 +1,304 @@
+##
+## Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+##
+## NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+## property and proprietary rights in and to this material, related
+## documentation and any modifications thereto. Any use, reproduction,
+## disclosure or distribution of this material and related documentation
+## without an express license agreement from NVIDIA CORPORATION or
+## its affiliates is strictly prohibited.
+##
+
+robot_cfg:
+  kinematics:
+    usd_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.usd"
+    usd_robot_root: "/ur12e"
+    isaac_usd_path: ""
+    usd_flip_joints: {}
+    usd_flip_joint_limits: []
+
+    urdf_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/robot_description.urdf"
+    asset_root_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e"
+    
+    base_link: "base_link"
+    ee_link: "xiaoyu_tip_link"
+    link_names: null
+    lock_joints: null
+    extra_links: null
+
+    
+    collision_link_names: ["xiaoyu_base_link", "xiaoyu_arm_base_link", "xiaoyu_accessory_link", "Link1", "Link2", "Link3", "Link4", "Link5", "Link6"]
+    collision_spheres:
+      xiaoyu_base_link:
+        - "center": [0.0, 0.0, -0.108]
+          "radius": 0.07
+        - "center": [0.0, 0.0, -0.18]
+          "radius": 0.07
+        - "center": [0.089, -0.122, -0.23]
+          "radius": 0.03
+        - "center": [0.051, -0.113, -0.23]
+          "radius": 0.03
+        - "center": [0.073, 0.0, -0.23]
+          "radius": 0.03
+        - "center": [0.078, 0.106, -0.23]
+          "radius": 0.03
+        - "center": [0.0, 0.062, -0.23]
+          "radius": 0.03
+        - "center": [-0.118, 0.0, -0.23]
+          "radius": 0.03
+        - "center": [-0.136, -0.015, -0.23]
+          "radius": 0.03
+        - "center": [0.039, -0.006, -0.23]
+          "radius": 0.03
+        - "center": [0.059, 0.047, -0.23]
+          "radius": 0.03
+        - "center": [0.0, -0.088, -0.23]
+          "radius": 0.03
+        - "center": [0.06, -0.067, -0.23]
+          "radius": 0.03
+        - "center": [-0.066, 0.0, -0.23]
+          "radius": 0.03
+        - "center": [-0.062, 0.037, -0.23]
+          "radius": 0.03
+        - "center": [-0.064, -0.044, -0.23]
+          "radius": 0.03
+        - "center": [-0.155, -0.019, -0.23]
+          "radius": 0.03
+        - "center": [-0.163, 0.012, -0.23]
+          "radius": 0.03
+        - "center": [0.065, 0.145, -0.23]
+          "radius": 0.03
+        - "center": [0.097, 0.127, -0.23]
+          "radius": 0.03
+        - "center": [0.092, -0.128, -0.23]
+          "radius": 0.03
+        - "center": [0.064, -0.147, -0.23]
+          "radius": 0.03
+      xiaoyu_arm_base_link:
+        - "center": [-0.013, 0.001, 0.05]
+          "radius": 0.05934
+        - "center": [0.032, 0.005, 0.049]
+          "radius": 0.05878
+        - "center": [-0.008, -0.03, 0.049]
+          "radius": 0.05934
+        - "center": [-0.007, 0.028, 0.05]
+          "radius": 0.05934
+        - "center": [-0.036, 0.005, 0.046]
+          "radius": 0.056
+        - "center": [0.01, -0.032, 0.048]
+          "radius": 0.05767
+        - "center": [0.022, 0.051, 0.031]
+          "radius": 0.041
+      xiaoyu_accessory_link:
+        - "center": [-0.162, 0.0, -0.076]
+          "radius": 0.013
+        - "center": [-0.426, 0.0, -0.268]
+          "radius": 0.04645
+        - "center": [-0.312, 0.0, -0.186]
+          "radius": 0.04645
+        - "center": [-0.373, 0.001, -0.229]
+          "radius": 0.04532
+        - "center": [-0.246, -0.0, -0.137]
+          "radius": 0.03407
+        - "center": [-0.343, 0.001, -0.209]
+          "radius": 0.04532
+        - "center": [-0.396, -0.001, -0.247]
+          "radius": 0.04588
+        - "center": [-0.274, 0.0, -0.157]
+          "radius": 0.03407
+        - "center": [-0.306, 0.0, -0.18]
+          "radius": 0.04645
+        - "center": [-0.024, 0.001, -0.0]
+          "radius": 0.014
+        - "center": [-0.214, -0.001, -0.116]
+          "radius": 0.02057
+        - "center": [-0.087, 0.0, -0.021]
+          "radius": 0.013
+        - "center": [-0.176, 0.0, -0.086]
+          "radius": 0.013
+        - "center": [-0.142, 0.001, -0.061]
+          "radius": 0.013
+        - "center": [-0.125, -0.001, -0.05]
+          "radius": 0.013
+        - "center": [-0.049, 0.001, -0.001]
+          "radius": 0.015
+        - "center": [-0.07, 0.0, -0.009]
+          "radius": 0.013
+        - "center": [-0.106, -0.0, -0.035]
+          "radius": 0.013
+        - "center": [-0.331, -0.0, -0.202]
+          "radius": 0.04476
+        - "center": [-0.194, 0.0, -0.099]
+          "radius": 0.013
+        - "center": [-0.005, 0.0, 0.001]
+          "radius": 0.014
+        - "center": [-0.352, 0.08, -0.214]
+          "radius": 0.04716
+        - "center": [-0.359, 0.076, -0.182]
+          "radius": 0.04083
+        - "center": [-0.33, 0.073, -0.246]
+          "radius": 0.03722
+        - "center": [-0.363, 0.072, -0.243]
+          "radius": 0.03902
+        - "center": [-0.341, 0.076, -0.178]
+          "radius": 0.03902
+        - "center": [-0.333, 0.105, -0.213]
+          "radius": 0.0327
+        - "center": [-0.371, 0.076, -0.18]
+          "radius": 0.03812
+        - "center": [-0.365, 0.088, -0.214]
+          "radius": 0.04083
+        - "center": [-0.332, 0.071, -0.215]
+          "radius": 0.03631
+        - "center": [-0.363, 0.063, -0.251]
+          "radius": 0.0345
+        - "center": [-0.37, 0.064, -0.215]
+          "radius": 0.0336
+        - "center": [-0.333, 0.093, -0.167]
+          "radius": 0.02727
+        - "center": [-0.418, 0.061, -0.242]
+          "radius": 0.02004
+        - "center": [-0.421, 0.064, -0.202]
+          "radius": 0.02004
+        - "center": [-0.43, 0.061, -0.223]
+          "radius": 0.02004
+        - "center": [-0.407, 0.064, -0.219]
+          "radius": 0.02004
+        - "center": [-0.324, 0.086, -0.255]
+          "radius": 0.02818
+        - "center": [-0.395, 0.108, -0.232]
+          "radius": 0.02004
+        - "center": [-0.42, 0.105, -0.228]
+          "radius": 0.01914
+        - "center": [-0.389, 0.108, -0.21]
+          "radius": 0.02275
+      Link1:
+        - "center": [0.0, -0.007, -0.003]
+          "radius": 0.08495
+        - "center": [0.0, -0.02, 0.009]
+          "radius": 0.08383
+        - "center": [-0.0, 0.0, 0.011]
+          "radius": 0.08439
+        - "center": [0.002, -0.034, -0.021]
+          "radius": 0.07038
+        - "center": [0.001, 0.02, -0.027]
+          "radius": 0.06478
+      Link3:
+        - "center": [-0.057, 0.001, 0.039]
+          "radius": 0.06613
+        - "center": [-0.536, 0.001, 0.039]
+          "radius": 0.05388
+        - "center": [-0.312, -0.0, 0.039]
+          "radius": 0.05183
+        - "center": [-0.165, 0.0, 0.039]
+          "radius": 0.05183
+        - "center": [-0.409, 0.0, 0.039]
+          "radius": 0.05183
+        - "center": [-0.229, 0.0, 0.039]
+          "radius": 0.05183
+        - "center": [0.0, 0.005, 0.068]
+          "radius": 0.05456
+        - "center": [-0.477, -0.002, 0.038]
+          "radius": 0.04979
+        - "center": [-0.576, -0.002, 0.056]
+          "radius": 0.04911
+        - "center": [-0.342, -0.0, 0.039]
+          "radius": 0.05183
+        - "center": [-0.571, -0.004, 0.026]
+          "radius": 0.05047
+        - "center": [-0.024, 0.004, 0.056]
+          "radius": 0.0634
+      Link2:
+        - "center": [-0.003, 0.001, 0.169]
+          "radius": 0.08358
+        - "center": [-0.611, 0.001, 0.183]
+          "radius": 0.06677
+        - "center": [-0.076, 0.001, 0.176]
+          "radius": 0.07899
+        - "center": [-0.491, -0.001, 0.175]
+          "radius": 0.06371
+        - "center": [-0.212, 0.001, 0.177]
+          "radius": 0.06371
+        - "center": [-0.357, 0.001, 0.177]
+          "radius": 0.06295
+        - "center": [-0.297, 0.001, 0.175]
+          "radius": 0.06295
+        - "center": [-0.418, -0.001, 0.175]
+          "radius": 0.06295
+        - "center": [-0.564, 0.0, 0.175]
+          "radius": 0.06677
+        - "center": [-0.004, -0.006, 0.195]
+          "radius": 0.07823
+        - "center": [-0.155, 0.0, 0.174]
+          "radius": 0.06295
+        - "center": [-0.621, -0.003, 0.161]
+          "radius": 0.05837
+      Link4:
+        - "center": [0.0, -0.007, -0.004]
+          "radius": 0.05439
+        - "center": [-0.0, -0.0, -0.033]
+          "radius": 0.05439
+        - "center": [-0.0, 0.006, -0.0]
+          "radius": 0.05439
+        - "center": [0.001, -0.013, 0.0]
+          "radius": 0.05364
+        - "center": [0.001, 0.019, -0.02]
+          "radius": 0.04541
+      Link5:
+        - "center": [0.0, 0.007, -0.001]
+          "radius": 0.05442
+        - "center": [-0.0, -0.01, -0.019]
+          "radius": 0.05086
+        - "center": [-0.0, -0.009, -0.002]
+          "radius": 0.05442
+        - "center": [0.004, 0.007, -0.024]
+          "radius": 0.04872
+        - "center": [-0.0, 0.013, 0.0]
+          "radius": 0.0537
+      Link6:
+        - "center": [-0.008, 0.009, -0.033]
+          "radius": 0.03624
+        - "center": [0.014, -0.013, -0.034]
+          "radius": 0.03569
+        - "center": [-0.013, -0.014, -0.034]
+          "radius": 0.03569
+        - "center": [0.007, 0.019, -0.032]
+          "radius": 0.03514
+        - "center": [0.019, 0.001, -0.034]
+          "radius": 0.03514
+
+
+    collision_sphere_buffer: 0.002
+    extra_collision_spheres: {}
+    self_collision_ignore: {
+      "xiaoyu_arm_base_link": ["xiaoyu_base_link","Link1"],
+      "Link1": ["Link2"],
+      "Link2": ["Link3"],
+      "Link3": ["Link4"],
+      "Link4": ["Link5"],
+      "Link5": ["Link6"],
+      "Link6": ["xiaoyu_accessory_link"],
+      }
+    self_collision_buffer: {
+      'xiaoyu_base_link': 0.001,
+      'xiaoyu_arm_base_link': 0.001,
+      'xiaoyu_accessory_link': 0.001,
+      'Link1': 0.001,
+      'Link2': 0.001,
+      'Link3': 0.001,
+      'Link4': 0.001,
+      'Link5': 0.001,
+      'Link6': 0.001,
+    } # Dict[str, float]
+
+    use_global_cumul: True
+    mesh_link_names: null # List[str]
+    external_asset_path: null # Use this to add path for externally located assets/robot folder.
+
+    cspace:
+      joint_names: ["xiaoyu_arm_joint1","xiaoyu_arm_joint2","xiaoyu_arm_joint3","xiaoyu_arm_joint4","xiaoyu_arm_joint5","xiaoyu_arm_joint6"] # List[str]
+      retract_config: [1.5707824230194092,-2.0071660480894984,1.3613484541522425,-0.9599629205516357,-1.570770565663473,0.0] # List[float]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # List[str]
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # List[str]
+      max_jerk: 500.0
+      max_acceleration: 15.0
