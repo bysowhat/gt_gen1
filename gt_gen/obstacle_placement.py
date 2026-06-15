@@ -19,6 +19,7 @@ M（max_per_scene）、N（max_attempts）等参数在 configs/default.yaml 的 
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -126,42 +127,126 @@ def _inside_init_free(p, cfg) -> bool:
 
 
 # ------------------------------------------------------------------ 障碍尺寸（按走廊管半径）
-def _shape_for(otype: str, span: float, tube_r: float) -> Tuple[dict, Tuple[float, float, float]]:
+def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
+               ) -> Tuple[dict, Tuple[float, float, float]]:
     """据局部走廊跨度 span / 管半径 tube_r 给该障碍类型的形状参数 + anchor 微调偏置(局部系，一般 0)。
 
-    span：障碍应覆盖的横向尺寸（≈走廊直径×size_scale）。返回 (shape_kwargs, local_offset)。
-    多数类型 anchor 即结构中心，offset=(0,0,0)；少数（l_bracket/u_channel/steps/gantry 以角/底为锚）
-    给一点偏置让结构主体压在 anchor 上。
+    入参
+    ----
+    otype   : 障碍类型名（obstacles.REGISTRY 的键）。
+    span    : 障碍应覆盖的横向尺寸（米）。来自 place_in_corridor 的 2·tube_r·size_scale，即「走廊
+              直径 × 尺寸缩放」——让障碍大致横穿整条走廊、挡住路径。下面记 clip 后的值为 s。
+    tube_r  : 局部走廊「管半径」（米）——该路点处各碰撞球外缘到 anchor 的最大距离，描述走廊有多粗。
+              主要用于定「细长杆/管/梁」类构件的截面半径或边长。下面记 clip 后的值为 rt。
+    cfg     : 配置对象；从 cfg.obstacle_placement 读 span/tube_r 的夹紧区间（span_clip_m /
+              tube_r_clip_m），不在代码里写死。
+    th      : 板/壁厚（米）。由调用方（place_in_corridor，值在 search_placement 按
+              thickness_range_m 随机采样）传入，使每次放置的薄板/盒壁厚度有多样性。
+
+    返回
+    ----
+    (shape_kwargs, local_offset)：
+      shape_kwargs —— 直接喂给 obstacles.build(otype, ..., **shape) 的该类型形状参数 dict；
+      local_offset —— anchor 朝向系下对 anchor 的微调偏置（米）。多数类型 anchor 即结构几何中心，
+                      offset=(0,0,0)；少数以「角/底/端」为锚的结构给一点偏置，把结构主体压到走廊上。
+      （各类型 shape 参数的逐项含义见下方 table 每条上方的行内注释；值由 s / rt / 随机壁厚 th 推出。）
+
+    为何对 s / rt 做 clip（夹紧到固定区间，区间值来自 default.yaml）
+    ----
+    span 与 tube_r 都是从「当前路点的扫掠球」量出来的，再乘上可在重试中被自适应放大/缩小的
+    size_scale（too_weak 时 ×1.25、no_solution 时 ×0.8…），数值会在很大范围漂移，甚至退化：
+      · span 可能因某 link 在该处球簇很小而趋近 0，或被放大到不合理；
+      · tube_r 同理可能极小或极大。
+    若不夹紧，会出两类问题：
+      （下界）尺寸趋 0 → 障碍小到挡不住路径（永远 too_weak）、或薄到生成的 mesh 退化、碰撞球穿过去；
+      （上界）尺寸过大 → 障碍塞满整个场景，挡死所有绕行（永远 no_solution）、还可能与工件/基座/地面
+              相交，且大 mesh 拖慢碰撞检查。
+    所以（区间从 cfg.obstacle_placement 读，便于逐机器/逐场景调，不写死在代码）：
+      s  = clip(span,   span_clip_m[0],   span_clip_m[1])   —— 障碍主跨度：下界保证大到能横挡走廊，
+                                                              上界防吞掉整个工作空间而无解。
+      rt = clip(tube_r, tube_r_clip_m[0], tube_r_clip_m[1]) —— 杆/管/梁截面半径：下界防细到数值上可
+                                                              忽略、从碰撞球缝隙漏过；上界防单根管成大圆柱。
+    夹紧后这两个值才是「物理上合理、可复现」的形状输入。th(板/壁厚)同理由 thickness_range_m 随机取，
+    既有多样性又被限定在合理薄板范围。
     """
-    s = float(np.clip(span, 0.15, 1.2))
-    rt = float(np.clip(tube_r, 0.04, 0.20))
-    th = 0.03
+    op = cfg.obstacle_placement
+    s_lo, s_hi = op["span_clip_m"]
+    rt_lo, rt_hi = op["tube_r_clip_m"]
+    s = float(np.clip(span, float(s_lo), float(s_hi)))
+    rt = float(np.clip(tube_r, float(rt_lo), float(rt_hi)))
+    th = float(th)
     O = (0.0, 0.0, 0.0)
     table = {
+        # plate: length=高(Z向), width=宽(Y向), thickness=板厚, tilt_deg=绕Y倾角
+        #   → 一块 s×s 的薄板，法向(+X)对齐切向，正面横挡走廊。
         "plate":          (dict(length=s, width=s, thickness=th, tilt_deg=0.0), O),
+        # l_bracket: length=两板边长, width=板宽, thickness=板厚；
+        #   offset=(-s/2,0,-s/2) 把 └ 的角从结构角挪到走廊中心（默认锚在 L 的拐角）。
         "l_bracket":      (dict(length=s, width=s, thickness=th), (-s / 2, 0.0, -s / 2)),
+        # u_channel: length=槽长(X), width=槽宽(Y,两侧板间距), height=侧板高(Z), thickness=壁厚；
+        #   offset=(0,0,-s·0.35) 把开口槽底压到走廊（默认锚在底板）。
         "u_channel":      (dict(length=s, width=s, height=s * 0.7, thickness=th), (0.0, 0.0, -s * 0.35)),
+        # open_box: size=(sx,sy,sz) 盒外形, wall=壁厚, open_face="front"=缺 +X 面（开口迎着切向）。
         "open_box":       (dict(size=(s, s, s), wall=th, open_face="front"), O),
+        # pipe: length=管长(取 s·1.5 让管足够长跨过走廊), radius=管半径(=rt), axis="y"=管轴沿 Y
+        #   （切向对齐后即垂直于路径，横拦走廊）。
         "pipe":           (dict(length=s * 1.5, radius=rt, axis="y"), O),
+        # parallel_pipes: n=管数(3), length=管长(s·1.5), radius=rt, gap=管间距(s·0.5), axis="y"管轴,
+        #   stack="z" 沿 Z 排开 → 一排平行管像护栏。
         "parallel_pipes": (dict(n=3, length=s * 1.5, radius=rt, gap=s * 0.5, axis="y", stack="z"), O),
+        # crossed_pipes: length=管长(s·1.5), radius=rt, cross_deg=90 → 两管在 Y-Z 面内成 X 形交叉。
         "crossed_pipes":  (dict(length=s * 1.5, radius=rt, cross_deg=90.0), O),
+        # box_beam: length=梁长(s·1.5), side=方截面边长(≥0.06, 取 rt·1.4), axis="y" 梁沿 Y 横拦。
         "box_beam":       (dict(length=s * 1.5, side=max(0.06, rt * 1.4), axis="y"), O),
+        # rect_frame: width=框宽(Y), height=框高(Z), beam=边框方梁截面(≥0.06,取 rt) → 中间留孔的矩形框。
         "rect_frame":     (dict(width=s, height=s, beam=max(0.06, rt)), O),
+        # gantry: span=两立柱间距, height=立柱高, post=立柱截面(≥0.06,取 rt), beam=横梁截面(≥0.08,取 rt)；
+        #   offset=(0,0,-s/2) 把门架从「立柱底=锚」下移，使横梁/门洞罩住走廊（默认锚在地面平面）。
         "gantry":         (dict(span=s, height=s, post=max(0.06, rt), beam=max(0.08, rt)), (0.0, 0.0, -s / 2)),
+        # braced_frame: width,height,beam 同 rect_frame, brace=对角斜撑截面(≥0.05,取 rt·0.8)
+        #   → 框+一根斜梁破坏直穿。
         "braced_frame":   (dict(width=s, height=s, beam=max(0.06, rt), brace=max(0.05, rt * 0.8)), O),
+        # tripod: height=三角高, base_half=底边半宽, rod=杆半径(≥0.05,取 rt) → 三根杆组成的竖立三角框。
         "tripod":         (dict(height=s, base_half=s * 0.5, rod=max(0.05, rt)), O),
+        # steps: n=台阶数(3), rise=单级升高(s·0.33), run=单级进深(s·0.4), width=台阶宽(Y)；
+        #   offset=(-s·0.6,0,-s/2) 把楼梯主体从「第一级底角=锚」挪到走廊中心。
         "steps":          (dict(n=3, rise=s * 0.33, run=s * 0.4, width=s), (-s * 0.6, 0.0, -s / 2)),
+        # box_with_pipe: size,wall,open_face 同 open_box, pipe_radius=开口前横管半径(=rt) → 开口盒+挡管组合。
         "box_with_pipe":  (dict(size=(s, s, s), wall=th, open_face="front", pipe_radius=rt), O),
+        # frame_with_brace: 同 braced_frame（width,height,beam,brace）——语义别名入口。
         "frame_with_brace": (dict(width=s, height=s, beam=max(0.06, rt), brace=max(0.05, rt * 0.8)), O),
     }
+    # 其它/未知类型 → 回退成一块 plate(length=s, width=s, thickness=th)。
     return table.get(otype, (dict(length=s, width=s, thickness=th), O))
 
 
 # ------------------------------------------------------------------ 底层放置（M=1）
 def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos_frac,
-                      jitter_vec, cfg, goal_pos):
+                      jitter_vec, thickness, cfg, goal_pos):
     """在 link 的扫掠走廊里放 1 个障碍（参数驱动、确定性）。返回 (prims, anchor, meta)；被排除区否决则返回 None。
 
+    per_wp:
+            per_wp: Dict[str, np.ndarray]
+            # per_wp[link] : shape (T, S_link, 4)
+
+            - key：link 名（"Link2"/"Link3"/.../"xiaoyu_accessory_link"，只含在 yml collision_spheres 里有定义的）；
+            - value：(T, S, 4) 的数组
+            - T = 默认轨迹路点数（如日志里的 67）；
+            - S = 该 link 的碰撞球个数（如 Link2/Link3 各 12 个、accessory 41 个，见运行日志 {'Link2': (67, 12, 4), ...}）；
+            - 最后一维 4 = [x, y, z, r]，即基座系下该球的球心坐标 + 半径。
+    
+    origin:
+            origin: Dict[str, np.ndarray]
+            # origin[link] : shape (T, 3)
+
+            - key：同 per_wp，是各关键 link 名；
+            - value：(T, 3) —— 该 link 坐标系原点在基座系下、沿默认轨迹每个路点的位置轨迹（T = 路点数，如 67）。
+
+            注意区别：
+            - per_wp[link] 是该 link 上所有碰撞球的球心+半径 (T,S,4) → 描述「管子的粗细/范围」；
+            - origin[link] 只是该 link 原点这一个点的轨迹 (T,3) → 描述「管子的走向/中心线」。
+
+  
     - pos_frac∈[0,1] 映射到 obstacle_placement.pos_t_window 内的路点 → 取该路点该 link 的扫掠球；
     - anchor = 这些球心均值 + jitter_vec；估走廊管半径 tube_r 与跨度 span(=2·tube_r·size_scale)；
     - 朝向：把障碍正面(+X)对齐该处路径切向，叠加 angle_deg 绕切向自转；
@@ -185,19 +270,21 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
         return None
     if float(np.linalg.norm(anchor - np.asarray(goal_pos, float))) < op["goal_clearance_m"]:
         return None
+    if len(centers) == 0:
+        return None
 
     # 走廊管半径：球心相对 anchor 的最大「球面外缘距」
-    tube_r = float(np.max(np.linalg.norm(centers - anchor, axis=1) + radii)) if len(centers) else 0.1
+    tube_r = float(np.max(np.linalg.norm(centers - anchor, axis=1) + radii))
     span = 2.0 * tube_r * float(size_scale)
 
-    # 路径切向（link 原点的前后差分）
+    # 路径切向（link 原点的前后差分） 为什么要求路径切向: 核心目的：让障碍「横挡」走廊，而不是顺着走廊摆。
     op_org = origin[link]
     tangent = op_org[min(t + 1, T - 1)] - op_org[max(t - 1, 0)]
     if np.linalg.norm(tangent) < 1e-6:
         tangent = np.array([1.0, 0.0, 0.0])
     rpy = _rpy_align_x_to(tangent, roll_deg=angle_deg)
 
-    shape, local_off = _shape_for(otype, span, tube_r)
+    shape, local_off = _shape_for(otype, span, tube_r, cfg=cfg, th=thickness)
     # local_off 在 anchor 朝向系下偏置 anchor（让以角/底为锚的结构主体压在走廊上）
     anchor_eff = anchor + R.from_euler("xyz", rpy, degrees=True).apply(np.asarray(local_off, float))
     if _inside_init_free(anchor_eff, cfg):
@@ -207,7 +294,7 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
     meta = dict(link=link, otype=otype, anchor=anchor_eff.tolist(), tangent=tangent.tolist(),
                 tube_r=tube_r, span=span, t=t, size_scale=float(size_scale),
                 angle_deg=float(angle_deg), pos_frac=float(pos_frac),
-                jitter=list(map(float, jitter_vec)), shape=shape)
+                jitter=list(map(float, jitter_vec)), thickness=float(thickness), shape=shape)
     return prims, anchor_eff, meta
 
 
@@ -224,11 +311,11 @@ def build_world(workpiece_mesh, prims):
 
 
 # ------------------------------------------------------------------ 三条件验证
-def path_collides(handle, traj, max_checks: int = 80) -> Tuple[bool, int]:
+def path_collides(handle, traj) -> Tuple[bool, int]:
     """默认轨迹在当前(含障碍)世界里是否会碰撞。逐路点 check_state，≥1 不可行即碰撞。返回 (collides, n_bad)。"""
     traj = np.asarray(traj, float)
     n = len(traj)
-    idx = np.unique(np.linspace(0, n - 1, min(max_checks, n)).astype(int))
+    idx = np.unique(np.linspace(0, n - 1, n).astype(int))
     n_bad = 0
     for i in idx:
         feasible, _ = ci.check_state(handle, traj[i].tolist())
@@ -264,6 +351,27 @@ def is_detour_different(traj_default, traj2, thresh) -> Tuple[bool, float]:
 
 def validate_scene(handle, traj_default, retract, goal_pose, metric, cfg) -> dict:
     """综合三条件。handle 世界须已切到「工件+障碍」。返回 dict（含 fail_reason / detour_traj）。"""
+    """
+    validate_scene 是放置验证的核心裁判——判断一个已经摆好障碍的场景是否"合适"。它假设传入的 handle 世界已经切到「工件 + 障碍」状态，然后顺序检验 docs/障碍物位置.md
+    的三条件，任一条不满足就提前返回失败（并附上失败原因，供上层 search_placement 自适应调参重试）：
+
+    ① 默认路径必须被挡住（path_collides）
+    逐路点对默认无障碍轨迹做 check_state,只要有 ≥1 个点在含障碍世界里不可行就算碰撞。
+    - 不碰 → fail_reason="too_weak"（障碍太弱/没挡住，白放）。
+
+    ② 必须仍有绕行解（detour_exists）
+    在含障碍世界里重新 plan_to_pose(retract→goal)，能规划成功才行。
+    - 规划不出 → fail_reason="no_solution"（障碍太强/把路堵死了，无解）。
+
+    ③ 绕行必须明显不同于默认（is_detour_different）
+    两条轨迹等长重采样后，逐路点关节最大偏差的峰值要 ≥ detour_min_joint_rad（默认 0.3 rad）。
+    - 偏差太小 → fail_reason="not_different"（绕了等于没绕，障碍没造成实质性扰动）。
+
+    三条全过 → ok=True，返回里带上 detour_traj(绕行轨迹)、n_bad(碰撞点数)、dist(关节偏差峰值)。
+
+    返回的 dict 形如：
+    {ok, fail_reason ∈ {None, too_weak, no_solution, not_different}, n_bad, dist, detour_traj}
+    """
     op = cfg.obstacle_placement
     collides, n_bad = path_collides(handle, traj_default)
     if not collides:
@@ -277,6 +385,95 @@ def validate_scene(handle, traj_default, retract, goal_pose, metric, cfg) -> dic
     return dict(ok=True, fail_reason=None, n_bad=n_bad, dist=dist, detour_traj=traj2)
 
 
+# ------------------------------------------------------------------ Open3D 调试可视化
+def _pose_to_T(pose7) -> np.ndarray:
+    """[x,y,z,qw,qx,qy,qz](base 系) → 4x4 齐次变换矩阵。"""
+    import open3d as o3d
+    T = np.eye(4)
+    T[:3, :3] = o3d.geometry.get_rotation_matrix_from_quaternion(
+        np.asarray([pose7[3], pose7[4], pose7[5], pose7[6]], float))   # o3d 取 wxyz
+    T[:3, 3] = np.asarray(pose7[:3], float)
+    return T
+
+
+def _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
+                      *, cfg=None, retract=None, title: str = "scene") -> None:
+    """用 Open3D 弹窗可视化当前待验证场景（工件 + 障碍 + 该 link 扫掠走廊 + anchor）。
+
+    仅作肉眼核对用：调用前世界已摆好障碍。窗口阻塞，关闭后继续。
+    传入 cfg+retract 时，额外画出机械臂在【初始位姿(retract)】下的整臂碰撞球（红色线框）。
+    依赖 open3d；缺库或无显示时打印告警后跳过，不影响主流程。
+    """
+    try:
+        import open3d as o3d
+    except Exception as e:                                   # 缺库 → 跳过
+        print(f"[debug-o3d] open3d 不可用，跳过可视化：{e}")
+        return
+
+    geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)]
+
+    # 工件 mesh（浅灰）
+    try:
+        wp = o3d.io.read_triangle_mesh(workpiece_mesh.file_path)
+        if not wp.is_empty():
+            wp.transform(_pose_to_T(workpiece_mesh.pose))
+            wp.compute_vertex_normals()
+            wp.paint_uniform_color([0.7, 0.7, 0.7])
+            geoms.append(wp)
+    except Exception as e:
+        print(f"[debug-o3d] 工件 mesh 加载失败：{e}")
+
+    # 障碍原语（橙色）：Box→create_box（角在原点，需平移居中）；Tube→create_cylinder（已居中、轴 Z）
+    for p in prims:
+        if isinstance(p, ob.Box):
+            dx, dy, dz = (float(v) for v in p.dims)
+            g = o3d.geometry.TriangleMesh.create_box(dx, dy, dz)
+            g.translate((-dx / 2, -dy / 2, -dz / 2))         # 居中到局部原点
+        else:                                                # Tube
+            g = o3d.geometry.TriangleMesh.create_cylinder(float(p.radius), float(p.height))
+        g.transform(_pose_to_T(p.pose))
+        g.compute_vertex_normals()
+        g.paint_uniform_color([0.95, 0.55, 0.15])
+        geoms.append(g)
+
+    # 该 link 扫掠走廊球心（蓝色点云）+ anchor（绿色球）
+    sph = per_wp.get(link)
+    if sph is not None and len(sph):
+        pts = np.asarray(sph, float).reshape(-1, 4)[:, :3]
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        pc.paint_uniform_color([0.1, 0.3, 0.9])
+        geoms.append(pc)
+    a = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+    a.translate(np.asarray(anchor, float))
+    a.compute_vertex_normals()
+    a.paint_uniform_color([0.1, 0.8, 0.2])
+    geoms.append(a)
+
+    # 机械臂初始位姿(retract)下的整臂碰撞球（红色线框，按真实半径）
+    n_init = 0
+    if cfg is not None and retract is not None:
+        try:
+            init_wp, _ = compute_link_sweep(cfg, [list(retract)], cfg.collision_link_names)
+            for ln, s in init_wp.items():
+                for c in np.asarray(s, float)[0]:            # (S,4) 取唯一路点
+                    cx, cy, cz, r = (float(v) for v in c)
+                    if r <= 1e-4:
+                        continue
+                    ball = o3d.geometry.TriangleMesh.create_sphere(radius=r, resolution=8)
+                    ball.translate((cx, cy, cz))
+                    ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+                    ls.paint_uniform_color([0.85, 0.1, 0.1])
+                    geoms.append(ls)
+                    n_init += 1
+        except Exception as e:
+            print(f"[debug-o3d] 初始碰撞球计算失败：{e}")
+
+    print(f"[debug-o3d] 显示场景「{title}」(关闭窗口继续)；"
+          f"障碍原语 {len(prims)} 个，走廊球 {0 if sph is None else len(sph)} 路点，"
+          f"初始碰撞球 {n_init} 个。")
+    o3d.visualization.draw_geometries(geoms, window_name=title)
+
+
 # ------------------------------------------------------------------ 上层重试
 def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
                      traj_default, retract, goal_pose, metric, cfg, rng,
@@ -287,6 +484,7 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
     s_lo, s_hi = op["size_scale_range"]
     ang = float(op["angle_jitter_deg"])
     pj = float(op["pos_jitter_m"])
+    th_lo, th_hi = op["thickness_range_m"]
 
     # 可变状态（随失败原因调整）
     size_scale = rng.uniform(s_lo, s_hi)
@@ -295,16 +493,21 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
         angle_deg = rng.uniform(-ang, ang)
         pos_frac = rng.uniform(0.0, 1.0)
         jitter_vec = np.array([rng.uniform(-pj, pj) for _ in range(3)])
+        thickness = rng.uniform(float(th_lo), float(th_hi))
 
         placed = place_in_corridor(per_wp, origin, link, otype, size_scale=size_scale,
                                    angle_deg=angle_deg, pos_frac=pos_frac,
-                                   jitter_vec=jitter_vec, cfg=cfg, goal_pos=goal_pose[0])
+                                   jitter_vec=jitter_vec, thickness=thickness,
+                                   cfg=cfg, goal_pos=goal_pose[0])
         if placed is None:                                # 落在排除区 → 换位置重采
             last = "excluded"
             continue
         prims, anchor, meta = placed
         world = build_world(workpiece_mesh, prims)
         handle.mg.update_world(world)
+        _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
+                            cfg=cfg, retract=retract,
+                            title=f"{link}/{otype} attempt{attempt + 1}")
         v = validate_scene(handle, traj_default, retract, goal_pose, metric, cfg)
         last = v["fail_reason"]
         if v["ok"]:

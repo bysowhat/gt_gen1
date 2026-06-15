@@ -115,3 +115,7 @@ obstacle_placement:                     # 沿「关键 link 扫掠走廊」自�
   pos_jitter_m: 0.40                    # 位置扰动幅度（米）
   detour_min_joint_rad: 0.3            # 条件③：绕行 vs 默认的关节空间最大偏差阈值（rad）
   obstacle_types: []                    # 空=用 obstacles.list_obstacles() 全部 15 种
+  # _shape_for 的尺寸夹紧/采样区间（不写死在代码里，单一来源）
+  span_clip_m: [0.15, 2.2]              # 障碍主跨度 s=clip(span,·) 的[下界,上界]（米）：下界保证大到能横挡走廊，上界防塞满场景无解
+  tube_r_clip_m: [0.04, 0.20]           # 杆/管/梁截面半径 rt=clip(tube_r,·) 的[下界,上界]（米）：下界防细到漏过，上界防单管成大圆柱
+  thickness_range_m: [0.02, 0.05]       # 板/壁厚 th 的随机采样[下界,上界]（米，每次放置在此区间均匀取）

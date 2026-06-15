@@ -156,6 +156,9 @@ class Config:
         op.setdefault("pos_jitter_m", 0.10)
         op.setdefault("detour_min_joint_rad", 0.30)
         op.setdefault("obstacle_types", [])
+        op.setdefault("span_clip_m", [0.15, 1.2])
+        op.setdefault("tube_r_clip_m", [0.04, 0.20])
+        op.setdefault("thickness_range_m", [0.02, 0.05])
         return op
 
 
