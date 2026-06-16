@@ -15,7 +15,10 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CUROBO_ISAAC = "/home/a/Projects/Github/curobo/examples/isaac_sim"
+# curobo 的 isaac_sim 示例目录（含 helper.add_robot_to_scene）。逐机器不同：
+# 本地默认走下面这个；服务器用环境变量 CUROBO_ISAAC 覆盖（见 scripts/bash/*.sh）。
+CUROBO_ISAAC = os.environ.get("CUROBO_ISAAC",
+                              "/home/a/Projects/Github/curobo/examples/isaac_sim")
 
 try:
     import isaacsim  # noqa: F401

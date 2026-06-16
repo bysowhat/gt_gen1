@@ -1,18 +1,18 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
 robot:                                  # 决策 B
-  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
-  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
+  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
+  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
 
-constraint:                             # 决策 A
-  scope: "whole_arm"                    # 整臂本体（整条臂扫掠体积 ⊆ FREE）
+# constraint:                             # 决策 A
+#   scope: "whole_arm"                    # 整臂本体（整条臂扫掠体积 ⊆ FREE）
 
-scene:                                  # 决策 C
-  format: "obj_mesh"                    # 输入为 watertight .obj
-  example: "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj"
-  # 焊缝/目标位姿来源（hanfeng_* 字段）
-  weld_pkl_example: "/home/a/Datas/20251201/aligned_ifc_parts_7/BEAM_1GMGl500020p4pD3WmDJ8n_part.pkl"
+# scene:                                  # 决策 C
+#   format: "obj_mesh"                    # 输入为 watertight .obj
+#   example: "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj"
+#   # 焊缝/目标位姿来源（hanfeng_* 字段）
+#   weld_pkl_example: "/home/a/Datas/20251201/aligned_ifc_parts_7/BEAM_1GMGl500020p4pD3WmDJ8n_part.pkl"
 
 sensor:                                 # 决策 D + E
   mode: "self_raycast"                  # 自己对 mesh raycast，不依赖 Isaac 渲染
@@ -82,7 +82,7 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
                             # 做 (r+√3/2·voxel) 过近似 → 差约 1 体素。膨胀 1 层使 cuRobo 规划留出一致余量，
                             # 保证 GT 整臂扫掠真正 ⊆ FREE（0 擦边 UNKNOWN）。
   # ↓ 提高规划成功率的三个杠杆（见 curobo_iface.init_curobo / plan_to_config，单一来源）
-  num_trajopt_seeds: 24     # trajopt 并行优化的轨迹起点数（init 时定）。比串行加 max_attempts 又快又稳：
+  num_trajopt_seeds: 128     # trajopt 并行优化的轨迹起点数（init 时定）。比串行加 max_attempts 又快又稳：
                             #   GPU 一把并行铺 N 条取最优，压住「随机起点陷局部最优」的失败。cuRobo 默认偏小(4)。
                             #   注意：plan_single* 路径下 graph planner 的并行种子数也取此值（cuRobo 把
                             #   graph seeds 硬绑到 trajopt seeds，无独立 num_graph_seeds 旋钮）。
