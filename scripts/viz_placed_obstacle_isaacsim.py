@@ -27,6 +27,8 @@ _ap.add_argument("--scene", default=None, help="场景 npz 路径（优先）")
 _ap.add_argument("--out_dir", default="/tmp/placed_obstacles", help="场景目录（配 --index）")
 _ap.add_argument("--index", type=int, default=0, help="--out_dir 内第几个场景（按文件名排序）")
 _ap.add_argument("--which", choices=["default", "detour"], default="detour", help="回放哪条轨迹")
+_ap.add_argument("--detour_index", type=int, default=0,
+                 help="--which detour 时回放第几条绕行候选（npz 的 detour_positions_all）")
 _ap.add_argument("--headless", action="store_true")
 _ap.add_argument("--fps", type=int, default=30)
 args = _ap.parse_args()
@@ -74,8 +76,19 @@ def spawn_prim_dict(k, p):
 
 def main():
     data = np.load(scene_path, allow_pickle=True)
-    positions = data["positions"] if args.which == "default" else data["detour_positions"]
-    positions = np.concatenate([positions, np.tile(positions[-1][None], (50, 1))], axis=0)
+    if args.which == "default":
+        positions = data["positions"]
+    else:
+        # 多条绕行候选存在 detour_positions_all；旧 npz 仅有单条 detour_positions 时兜底
+        if "detour_positions_all" in data.files:
+            alld = list(data["detour_positions_all"])
+            di = max(0, min(args.detour_index, len(alld) - 1))
+            positions = np.asarray(alld[di], float)
+            print(f"绕行候选 {len(alld)} 条，回放第 {di} 条")
+        else:
+            positions = data["detour_positions"]
+    positions = np.concatenate([np.tile(positions[0][None], (30, 1)), positions], axis=0)
+    positions = np.concatenate([positions, np.tile(positions[-1][None], (30, 1))], axis=0)
     joint_names = [str(x) for x in data["joint_names"]]
     piece_pose_to_robot = np.asarray(data["piece_pose_to_robot"], float)
     obj_path = str(data["obj_path"])

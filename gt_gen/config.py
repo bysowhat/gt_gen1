@@ -137,6 +137,25 @@ class Config:
         return int(self.raw.get("planner", {}).get("voxel_inflate_voxels", 1))
 
     @property
+    def num_trajopt_seeds(self) -> int:
+        """trajopt 并行优化的轨迹起点数（MotionGenConfig，init 时定）。越大越稳，GPU 并行几乎不加时。
+
+        注：plan_single* 路径下 graph planner 的并行种子数也取此值——cuRobo 把 graph seeds
+        硬绑到 trajopt seeds（无独立 num_graph_seeds 旋钮，传了也被忽略），故想加 graph 种子调这个。
+        """
+        return int(self.raw.get("planner", {}).get("num_trajopt_seeds", 12))
+
+    @property
+    def enable_graph(self) -> bool:
+        """规划是否先跑 graph planner 找全局可行折线再 trajopt 平滑（窄通道/绕行成功率↑，更慢）。"""
+        return bool(self.raw.get("planner", {}).get("enable_graph", True))
+
+    @property
+    def time_dilation_factor(self) -> float:
+        """轨迹时间放慢系数 ∈(0,1]：<1 把速度/加速度上限按比例缩小，松动力学约束→成功率↑（轨迹更慢）。"""
+        return float(self.raw.get("planner", {}).get("time_dilation_factor", 0.5))
+
+    @property
     def params(self) -> dict:
         return self.raw.get("params", {})
 

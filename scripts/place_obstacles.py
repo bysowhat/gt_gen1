@@ -123,10 +123,13 @@ def main():
             n_ok += 1
             used_types.append(sc["otype"])
             out = os.path.join(args.out_dir, f"scene_{i:02d}_{sc['link']}_{sc['otype']}.npz")
+            detours = sc["detour_trajs"]                       # list[ndarray]：多条互不相同的绕行解
             np.savez(
                 out,
                 positions=traj_default,
-                detour_positions=sc["detour_traj"],
+                detour_positions=detours[0],                  # 主绕行解（首条，IK 误差最小）：viz 默认回放它
+                detour_positions_all=np.array(detours, dtype=object),  # 全部候选（供存多份 GT / 逐条核对）
+                n_detour=len(detours),
                 joint_names=np.array(cfg.joint_names),
                 retract=np.array(retract),
                 obstacle_prims=np.array(_serialize_prims(sc["prims"]), dtype=object),
@@ -140,7 +143,8 @@ def main():
                 dt=0.02,
             )
             print(f"  [{i:02d}] {sc['link']:<22} {sc['otype']:<16} ✓ 第{sc['attempt']}次成功 "
-                  f"碰撞点={sc['n_bad']} 绕行偏差={sc['dist']:.3f}rad → {os.path.basename(out)}")
+                  f"碰撞点={sc['n_bad']} 绕行偏差={sc['dist']:.3f}rad 绕行解={len(detours)}条 "
+                  f"→ {os.path.basename(out)}")
         else:
             print(f"  [{i:02d}] {sc['link']:<22} {sc['otype']:<16} ✗ 试{sc['attempt']}次失败 "
                   f"(末次原因={sc['last_reason']})")

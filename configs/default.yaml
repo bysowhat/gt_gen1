@@ -71,16 +71,26 @@ env:                                    # 决策 F
   conda_env: "env_isaaclab"             # curobo 0.0.post1.dev24 / torch 2.7+cu128 / CUDA 可用
 
 planner:                                # cuRobo IK / 规划参数（见 curobo_iface）
-  ik_num_seeds: 100                     # 每个 IK 问题并行优化的随机起点数（cuRobo 默认 100）
-  ik_return_seeds: 100                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
+  ik_num_seeds: 200                     # 每个 IK 问题并行优化的随机起点数（cuRobo 默认 100）
+  ik_return_seeds: 200                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
   position_threshold: 0.05              # 位置收敛门限（米）；init_curobo 不传时用此值
   rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
-  max_attempts: 200                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
+  max_attempts: 20                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
   drop_collision_links: []  # 从碰撞检查剔除的 link（单一来源：init_curobo 不传时读这里）。空=不剔除任何 link，焊枪也参与避障
   voxel_inflate_voxels: 0   # sync_collision_world 把「非 FREE」障碍向 FREE 膨胀的体素层数。
                             # cuRobo voxel 规划只保证球心避障，而保守判据 motion_stays_in_free 对整臂扫掠
                             # 做 (r+√3/2·voxel) 过近似 → 差约 1 体素。膨胀 1 层使 cuRobo 规划留出一致余量，
                             # 保证 GT 整臂扫掠真正 ⊆ FREE（0 擦边 UNKNOWN）。
+  # ↓ 提高规划成功率的三个杠杆（见 curobo_iface.init_curobo / plan_to_config，单一来源）
+  num_trajopt_seeds: 24     # trajopt 并行优化的轨迹起点数（init 时定）。比串行加 max_attempts 又快又稳：
+                            #   GPU 一把并行铺 N 条取最优，压住「随机起点陷局部最优」的失败。cuRobo 默认偏小(4)。
+                            #   注意：plan_single* 路径下 graph planner 的并行种子数也取此值（cuRobo 把
+                            #   graph seeds 硬绑到 trajopt seeds，无独立 num_graph_seeds 旋钮）。
+  enable_graph: true        # 规划先跑 graph planner 找全局可行折线、再 trajopt 平滑。窄通道/绕障场景
+                            #   （正是放障碍后的绕行）trajopt 易陷局部最优失败，graph 先给可行拓扑→命中率最大提升。
+                            #   代价：更慢。trajopt 种子里一部分由 graph 解插值生成，故与 num_*_seeds 搭配调最有效。
+  time_dilation_factor: 0.5 # 轨迹时间放慢系数 ∈(0,1]：把速度/加速度上限按比例缩小，松动力学约束。
+                            #   对「几何可行但太赶、撞速度/加速度极限」的失败有效；只改快慢不改路径形状（GT 轨迹更慢）。
 
 # 以下参数留待对应步骤填实（先放占位/默认）
 params:
@@ -106,8 +116,8 @@ obstacle_placement:                     # 沿「关键 link 扫掠走廊」自�
   # 底层 place_in_corridor 按参数（link/类型/尺寸/角度/位置）放 ≤M 个障碍；上层 search_placement
   # 失败就改尺寸/角度/位置重试至 N 次。判定「合适」三条件：①默认路径碰撞 ②仍有绕行解 ③绕行明显不同。
   max_per_scene: 1                      # M：每个场景最多障碍数（先实现 M=1）
-  max_attempts: 200                      # N：单个 (link,type) 放置失败后的最大重试次数
-  detour_max_attempts: 200               # 绕行可行性判定(detour_exists)的 plan 尝试次数。
+  max_attempts: 20                      # N：单个 (link,type) 放置失败后的最大重试次数
+  detour_max_attempts: 20               # 绕行可行性判定(detour_exists)的 plan 尝试次数。
                                         # 独立于 planner.max_attempts(=200，那是产最终 GT 用的余量)；
                                         # 这里只判「是否存在绕行解」，无需跑满 → 取小值大幅提速
                                         # （障碍挡死时是最坏情况：ik_return_seeds 个候选 × 此值，全失败才返回）。
@@ -117,7 +127,12 @@ obstacle_placement:                     # 沿「关键 link 扫掠走廊」自�
   size_scale_range: [0.6, 1.6]          # 障碍尺寸相对局部走廊管半径的缩放采样区间
   angle_jitter_deg: 180                  # 角度扰动幅度（度）
   pos_jitter_m: 0.40                    # 位置扰动幅度（米）
-  detour_min_joint_rad: 0.3            # 条件③：绕行 vs 默认的关节空间最大偏差阈值（rad）
+  detour_min_joint_rad: 0.1            # 条件③：绕行 vs 默认的关节空间最大偏差阈值（rad）
+  detour_max_solutions: 10              # 每个场景收集多少条【互不相同】的绕行解存为多份 GT 候选：
+                                       # 对多 IK 分支各规划，按关节偏差峰值 ≥ detour_min_joint_rad 去重，
+                                       # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
+  obstacle_buffer_m: 0.1               # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
+                                        # ②③绕行规划用膨胀尺寸→绕行解与真实障碍留 buffer；工件不受影响。0=关闭
   obstacle_types: []                    # 空=用 obstacles.list_obstacles() 全部 15 种
   # _shape_for 的尺寸夹紧/采样区间（不写死在代码里，单一来源）
   span_clip_m: [0.15, 2.2]              # 障碍主跨度 s=clip(span,·) 的[下界,上界]（米）：下界保证大到能横挡走廊，上界防塞满场景无解

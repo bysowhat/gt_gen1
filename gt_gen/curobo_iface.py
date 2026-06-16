@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
+from tqdm import tqdm
 
 import gt_gen.compat  # noqa: F401  warp shim，须在 import curobo 前
 
@@ -60,6 +63,7 @@ def init_curobo(
     position_threshold: Optional[float] = None,
     rotation_threshold: Optional[float] = None,
     num_seeds: Optional[int] = None,
+    num_trajopt_seeds: Optional[int] = None,
 ) -> CuroboHandle:
     """初始化 MotionGen + warmup。
 
@@ -73,6 +77,10 @@ def init_curobo(
     rotation_threshold：朝向收敛门限（四元数测度；越大越松）。
         注意 cuRobo 在 position_threshold<=1mm 时会自动收紧，别设太小。
     num_seeds：IK 并行优化的随机起点数；None 时取 config.ik_num_seeds（default.yaml）。
+    num_trajopt_seeds：trajopt 并行起点数；None 时取 config.num_trajopt_seeds（planner 段）。比串行
+        加 max_attempts 更划算——GPU 一把并行铺多条取最优，压住「随机起点陷局部最优」的失败。
+        注：plan_single* 路径下 graph planner 的并行种子数也取此值（cuRobo 把 graph seeds 硬绑到
+        trajopt seeds，无独立 num_graph_seeds 旋钮）。
     """
     from curobo.types.base import TensorDeviceType
     from curobo.geom.sdf.world import CollisionCheckerType
@@ -138,6 +146,11 @@ def init_curobo(
         world_model = {"voxel": {"world": {"dims": dims, "pose": pose, "voxel_size": vs}}}
         checker = collision_checker_type or CollisionCheckerType.VOXEL
 
+    if num_trajopt_seeds is None:
+        num_trajopt_seeds = config.num_trajopt_seeds
+
+    # 注：不传 num_graph_seeds——cuRobo plan_single* 路径下 graph planner 的并行种子数恒取
+    # trajopt seeds（见 motion_gen.py:2916），传 num_graph_seeds 会被忽略，故不暴露该旋钮。
     mg_cfg = MotionGenConfig.load_from_robot_config(
         robot_cfg,
         world_model,
@@ -146,6 +159,7 @@ def init_curobo(
         interpolation_dt=interpolation_dt,
         position_threshold=position_threshold,
         rotation_threshold=rotation_threshold,
+        num_trajopt_seeds=num_trajopt_seeds,
     )
     mg = MotionGen(mg_cfg)
     mg.warmup(warmup_js_trajopt=False)
@@ -266,6 +280,50 @@ def plan_to_pose(handle: CuroboHandle, start_cfg, goal_pose, max_attempts: int =
     return last  # 全失败，返回最后一次结果供 explain 诊断
 
 
+def _traj_max_joint_dist(a, b) -> float:
+    """两条关节轨迹的「逐路点关节最大偏差」峰值（等长重采样后比较）。"""
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    n = max(len(a), len(b))
+    ta, tb, tn = (np.linspace(0.0, 1.0, len(a)), np.linspace(0.0, 1.0, len(b)),
+                  np.linspace(0.0, 1.0, n))
+    ra = np.stack([np.interp(tn, ta, a[:, j]) for j in range(a.shape[1])], axis=1)
+    rb = np.stack([np.interp(tn, tb, b[:, j]) for j in range(b.shape[1])], axis=1)
+    return float(np.max(np.abs(ra - rb)))
+
+
+def plan_to_pose_all(handle: CuroboHandle, start_cfg, goal_pose, max_attempts: int = 5,
+                     pose_cost_metric=None, num_solutions: Optional[int] = None,
+                     max_solutions: int = 5, dedup_rad: float = 0.3) -> List[np.ndarray]:
+    """同 plan_to_pose，但【收集多条互不相同】的成功轨迹（多 IK 分支 → 多绕行解）。
+
+    对 IK 多解按位置误差升序逐个 plan_to_config：成功且与【已保留轨迹】的关节空间偏差
+    峰值 ≥ dedup_rad 才收下（滤掉同一 IK 分支的近似重复）；收满 max_solutions 条即停
+    （控代价 + 去重）。dedup_rad 一般取条件③的 detour_min_joint_rad。
+
+    返回 [traj(T,dof) ndarray, ...]，按 IK 误差升序（第 0 条即 plan_to_pose 会返回的那条）；
+    IK 完全无解 / 全部规划失败 → 返回 []。
+    """
+    if num_solutions is None:
+        num_solutions = handle.config.ik_return_seeds
+    res_ik = solve_ik(handle, goal_pose, pose_cost_metric=pose_cost_metric,
+                      return_seeds=num_solutions)
+    cands = ik_configs(handle, res_ik)
+    if not cands:
+        return []
+    kept: List[np.ndarray] = []
+    for goal_cfg, _err in tqdm(cands):
+        if max_solutions and len(kept) >= max_solutions:
+            break
+        res = plan_to_config(handle, start_cfg, goal_cfg, max_attempts=max_attempts)
+        if res is None or not bool(res.success.item()):
+            continue
+        traj = res.get_interpolated_plan().position.detach().cpu().numpy()
+        if all(_traj_max_joint_dist(traj, k) >= dedup_rad for k in kept):
+            kept.append(traj)
+    return kept
+
+
 def plan_to_pose2(handle: CuroboHandle, start_cfg, goal_pose, max_attempts: int = 5,
                   pose_cost_metric=None):
     """直接用 cuRobo `mg.plan_single(末端位姿)` 规划，**不预先 IK 选构型**。
@@ -289,19 +347,33 @@ def plan_to_pose2(handle: CuroboHandle, start_cfg, goal_pose, max_attempts: int 
         applied = bool(handle.mg.update_pose_cost_metric(
             pose_cost_metric, start_state=start, goal_pose=goal))
     try:
-        return handle.mg.plan_single(start, goal, MotionGenPlanConfig(max_attempts=max_attempts))
+        return handle.mg.plan_single(start, goal, MotionGenPlanConfig(
+            max_attempts=max_attempts, enable_graph=handle.config.enable_graph,
+            time_dilation_factor=handle.config.time_dilation_factor))
     finally:
         if applied:
             handle.mg.update_pose_cost_metric(PoseCostMetric(hold_partial_pose=False))
 
 
-def plan_to_config(handle: CuroboHandle, start_cfg, goal_cfg, max_attempts: int = 5):
-    """关节空间到关节空间的无碰撞规划。返回 MotionGenResult。"""
+def plan_to_config(handle: CuroboHandle, start_cfg, goal_cfg, max_attempts: int = 5,
+                   enable_graph: Optional[bool] = None,
+                   time_dilation_factor: Optional[float] = None):
+    """关节空间到关节空间的无碰撞规划。返回 MotionGenResult。
+
+    enable_graph：先跑 graph planner(PRM) 找全局可行折线再 trajopt 平滑（窄通道/绕障成功率↑，更慢）。
+    time_dilation_factor：轨迹时间放慢系数 ∈(0,1]，松速度/加速度约束→成功率↑（轨迹更慢）。
+    两者 None 时取 config.enable_graph / config.time_dilation_factor（planner 段，单一来源）。
+    """
     from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
+    if enable_graph is None:
+        enable_graph = handle.config.enable_graph
+    if time_dilation_factor is None:
+        time_dilation_factor = handle.config.time_dilation_factor
     return handle.mg.plan_single_js(
         _js(handle, start_cfg),
         _js(handle, goal_cfg),
-        MotionGenPlanConfig(max_attempts=max_attempts),
+        MotionGenPlanConfig(max_attempts=max_attempts, enable_graph=enable_graph,
+                            time_dilation_factor=time_dilation_factor),
     )
 
 

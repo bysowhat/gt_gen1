@@ -405,17 +405,44 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
                 size_scale=float(size_scale), shrink_scale=float(scale), sd_k=float(sd_k),
                 angle_deg=float(angle_deg), thickness=float(thickness) * float(scale),
                 shape=shape, init_free_push=0.0)
-    _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
-                        cfg=cfg, retract=retract, title=f"{link}/{otype} t={t_k}(解析解)")
+    # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
+    #                     cfg=cfg, retract=retract, title=f"{link}/{otype} t={t_k}(解析解)")
     return prims, anchor_eff, meta
 
 
 # ------------------------------------------------------------------ 世界构建 + 切换
-def build_world(workpiece_mesh, prims):
-    """工件 mesh + 障碍原语 → 全 mesh 的 WorldConfig（MESH 检查器最稳）。"""
+def inflate_prims(prims, buffer_m: float):
+    """把障碍原语整体膨胀一圈（buffer_m 米），返回新列表；buffer_m<=0 时原样返回。
+
+    Box：每条边长 +2·buffer（左右各扩 buffer）；Tube：半径 +buffer、高 +2·buffer（两端各扩 buffer）。
+    膨胀的是副本（dataclasses.replace），传入的 prims 不被修改（存盘/可视化仍用真实尺寸）。
+    单一来源：build_world 的「绕行留间隙」与 viz_obstacle_buffer 的「膨胀前后对比」都走这里。"""
+    if not buffer_m or buffer_m <= 0:
+        return list(prims)
+    import dataclasses
+    out = []
+    for p in prims:
+        if isinstance(p, ob.Box):
+            out.append(dataclasses.replace(p, dims=[d + 2.0 * buffer_m for d in p.dims]))
+        elif isinstance(p, ob.Tube):
+            out.append(dataclasses.replace(
+                p, radius=p.radius + buffer_m, height=p.height + 2.0 * buffer_m))
+        else:
+            out.append(p)
+    return out
+
+
+def build_world(workpiece_mesh, prims, buffer_m: float = 0.0, show_buffer: bool = False):
+    """工件 mesh + 障碍原语 → 全 mesh 的 WorldConfig（MESH 检查器最稳）。
+    buffer_m>0 时只把障碍原语膨胀一圈（工件 mesh 不变），让绕行解与真实障碍留间隙。
+    膨胀的是 prims 的副本，传入的 prims 不被修改（存盘/可视化仍用真实尺寸）。
+    show_buffer=True 且 buffer_m>0 时，弹 Open3D 窗对比膨胀前后（默认关——search 时会被调
+    很多次，无条件弹窗会反复阻塞；调试单个场景再开）。"""
     import gt_gen.compat  # noqa: F401
     gt_gen.compat.apply_trimesh_shim()
     from curobo.geom.types import WorldConfig
+
+    prims = inflate_prims(prims, buffer_m)
 
     obs_wc = ob.to_world_config(prims)                   # cuboid=/cylinder=
     obs_mesh = obs_wc.get_mesh_world(process=False).mesh # 原语转 mesh
@@ -436,13 +463,15 @@ def path_collides(handle, traj) -> Tuple[bool, int]:
     return n_bad > 0, n_bad
 
 
-def detour_exists(handle, retract, goal_pose, metric, max_attempts):
-    """当前(含障碍)世界里能否规划出绕行解。返回 (ok, traj2 或 None)。"""
-    res = ci.plan_to_pose(handle, retract, goal_pose, max_attempts=max_attempts,
-                          pose_cost_metric=metric)
-    if res is None or not bool(res.success.item()):
-        return False, None
-    return True, res.get_interpolated_plan().position.detach().cpu().numpy()
+def detour_exists(handle, retract, goal_pose, metric, max_attempts,
+                  max_solutions: int = 1, dedup_rad: float = 0.3):
+    """当前(含障碍)世界里能否规划出绕行解。返回 (ok, trajs)：
+    trajs 是 list[ndarray]，按 IK 误差升序、互不相同（关节偏差峰值 ≥ dedup_rad 才算不同）。
+    max_solutions=1 时只取首个成功解（等价旧行为）；>1 时收集多条不同绕行解供存多份 GT。"""
+    trajs = ci.plan_to_pose_all(handle, retract, goal_pose, max_attempts=max_attempts,
+                                pose_cost_metric=metric, max_solutions=max_solutions,
+                                dedup_rad=dedup_rad)
+    return (len(trajs) > 0), trajs
 
 
 def _resample(a, n):
@@ -461,10 +490,15 @@ def is_detour_different(traj_default, traj2, thresh) -> Tuple[bool, float]:
     return dist >= float(thresh), dist
 
 
-def validate_scene(handle, traj_default, retract, goal_pose, metric, cfg) -> dict:
-    """综合三条件。handle 世界须已切到「工件+障碍」。返回 dict（含 fail_reason / detour_traj）。"""
+def validate_scene(handle, traj_default, retract, goal_pose, metric, cfg,
+                   world_real, world_inflated) -> dict:
+    """综合三条件。①碰撞判定用真实尺寸世界 world_real，②③绕行规划用膨胀世界 world_inflated
+    （障碍外扩一圈→绕行解与真实障碍留 buffer）。两世界外部 build_world 时分别构好传入。
+    返回 dict（含 fail_reason / detour_trajs）。"""
     """
-    validate_scene 是放置验证的核心裁判——判断一个已经摆好障碍的场景是否"合适"。它假设传入的 handle 世界已经切到「工件 + 障碍」状态，然后顺序检验 docs/障碍物位置.md
+    validate_scene 是放置验证的核心裁判——判断一个已经摆好障碍的场景是否"合适"。它在内部切换世界：
+    ①用真实尺寸世界 world_real 判碰撞、②③用膨胀世界 world_inflated 判绕行（障碍外扩 buffer，工件不变），
+    然后顺序检验 docs/障碍物位置.md
     的三条件，任一条不满足就提前返回失败（并附上失败原因，供上层 search_placement 自适应调参重试）：
 
     ① 默认路径必须被挡住（path_collides）
@@ -472,30 +506,47 @@ def validate_scene(handle, traj_default, retract, goal_pose, metric, cfg) -> dic
     - 不碰 → fail_reason="too_weak"（障碍太弱/没挡住，白放）。
 
     ② 必须仍有绕行解（detour_exists）
-    在含障碍世界里重新 plan_to_pose(retract→goal)，能规划成功才行。
-    - 规划不出 → fail_reason="no_solution"（障碍太强/把路堵死了，无解）。
+    在含障碍世界里重新规划 retract→goal，能规划成功才行。按 detour_max_solutions 收集多条
+    【互不相同】的绕行解（供存多份 GT 候选）。
+    - 一条都规划不出 → fail_reason="no_solution"（障碍太强/把路堵死了，无解）。
 
     ③ 绕行必须明显不同于默认（is_detour_different）
-    两条轨迹等长重采样后，逐路点关节最大偏差的峰值要 ≥ detour_min_joint_rad（默认 0.3 rad）。
-    - 偏差太小 → fail_reason="not_different"（绕了等于没绕，障碍没造成实质性扰动）。
+    每条绕行与默认等长重采样后，逐路点关节最大偏差的峰值要 ≥ detour_min_joint_rad（默认 0.3 rad）；
+    只保留满足此条的绕行解。
+    - 无一条明显不同 → fail_reason="not_different"（绕了等于没绕，障碍没造成实质性扰动）。
 
-    三条全过 → ok=True，返回里带上 detour_traj(绕行轨迹)、n_bad(碰撞点数)、dist(关节偏差峰值)。
+    三条全过 → ok=True，detour_trajs 是【按 IK 误差升序、互不相同且都明显异于默认】的多条绕行轨迹，
+    第 0 条即默认会优先取的那条；dist=这些绕行里关节偏差峰值的最大值。
 
     返回的 dict 形如：
-    {ok, fail_reason ∈ {None, too_weak, no_solution, not_different}, n_bad, dist, detour_traj}
+    {ok, fail_reason ∈ {None, too_weak, no_solution, not_different}, n_bad, dist, detour_trajs}
+    其中 detour_trajs 是 list[ndarray]（失败时为 []）。
     """
     op = cfg.obstacle_placement
+    thresh = float(op["detour_min_joint_rad"])
+    # ① 真实尺寸：默认路径是否真的撞到（buffer 不参与"是否碰撞"的判定）
+    handle.mg.update_world(world_real)
     collides, n_bad = path_collides(handle, traj_default)
     if not collides:
-        return dict(ok=False, fail_reason="too_weak", n_bad=0, dist=0.0, detour_traj=None)
-    ok2, traj2 = detour_exists(handle, retract, goal_pose, metric,
-                               int(op["detour_max_attempts"]))
+        return dict(ok=False, fail_reason="too_weak", n_bad=0, dist=0.0, detour_trajs=[])
+    # ②③ 膨胀尺寸：绕行解与真实障碍留 buffer 间隙；收集多条互不相同的绕行解
+    handle.mg.update_world(world_inflated)
+    max_sol = int(op.get("detour_max_solutions", 1))
+    ok2, trajs = detour_exists(handle, retract, goal_pose, metric,
+                               int(op["detour_max_attempts"]),
+                               max_solutions=max_sol, dedup_rad=thresh)
     if not ok2:
-        return dict(ok=False, fail_reason="no_solution", n_bad=n_bad, dist=0.0, detour_traj=None)
-    okd, dist = is_detour_different(traj_default, traj2, op["detour_min_joint_rad"])
-    if not okd:
-        return dict(ok=False, fail_reason="not_different", n_bad=n_bad, dist=dist, detour_traj=traj2)
-    return dict(ok=True, fail_reason=None, n_bad=n_bad, dist=dist, detour_traj=traj2)
+        return dict(ok=False, fail_reason="no_solution", n_bad=n_bad, dist=0.0, detour_trajs=[])
+    # ③ 只保留「明显不同于默认」的绕行解
+    diff, best_dist = [], 0.0
+    for t in trajs:
+        okd, d = is_detour_different(traj_default, t, thresh)
+        best_dist = max(best_dist, d)
+        if okd:
+            diff.append(t)
+    if not diff:
+        return dict(ok=False, fail_reason="not_different", n_bad=n_bad, dist=best_dist, detour_trajs=[])
+    return dict(ok=True, fail_reason=None, n_bad=n_bad, dist=best_dist, detour_trajs=diff)
 
 
 # ------------------------------------------------------------------ Open3D 调试可视化
@@ -633,18 +684,19 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
             last = "excluded"
             continue
         prims, anchor, meta = placed
-        world = build_world(workpiece_mesh, prims)
-        handle.mg.update_world(world)
-        if debug_show:
-            _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
-                              cfg=cfg, retract=retract,
-                              title=f"{link}/{otype} attempt{attempt + 1}")
-        v = validate_scene(handle, traj_default, retract, goal_pose, metric, cfg)
+        buf = float(op.get("obstacle_buffer_m", 0.0))
+        world_real = build_world(workpiece_mesh, prims, buffer_m=0.0)
+        world_inflated = build_world(workpiece_mesh, prims, buffer_m=buf)
+        # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor,
+        #                   cfg=cfg, retract=retract,
+        #                   title=f"{link}/{otype} attempt{attempt + 1}")
+        v = validate_scene(handle, traj_default, retract, goal_pose, metric, cfg,
+                           world_real, world_inflated)
         last = v["fail_reason"]
         if v["ok"]:
             return dict(ok=True, link=link, otype=otype, attempt=attempt + 1, prims=prims,
                         anchor=list(map(float, anchor)), meta=meta,
-                        detour_traj=v["detour_traj"], n_bad=v["n_bad"], dist=v["dist"])
+                        detour_trajs=v["detour_trajs"], n_bad=v["n_bad"], dist=v["dist"])
         # 自适应：太弱→增大；无解→缩小；绕行不明显→略增大（换位置已每轮随机）
         if v["fail_reason"] == "too_weak":
             size_scale = min(s_hi * 1.5, size_scale * 1.25)
@@ -654,7 +706,7 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
             size_scale = min(s_hi * 1.5, size_scale * 1.1)
 
     return dict(ok=False, link=link, otype=otype, attempt=N, last_reason=last,
-                prims=None, anchor=None, meta=None, detour_traj=None)
+                prims=None, anchor=None, meta=None, detour_trajs=[])
 
 
 def generate_scenes(handle, workpiece_mesh, per_wp, origin, traj_default,
