@@ -101,8 +101,14 @@ class Config:
 
     @property
     def init_free_cyl_height(self) -> float:
-        """初始引导 FREE 空间（圆柱体法）：圆柱高度（米，从 base_link 平面 z=0 往上）。"""
+        """初始引导 FREE 空间（圆柱体法）：圆柱高度（米，从底面 cyl_z_min 往上）。"""
         return float(self.raw.get("init_free", {}).get("cyl_height_m", 1.50))
+
+    @property
+    def init_free_cyl_z_min(self) -> float:
+        """初始引导 FREE 空间（圆柱体法）：圆柱底面 z（米，base 系）。默认 -0.02 以盖住固定底座
+        碰撞球扎到 z<0 的那层体素（实测最低球点 z≈-0.002m，体素中心 -0.01m），避免每段运动假阳性非 FREE。"""
+        return float(self.raw.get("init_free", {}).get("cyl_z_min_m", 0.0))
 
     # ---- cuRobo IK / 规划 ----
     @property

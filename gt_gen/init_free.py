@@ -96,7 +96,7 @@ def base_cylinder_bounds(handle, retract, margin: float = 0.0):
 def set_initial_free_cylinder(handle, voxmap, config=None,
                               radius: Optional[float] = None,
                               height: Optional[float] = None,
-                              z_min: float = 0.0,
+                              z_min: Optional[float] = None,
                               return_cells: bool = False):
     """把一个竖立在 base_link 平面、给定半径/高度的圆柱体内的体素整块标 FREE（初始 FREE 空间的另一方案）。
 
@@ -111,7 +111,8 @@ def set_initial_free_cylinder(handle, voxmap, config=None,
       config  : Config；radius/height 为 None 时从它取（init_free_cyl_radius / init_free_cyl_height）。
       radius  : 圆柱半径（米）；None 时取 config.init_free_cyl_radius。
       height  : 圆柱高度（米，从 z_min 往上）；None 时取 config.init_free_cyl_height。
-      z_min   : 圆柱底面 z（米，base 系）；默认 0.0 = base_link 平面。
+      z_min   : 圆柱底面 z（米，base 系）；None 时取 config.init_free_cyl_z_min（默认 -0.02，
+                盖住固定底座扎到 z<0 的那层体素）。
       return_cells : True 则额外返回标记的体素下标 (M,3)。
 
     返回：标记为 FREE 的体素数 n（return_cells=True 时返回 (n, cells)）。
@@ -126,6 +127,8 @@ def set_initial_free_cylinder(handle, voxmap, config=None,
         if config is None:
             raise ValueError("需要 height 或 config 之一来确定圆柱高度")
         height = config.init_free_cyl_height
+    if z_min is None:
+        z_min = config.init_free_cyl_z_min if config is not None else 0.0
     radius = float(radius)
     z_max = float(z_min) + float(height)
 

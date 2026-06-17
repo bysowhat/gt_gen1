@@ -1,8 +1,8 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
 robot:                                  # 决策 B
-  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
-  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
+  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
+  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
 
 # constraint:                             # 决策 A
@@ -62,7 +62,11 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
   # dq 由 tmp/plan_seam 轨迹标定：0.05rad 即 122/122 条起步(reach_idx≥4)，取 0.10rad 留余量。
   dq_rad: 0.10                          # 关节扫掠法：retract 各关节活动半幅（rad）
   cyl_radius_m: 0.60                    # 圆柱体法：半径（米，轴过 base 原点 x=y=0）
-  cyl_height_m: 1.80                    # 圆柱体法：高度（米，从 base_link 平面 z=0 往上）
+  cyl_height_m: 1.80                    # 圆柱体法：高度（米，从底面 z=cyl_z_min 往上）
+  cyl_z_min_m: -0.02                    # 圆柱体法：底面 z（米，base 系）。固定底座 xiaoyu_base_link 的
+                                        # 碰撞球最低扎到 base 系 z≈-0.002m（实测 FK），体素中心落到 z=-0.01 层；
+                                        # 底面取 -0.02m 才盖得住这层、又不会多拉进下一层(z=-0.05)，否则这层恒为
+                                        # UNKNOWN→每段运动都假阳性非 FREE。(voxel=0.04m；与 swept 排除底座球互为冗余兜底)
 
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定
@@ -75,21 +79,21 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
   ik_return_seeds: 200                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
   position_threshold: 0.05              # 位置收敛门限（米）；init_curobo 不传时用此值
   rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
-  max_attempts: 20                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
+  max_attempts: 200                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
   drop_collision_links: []  # 从碰撞检查剔除的 link（单一来源：init_curobo 不传时读这里）。空=不剔除任何 link，焊枪也参与避障
   voxel_inflate_voxels: 0   # sync_collision_world 把「非 FREE」障碍向 FREE 膨胀的体素层数。
                             # cuRobo voxel 规划只保证球心避障，而保守判据 motion_stays_in_free 对整臂扫掠
                             # 做 (r+√3/2·voxel) 过近似 → 差约 1 体素。膨胀 1 层使 cuRobo 规划留出一致余量，
                             # 保证 GT 整臂扫掠真正 ⊆ FREE（0 擦边 UNKNOWN）。
   # ↓ 提高规划成功率的三个杠杆（见 curobo_iface.init_curobo / plan_to_config，单一来源）
-  num_trajopt_seeds: 128     # trajopt 并行优化的轨迹起点数（init 时定）。比串行加 max_attempts 又快又稳：
+  num_trajopt_seeds: 24     # trajopt 并行优化的轨迹起点数（init 时定）。比串行加 max_attempts 又快又稳：
                             #   GPU 一把并行铺 N 条取最优，压住「随机起点陷局部最优」的失败。cuRobo 默认偏小(4)。
                             #   注意：plan_single* 路径下 graph planner 的并行种子数也取此值（cuRobo 把
                             #   graph seeds 硬绑到 trajopt seeds，无独立 num_graph_seeds 旋钮）。
   enable_graph: true        # 规划先跑 graph planner 找全局可行折线、再 trajopt 平滑。窄通道/绕障场景
                             #   （正是放障碍后的绕行）trajopt 易陷局部最优失败，graph 先给可行拓扑→命中率最大提升。
                             #   代价：更慢。trajopt 种子里一部分由 graph 解插值生成，故与 num_*_seeds 搭配调最有效。
-  time_dilation_factor: 0.5 # 轨迹时间放慢系数 ∈(0,1]：把速度/加速度上限按比例缩小，松动力学约束。
+  time_dilation_factor: 1.0 # 轨迹时间放慢系数 ∈(0,1]：把速度/加速度上限按比例缩小，松动力学约束。
                             #   对「几何可行但太赶、撞速度/加速度极限」的失败有效；只改快慢不改路径形状（GT 轨迹更慢）。
 
 # 以下参数留待对应步骤填实（先放占位/默认）

@@ -24,6 +24,30 @@ def fk_spheres_batch(handle, qs):
 _fk_spheres_batch = fk_spheres_batch   # 兼容内部旧名
 
 
+# 固定底座 link（都在 Link1 关节之前，永不随关节运动）：其碰撞球恒定不动，不可能"新"碰到障碍，
+# 却常扎进「基座平面以下 / 初始 FREE 圆柱外」的从未观测区(UNKNOWN)，使每段运动都假阳性非 FREE。
+# 故从扫掠体积里整体剔除（实测：z<0 的格全部来自 xiaoyu_base_link）。
+_FIXED_BASE_LINKS = ("base_link", "xiaoyu_base_link", "xiaoyu_arm_base_link")
+
+
+def _moving_sphere_mask(handle):
+    """整臂碰撞球里「会随关节运动」的球掩码 (S,) bool：剔除 _FIXED_BASE_LINKS 的固定底座球。
+    结果按 handle 缓存（kinematics 不变）。某 handle 取不到映射时退回全 True（不剔除，保守不漏检）。"""
+    cached = getattr(handle, "_moving_sphere_mask_cache", None)
+    if cached is not None:
+        return cached
+    try:
+        kc = handle.mg.kinematics.kinematics_config
+        idx_map = kc.link_sphere_idx_map.detach().cpu().numpy()       # (S,) 每球所属 link 下标
+        name_to_idx = kc.link_name_to_idx_map
+        drop = [name_to_idx[n] for n in _FIXED_BASE_LINKS if n in name_to_idx]
+        mask = ~np.isin(idx_map, drop)
+    except Exception:
+        mask = None
+    handle._moving_sphere_mask_cache = mask
+    return mask
+
+
 def voxelize_spheres(voxmap, spheres) -> np.ndarray:
     """把一组碰撞球 (M,4 xyz+r) 体素化到 voxmap：返回真正与球相交的体素下标 (M,3)（去重、在界内）。
 
@@ -71,8 +95,67 @@ def swept_volume(handle, voxmap, q_from, q_to, resolution: Optional[float] = Non
     q_from = np.asarray(q_from, float); q_to = np.asarray(q_to, float)
     ts = np.linspace(0.0, 1.0, K)
     qs = q_from[None] + ts[:, None] * (q_to - q_from)[None]      # (K,dof)
-    spheres = fk_spheres_batch(handle, qs).reshape(-1, 4)        # (K*S,4)
-    return voxelize_spheres(voxmap, spheres)
+    spheres = fk_spheres_batch(handle, qs)                       # (K,S,4)
+    mask = _moving_sphere_mask(handle)                           # 剔除固定底座球（None=不剔除）
+    if mask is not None:
+        spheres = spheres[:, mask, :]
+    return voxelize_spheres(voxmap, spheres.reshape(-1, 4))
+
+
+def _debug_viz_cells(handle, voxmap, q_from, q_to, cells):
+    """调试用【整臂扫掠体素 cells】：可视化 swept_volume 返回的扫掠体素（按三态着色）。
+    被调用即弹窗(需显示器+open3d)；无显示器/服务器跑时把调用行注释掉即可（调用行本身就是开关）。
+
+    画 cells 中 FREE 格(蓝半透明) + 非 FREE 格(OCCUPIED/UNKNOWN，橙不透明) + 两端整臂碰撞球
+    (q_from 绿 / q_to 青) + ROI/base。一眼看出「这段运动整臂扫过哪些格、是否擦到非 FREE」。
+    依赖 verify_step8 的 open3d 工具。
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from verify_step8 import _arm_mesh, _cells_mesh, _draw, _roi_and_base
+    from gt_gen.voxmap import FREE
+
+    af = _arm_mesh(handle, list(q_from)); af.paint_uniform_color([0.10, 0.80, 0.20])
+    at = _arm_mesh(handle, list(q_to)); at.paint_uniform_color([0.10, 0.75, 0.85])
+    geoms = [("q_from", af, "lit", None), ("q_to", at, "lit", None)]
+
+    n_free = n_nonfree = 0
+    if cells.shape[0]:
+        states = np.asarray(voxmap.get(cells))
+        centers = voxmap.voxel_to_world(cells)
+        free_c = centers[states == FREE]
+        nonfree_c = centers[states != FREE]
+        n_free = int(free_c.shape[0]); n_nonfree = int(nonfree_c.shape[0])
+        if n_free:
+            geoms.append(("swept_free", _cells_mesh(voxmap, free_c), "fill", [0.20, 0.45, 0.95, 0.25]))
+        if n_nonfree:
+            nm = _cells_mesh(voxmap, nonfree_c); nm.paint_uniform_color([1.0, 0.35, 0.0])
+            geoms.append(("swept_nonfree", nm, "lit", None))     # 非 FREE：撞到的格(橙)
+    geoms += _roi_and_base(voxmap)
+    _draw(geoms, f"swept 扫掠体素: FREE={n_free}格(蓝) 非FREE={n_nonfree}格(橙) "
+                 f"绿=q_from整臂 青=q_to整臂")
+
+
+def _debug_viz_cells2(handle, voxmap, q_from, q_to, cells):
+    """调试用【整臂扫掠体素 cells，单色版】：cells【整体只用一种颜色(黄)】，其他什么都不画
+    (无整臂、无 ROI/base)。被调用即弹窗(需显示器+open3d)；服务器/无显示器时把调用行注释掉即可。
+
+    只看「整臂扫过的体素几何形状/占多大一片」，不区分 FREE/非 FREE。依赖 verify_step8 的 open3d 工具。
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from verify_step8 import _cells_mesh, _draw
+
+    geoms = []
+    n = int(cells.shape[0])
+    if n:
+        centers = voxmap.voxel_to_world(cells)
+        geoms.append(("swept", _cells_mesh(voxmap, centers), "fill", [1.0, 0.92, 0.0, 0.45]))  # 全部黄（单色）
+    _draw(geoms, f"swept 扫掠体素(单色黄): cells={n}格")
 
 
 def motion_stays_in_free(handle, voxmap, q_from, q_to,
@@ -85,6 +168,8 @@ def motion_stays_in_free(handle, voxmap, q_from, q_to,
     from gt_gen.voxmap import FREE
 
     cells = swept_volume(handle, voxmap, q_from, q_to, resolution=resolution)
+    # _debug_viz_cells2(handle, voxmap, q_from, q_to, cells)        # 看整臂扫掠体素 cells（注释此行可关）
+    # _debug_viz_cells(handle, voxmap, q_from, q_to, cells)        # 看整臂扫掠体素 cells（注释此行可关）
     if cells.shape[0] == 0:
         return True, 0
     states = np.asarray(voxmap.get(cells))

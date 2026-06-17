@@ -77,6 +77,67 @@ def score_candidate(voxmap, cand, B, truth_scene, camera_model, cur_cfg,
     return gain, float(gain) - float(lambda_cost) * path_cost, reveal
 
 
+# ---------------- 调试可视化（open3d；默认关，置环境变量 NBV_VIZ=1 开启） ----------------
+
+def _viz_helpers():
+    """惰性载入 verify_step8 的 open3d 工具（需显示器 + open3d）。返回 (helpers模块字典)。"""
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from verify_step8 import _arm_mesh, _work_mesh, _cells_mesh, _draw, _roi_and_base, _lines
+    return dict(arm=_arm_mesh, work=_work_mesh, cells=_cells_mesh, draw=_draw,
+                roi=_roi_and_base, lines=_lines)
+
+
+def _debug_viz_voxmap(handle, voxmap, P, reach_idx, truth_scene):
+    """【line 116 后】可视化当前 voxmap 三态 + reach_pt 处整臂：
+    FREE(蓝半透明) + OCCUPIED(红实心) + 工件(灰) + reach_idx 构型整臂碰撞球(绿) + ROI/base。
+    参考 verify_step7.viz_voxmap_arm / main_loop._debug_viz_voxmap。被调用即弹窗(需显示器+open3d)；
+    无显示器/服务器跑时把调用行注释掉即可（调用行本身就是开关）。
+    """
+    from gt_gen.voxmap import FREE, OCCUPIED
+    h = _viz_helpers()
+    q = list(P[int(np.clip(reach_idx, 0, len(P) - 1))])
+    geoms = [("work", h["work"](truth_scene), "lit", None),
+             ("arm", h["arm"](handle, q), "lit", None)]
+    fc = voxmap.state_centers(FREE)
+    if fc.shape[0]:
+        geoms.append(("free", h["cells"](voxmap, fc), "fill", [0.20, 0.45, 0.95, 0.12]))
+    oc = voxmap.state_centers(OCCUPIED)
+    if oc.shape[0]:
+        om = h["cells"](voxmap, oc); om.paint_uniform_color([0.92, 0.12, 0.12])
+        geoms.append(("occ", om, "lit", None))
+    geoms += h["roi"](voxmap)
+    h["draw"](geoms, f"nbv voxmap: FREE={int(fc.shape[0])}格(蓝) OCC={int(oc.shape[0])}格(红) "
+                     f"绿=reach@{reach_idx} 灰=工件")
+
+
+def _debug_viz_B(handle, voxmap, P, reach_idx, B, truth_scene):
+    """【line 117 后】可视化阻塞段 B（橙不透明格）叠加在 voxmap 底图上：
+    FREE(蓝半透明) + OCCUPIED(红) + 工件(灰) + reach_pt 整臂(绿) + B(橙) + ROI/base。
+    参考 verify_step7.verify_compute_blocking_B 的 b_cells 橙色显示。被调用即弹窗(需显示器+open3d)；
+    无显示器/服务器跑时把调用行注释掉即可（调用行本身就是开关）。
+    """
+    from gt_gen.voxmap import FREE, OCCUPIED
+    h = _viz_helpers()
+    q = list(P[int(np.clip(reach_idx, 0, len(P) - 1))])
+    geoms = [("work", h["work"](truth_scene), "lit", None),
+             ("arm", h["arm"](handle, q), "lit", None)]
+    fc = voxmap.state_centers(FREE)
+    if fc.shape[0]:
+        geoms.append(("free", h["cells"](voxmap, fc), "fill", [0.20, 0.45, 0.95, 0.12]))
+    oc = voxmap.state_centers(OCCUPIED)
+    if oc.shape[0]:
+        om = h["cells"](voxmap, oc); om.paint_uniform_color([0.92, 0.12, 0.12])
+        geoms.append(("occ", om, "lit", None))
+    if B is not None and B.shape[0]:
+        bm = h["cells"](voxmap, voxmap.voxel_to_world(B)); bm.paint_uniform_color([1.0, 0.55, 0.0])
+        geoms.append(("B", bm, "lit", None))                   # B = 橙不透明（待观测的阻塞未知区）
+    geoms += h["roi"](voxmap)
+    h["draw"](geoms, f"nbv 阻塞段B(橙{int(B.shape[0]) if B is not None else 0}格) "
+                     f"reach_idx={reach_idx} 绿=reach整臂 灰=工件")
+
+
 # ---------------- 顶层：oracle-path NBV（§8 伪代码） ----------------
 
 def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
@@ -114,7 +175,9 @@ def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
 
     # 2) 沿 P* 求 reach_pt，取前方 k 段的 UNKNOWN = 阻塞段 B
     reach_idx = compute_reach_pt(handle, voxmap, P)
+    # _debug_viz_voxmap(handle, voxmap, P, reach_idx, truth_scene)        # 看 voxmap 三态 + reach 整臂（注释此行可关）
     B = compute_blocking_B(handle, voxmap, P, reach_idx, k)
+    # _debug_viz_B(handle, voxmap, P, reach_idx, B, truth_scene)          # 看阻塞段 B（橙）（注释此行可关）
     if B.shape[0] == 0:
         return NBVResult("corridor_confirmed", reach_idx=reach_idx, P_star=P)
 
