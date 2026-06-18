@@ -177,7 +177,7 @@ def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
     reach_idx = compute_reach_pt(handle, voxmap, P)
     # _debug_viz_voxmap(handle, voxmap, P, reach_idx, truth_scene)        # 看 voxmap 三态 + reach 整臂（注释此行可关）
     B = compute_blocking_B(handle, voxmap, P, reach_idx, k)
-    _debug_viz_B(handle, voxmap, P, reach_idx, B, truth_scene)          # 看阻塞段 B（橙）（注释此行可关）
+    # _debug_viz_B(handle, voxmap, P, reach_idx, B, truth_scene)          # 看阻塞段 B（橙）（注释此行可关）
     if B.shape[0] == 0:
         return NBVResult("corridor_confirmed", reach_idx=reach_idx, P_star=P)
 
