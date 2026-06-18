@@ -39,8 +39,14 @@ if [ -n "${HEADLESS:-}" ]; then
     HEADLESS_ARGS=(--headless)
 fi
 
+# /isaac-sim/python.sh -u scripts/viz_placed_obstacle_isaacsim.py \
+#     "${SCENE_ARGS[@]}" \
+#     --which "$WHICH" \
+#     --fps "$FPS" \
+#     "${HEADLESS_ARGS[@]}"
+
+
 /isaac-sim/python.sh -u scripts/viz_placed_obstacle_isaacsim.py \
-    "${SCENE_ARGS[@]}" \
-    --which "$WHICH" \
-    --fps "$FPS" \
-    "${HEADLESS_ARGS[@]}"
+    # --scene /tmp/placed_obstacles_active/scene_00_xiaoyu_accessory_link_plate_gt.npz \
+    --scene /tmp/placed_obstacles/scene_00_xiaoyu_accessory_link_plate.npz \
+    --which default
