@@ -146,8 +146,8 @@ obstacle_placement:                     # 沿「关键 link 扫掠走廊」自�
   detour_max_solutions: 10              # 每个场景收集多少条【互不相同】的绕行解存为多份 GT 候选：
                                        # 对多 IK 分支各规划，按关节偏差峰值 ≥ detour_min_joint_rad 去重，
                                        # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
-  detour_ik_position_threshold: 0.8   # 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
-  detour_ik_rotation_threshold: 0.5    # 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
+  detour_ik_position_threshold: 0.1   # 无用，ik目前的goal是写死的，仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
+  detour_ik_rotation_threshold: 0.3    # 用，ik目前的goal是写死的， 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
   obstacle_buffer_m: 0.1               # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
                                         # ②③绕行规划用膨胀尺寸→绕行解与真实障碍留 buffer；工件不受影响。0=关闭
   obstacle_types: []                    # 空=用 obstacles.list_obstacles() 全部 15 种

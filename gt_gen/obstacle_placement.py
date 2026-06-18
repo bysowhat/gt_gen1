@@ -493,7 +493,8 @@ def detour_exists(handle, retract, goal_pose, metric, max_attempts,
         cands = si.plan_pose_multi(
             cfg, world, retract, goal_pose, checker_type=checker_type,
             ik_position_threshold=float(op["detour_ik_position_threshold"]),
-            ik_rotation_threshold=float(op["detour_ik_rotation_threshold"]))
+            ik_rotation_threshold=float(op["detour_ik_rotation_threshold"]),
+            showik=False)   # 调试写死：True 时弹 Open3D 画 IK 退回解整臂碰撞球+工件/障碍
         kept = []
         for traj in cands:                                    # 已按 state_cost 升序
             if max_solutions and len(kept) >= max_solutions:
