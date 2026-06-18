@@ -1,8 +1,8 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
 robot:                                  # 决策 B
-  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
-  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
+  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
+  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
 
 # constraint:                             # 决策 A
@@ -101,8 +101,8 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
     # STOMP 核心已 vendoring 到本项目 stomp_planner/；默认用项目内目录（见 config.py），
     # 无需在此写绝对路径。如需覆盖：加 stomp_planner_dir: <路径> 或设 env STOMP_PLANNER_DIR。
     num_iterations: 120     # 迭代轮数（搜索深度）：越大收敛越充分越能绕开，越慢
-    num_batch: 2            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
-    num_timesteps: 101       # 轨迹时间步数
+    num_batch: 8            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
+    num_timesteps: 151       # 轨迹时间步数
     delta_t: 0.1            # 步长（秒）；也是产出 npz 的回放 dt
     collision_weight: 80.0  # 碰撞代价权重
     buffer_m: 0.001         # STOMP 自身的碰撞激活距离≈0：间隙完全来自障碍物理膨胀(obstacle_buffer_m)，工件不膨胀，
