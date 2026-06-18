@@ -2,14 +2,14 @@
 
 与 scripts/plan_seam.py 的区别只在【规划器】：
   - plan_seam.py     用 cuRobo MotionGen（graph + trajopt）规划；
-  - plan_seam_stomp  用参考项目 gt_overall 的 STOMP 规划器（stomp_planning_api.py）。
+  - plan_seam_stomp  用本项目 stomp_planner 的 STOMP 规划器（stomp_planning_api.py）。
 其余完全一致：焊缝几何 → 末端目标位姿(base 系)、工件 obj 当障碍(MESH 世界)、retract 当起点；
 产出 npz 字段与 plan_seam.py 对齐，故可直接用 scripts/viz_seam_isaacsim.py 回放。
 
 碰撞世界（即 plan_two_cfgs.py 里 h_expl 那种「cuRobo 碰撞世界」）这里取【只含工件 mesh 的
 MESH 世界】，与 plan_seam.py 同源；--empty_world 可切成空世界(仅自碰撞)做对照。
 
-STOMP 规划能力来自参考项目（默认路径见 GT_OVERALL_DIR，可用环境变量 GT_OVERALL_DIR 覆盖）：
+STOMP 规划能力来自本项目 stomp_planner（默认路径见 STOMP_PLANNER_DIR，可用环境变量 STOMP_PLANNER_DIR 覆盖）：
     函数2 plan_to_pose(cur_cfg, target_pose, world, ...) —— 内部先 IK 解目标关节角，再 STOMP 到关节角。
 
 运行：conda run -n env_isaaclab python scripts/plan_seam_stomp.py --seam <seam_x.pkl> --out /tmp/seam_traj_stomp.npz
@@ -26,11 +26,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-# 参考项目 gt_overall（含 stomp_planning_api）。逐机器不同：默认走下面，env 可覆盖。
-GT_OVERALL_DIR = os.environ.get("GT_OVERALL_DIR",
-                                "/home/a/Projects/Github/kejian_guihua/gt_overall")
-if GT_OVERALL_DIR not in sys.path:
-    sys.path.insert(0, GT_OVERALL_DIR)
+# STOMP 核心已 vendoring 到本项目 stomp_planner/（含 stomp_planning_api）。默认用项目内目录，env 可覆盖。
+STOMP_PLANNER_DIR = os.environ.get("STOMP_PLANNER_DIR", os.path.join(ROOT, "stomp_planner"))
+if STOMP_PLANNER_DIR not in sys.path:
+    sys.path.insert(0, STOMP_PLANNER_DIR)
 
 # 复用 plan_seam.py 已验证的焊缝几何 → 末端位姿、找 obj
 from plan_seam import seam_ee_pose, find_obj, DEFAULT_SEAM  # noqa: E402

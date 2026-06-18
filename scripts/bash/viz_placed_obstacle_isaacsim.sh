@@ -43,5 +43,4 @@ fi
     "${SCENE_ARGS[@]}" \
     --which "$WHICH" \
     --fps "$FPS" \
-    --detour_index "$DETOUR_INDEX" \
     "${HEADLESS_ARGS[@]}"

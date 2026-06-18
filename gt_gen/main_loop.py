@@ -51,13 +51,24 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
 
     # _debug_viz_voxmap(voxmap, h_expl, target_cfg, truth_scene, show_unknown=True, cur_cfg=cur_cfg, cfg_show=True)
     # _debug_viz_voxmap(voxmap, h_expl, target_cfg, truth_scene, show_unknown=True, cur_cfg=cur_cfg, cfg_show=False)
-    res = ci.plan_to_config(h_expl, cur_cfg, target_cfg, max_attempts=h_expl.config.plan_max_attempts)
-    if res is None or not bool(res.success.item()):
-        # 诊断：起点/终点哪个在碰撞，还是中间连不上（区分三种成因）
-        print("[_move_to] plan_to_config 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
-        # cuRobo 实际避障的占据场（sync 后、含 inflate=1），看 target_cfg 整臂是否泡在障碍里
-        return None
-    traj = res.get_interpolated_plan().position.detach().cpu().numpy()
+    cfg = h_expl.config
+    if cfg.planner_backend == "stomp":
+        # STOMP 后端：把 voxmap 的非 FREE 区域转 STOMP 世界（mesh 或 cuboid，见 voxel_world），关节目标规划 cur->target。
+        from gt_gen import stomp_iface as si
+        world, ck = si.world_from_voxmap_auto(cfg, voxmap)
+        traj = si.plan_joint_single(cfg, cur_cfg=cur_cfg, target_cfg=target_cfg, world=world,
+                                    checker_type=ck)
+        if traj is None:
+            print("[_move_to] STOMP plan_joint 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
+            return None
+    else:
+        res = ci.plan_to_config(h_expl, cur_cfg, target_cfg, max_attempts=cfg.plan_max_attempts)
+        if res is None or not bool(res.success.item()):
+            # 诊断：起点/终点哪个在碰撞，还是中间连不上（区分三种成因）
+            print("[_move_to] plan_to_config 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
+            # cuRobo 实际避障的占据场（sync 后、含 inflate），看 target_cfg 整臂是否泡在障碍里
+            return None
+        traj = res.get_interpolated_plan().position.detach().cpu().numpy()
 
     # 沿途每 every_n 个路点拍一次（h_expl 做相机 FK，与 h_truth 同一套运动学）
     for i in range(0, len(traj), every_n):
@@ -209,6 +220,54 @@ def _debug_viz_curobo(h_expl, voxmap, fk_handle, q, truth_scene, stage="", every
     tag = {"before": "(sync前,应全自由)", "after": "(sync后,各层布满仅圆柱留洞)"}.get(stage, "")
     _draw(geoms, f"main_loop cuRobo世界{tag}: 占据={n_occ}格(每{n_layers}层取1层显示{n_show}格) "
                  f"暗红=cuRobo占据切片 绿=整臂 灰=工件")
+
+
+def _debug_viz_w1(w1, fk_handle, voxmap, cur_cfg, truth_scene, goal_pose=None, rnd=None):
+    """调试用【STOMP 探索世界 _w1】：可视化 world_from_voxmap 产出的 marching-cubes mesh
+    （= 非 FREE 区的「自由泡边界 + ROI 外壳」等值面，STOMP 实际拿来避障的那张网）+ 当前整臂@cur_cfg。
+    目视核对：mesh 是否把已确认 FREE 区正确围出空腔、机械臂当前是否在腔内、面数是否爆炸。
+    默认在步① _w1 算出后调用（每轮弹一次阻塞窗口；只想看首轮可在调用处加 if rnd == 0）。
+
+    w1 内每个 Mesh 顶点已是 base 系绝对坐标、pose=单位 → 直接转 open3d，无需再变换。
+    橙色半透明=_w1 mesh，绿=当前整臂，灰=工件，另叠 goal 坐标系 + ROI/base。
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from verify_step8 import _arm_mesh, _work_mesh, _draw, _roi_and_base
+    import open3d as o3d
+
+    geoms = [("work", _work_mesh(truth_scene), "lit", None),
+             ("arm_cur", _arm_mesh(fk_handle, list(cur_cfg)), "lit", None)]   # 当前整臂(绿)
+    n_faces = 0
+    for i, m in enumerate(getattr(w1, "mesh", None) or []):
+        tm = m.get_trimesh_mesh()
+        v = np.asarray(tm.vertices, float)
+        f = np.asarray(tm.faces, np.int32)
+        n_faces += int(f.shape[0])
+        o3m = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(v),
+                                        o3d.utility.Vector3iVector(f))
+        o3m.compute_vertex_normals()
+        geoms.append((f"w1_mesh_{i}", o3m, "fill", [0.95, 0.45, 0.10, 0.35]))  # 探索障碍 mesh(橙,半透明)
+    n_cub = 0
+    for i, c in enumerate(getattr(w1, "cuboid", None) or []):                  # cuboid 版：合并后的大盒
+        dx, dy, dz = (float(v) for v in c.dims)
+        cx, cy, cz = (float(v) for v in c.pose[:3])                            # 轴对齐(quat=单位)，无需旋转
+        bx = o3d.geometry.TriangleMesh.create_box(dx, dy, dz)
+        bx.translate((cx - dx / 2.0, cy - dy / 2.0, cz - dz / 2.0))
+        bx.compute_vertex_normals()
+        geoms.append((f"w1_cuboid_{i}", bx, "fill", [0.95, 0.45, 0.10, 0.35]))
+        n_cub += 1
+    if goal_pose is not None:
+        gp = (goal_pose[0] if (isinstance(goal_pose, (tuple, list)) and len(goal_pose) == 2
+                               and hasattr(goal_pose[0], "__len__")) else goal_pose[:3])
+        gf = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
+        gf.translate(np.asarray(gp, float)[:3])
+        geoms.append(("goal", gf, "lit", None))
+    geoms += _roi_and_base(voxmap)
+    rtag = "" if rnd is None else f" R{rnd}"
+    _draw(geoms, f"main_loop _w1{rtag}: 探索障碍 mesh面={n_faces}/cuboid={n_cub}（橙,半透明） 绿=当前整臂 灰=工件")
 
 
 def _debug_viz_voxmap(voxmap, fk_handle, q, truth_scene, every_n_layers: int = 8,
@@ -529,7 +588,8 @@ def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene
 # ---------------- 顶层：完整主循环 ----------------
 
 def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
-                camera_model=None, params=None, h_truth_plan=None, p_star_init=None):
+                camera_model=None, params=None, h_truth_plan=None, p_star_init=None,
+                world_plan=None):
     """完整 ①~⑦ 主循环（goal 已含 standoff 后退）。
 
     入参：
@@ -548,6 +608,9 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     传入则【第一轮(rnd==0)直接拿它当 P*，不再重新规划】——绕开「同一空间这里 plan 却
                     失败」的随机性/位姿差异，用全知阶段已验证可行的那条路起步。其起点须 = retract_config
                     （place_obstacles 也从 retract 规划，故一致）。仅第一轮用；之后臂已移动，照常重新规划。
+      world_plan  : 可选 cuRobo WorldConfig（= h_plan 对应的 MESH 世界，工件+膨胀障碍）。仅当
+                    cfg.planner_backend=='stomp' 时步② 需要它（STOMP 把 world 作参数直接传入）；
+                    curobo 后端忽略此参数（用 h_plan 内部世界）。None 时 stomp 步② 无法规划 P*。
 
     返回 (GT, status, info)：
       GT     : (T, dof) np.float64 关节角序列（含起点 retract）。
@@ -596,10 +659,20 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
         # _debug_viz_curobo(h_expl, voxmap, h_truth, cur_cfg, truth_scene, "after", every_n_layers=10)    # sync 后：仅圆柱留洞
 
         # 步①：试在已确认自由区直接规划到 goal（h_expl，UNKNOWN 已当障碍）
-        res = ci.plan_to_pose(h_expl, cur_cfg, goal_pose,
-                              max_attempts=cfg.plan_max_attempts, pose_cost_metric=metric)
-        if res is not None and bool(res.success.item()):
-            seg = res.get_interpolated_plan().position.detach().cpu().numpy()
+        if cfg.planner_backend == "stomp":
+            # STOMP：把当前 voxmap 非 FREE 区转 mesh，直接规划到 goal 位姿。
+            from gt_gen import stomp_iface as si
+            _w1, _ck1 = si.world_from_voxmap_auto(cfg, voxmap)
+            # _debug_viz_w1(_w1, h_expl, voxmap, cur_cfg, truth_scene, goal_pose, rnd=rnd)  # 看 _w1（mesh/cuboid）+ 当前整臂（每轮弹窗；只看首轮改 if rnd==0）
+            seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
+            reached_direct = seg is not None
+        else:
+            res = ci.plan_to_pose(h_expl, cur_cfg, goal_pose,
+                                  max_attempts=cfg.plan_max_attempts, pose_cost_metric=metric)
+            reached_direct = res is not None and bool(res.success.item())
+            seg = (res.get_interpolated_plan().position.detach().cpu().numpy()
+                   if reached_direct else None)
+        if reached_direct:
             GT.extend(seg[1:])
             status = "reached"
             info["rounds"] = rnd + 1
@@ -611,6 +684,17 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             # （同一 3D 空间 + 同起点 retract，但这里 plan 会随机失败/位姿略差；全知阶段那条已验证可行。）
             P = np.asarray(p_star_init, dtype=np.float64)
             print(f"[step② R0] 直接用预规划 P*（--scene 绕行轨迹）{P.shape[0]} 点，跳过重新规划")
+        elif cfg.planner_backend == "stomp":
+            # STOMP：在 h_plan 对应的膨胀 MESH 世界(world_plan)上规划 P*；single 已返回最优一条
+            # （等价 multi 取首条，但更简）。world_plan 由调用方按 h_plan 的 WorldConfig 传入。
+            from gt_gen import stomp_iface as si
+            if world_plan is None:
+                print(f"[step② P*失败 R{rnd}] backend=stomp 但未传 world_plan → 无法规划 P*")
+                P = None
+            else:
+                P = si.plan_pose_single(cfg, world_plan, cur_cfg, goal_pose)
+                if P is None:
+                    print(f"[step② P*失败 R{rnd}] STOMP 在 world_plan 上未找到到 goal 的合格轨迹")
         else:
             # 改走 plan_to_pose_all（= place_obstacles.detour_exists 那条成功路径）：对多条 IK 分支逐个 plan，
             # 取第 0 条（IK 误差最小的成功解）。与 plan_to_pose 同核，但显式跑满 IK 多解、对随机失败更稳。

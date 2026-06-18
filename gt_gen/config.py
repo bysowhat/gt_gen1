@@ -164,7 +164,7 @@ class Config:
     # ---- 规划后端（curobo | stomp，见 gt_gen/stomp_iface.py） ----
     @property
     def planner_backend(self) -> str:
-        """obstacle_placement 的「默认轨迹/绕行解」用哪种规划器：curobo(MotionGen) | stomp(gt_overall)。
+        """obstacle_placement 的「默认轨迹/绕行解」用哪种规划器：curobo(MotionGen) | stomp(stomp_planner)。
         碰撞判定 check_state 不受此影响（恒用 cuRobo handle）。"""
         return str(self.raw.get("planner", {}).get("backend", "curobo")).lower()
 
@@ -172,13 +172,17 @@ class Config:
     def stomp_params(self) -> dict:
         """STOMP 旋钮（planner.stomp 段，单一来源；backend=stomp 时透传 stomp_planning_api）。缺省给兜底。"""
         sp = dict(self.raw.get("planner", {}).get("stomp", {}))
-        sp.setdefault("gt_overall_dir", "/home/a/Projects/Github/kejian_guihua/gt_overall")
+        # STOMP 规划核心已 vendoring 到本项目 stomp_planner/（原参考项目 gt_overall 的副本）。
+        # 默认指向项目内目录，与机器无关；yaml 写 stomp_planner_dir 或 env STOMP_PLANNER_DIR 可覆盖。
+        sp.setdefault("stomp_planner_dir", os.path.join(PROJECT_ROOT, "stomp_planner"))
         sp.setdefault("num_iterations", 120)
         sp.setdefault("num_batch", 8)
         sp.setdefault("num_timesteps", 51)
         sp.setdefault("delta_t", 0.1)
         sp.setdefault("collision_weight", 80.0)
         sp.setdefault("buffer_m", 0.001)
+        sp.setdefault("voxel_world", "mesh")     # 兜底=mesh(保持原行为)；yaml 可设 cuboid
+        sp.setdefault("local_box_m", 2.0)        # cuboid 模式：base 原点为心、半边长(米)的转换盒
         return sp
 
     @property

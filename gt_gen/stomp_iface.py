@@ -1,4 +1,7 @@
-"""STOMP 规划后端：封装参考项目 gt_overall/stomp_planning_api（与 curobo_iface 并列）。
+"""STOMP 规划后端：封装本项目 stomp_planner/stomp_planning_api（与 curobo_iface 并列）。
+
+stomp_planner/ 是原参考项目 gt_overall 中 STOMP 核心(stomp_planning_api / plan_path_stomp /
+plan_path_stomp_obstacle / stomp_utils_traj)的 vendoring 副本，已并入本项目、不再外部引用。
 
 当 configs/default.yaml 的 planner.backend == 'stomp' 时，obstacle_placement 的
 「默认轨迹 / 绕行解」改走这里；碰撞判定(check_state)、扫掠 FK、三条件验证逻辑均不变。
@@ -15,17 +18,19 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any, Optional
 
 import numpy as np
 
 
 def _ensure_api(cfg):
-    """把 gt_overall 目录注入 sys.path 并 import stomp_planning_api（懒加载，避免无 STOMP 时报错）。
+    """把 stomp_planner 目录注入 sys.path 并 import stomp_planning_api（懒加载，避免无 STOMP 时报错）。
 
-    目录优先级：环境变量 GT_OVERALL_DIR > config.stomp_params['gt_overall_dir']。
+    目录优先级：环境变量 STOMP_PLANNER_DIR > config.stomp_params['stomp_planner_dir']
+    （后者默认 = 本项目 stomp_planner/）。
     """
-    d = os.environ.get("GT_OVERALL_DIR") or cfg.stomp_params["gt_overall_dir"]
+    d = os.environ.get("STOMP_PLANNER_DIR") or cfg.stomp_params["stomp_planner_dir"]
     if d and d not in sys.path:
         sys.path.insert(0, d)
     import stomp_planning_api  # noqa: E402
@@ -65,9 +70,12 @@ def plan_pose_single(cfg, world, cur_cfg, goal_pose, *, buffer: Optional[float] 
     返回：(T,dof) ndarray 或 None。
     """
     api = _ensure_api(cfg)
+    _t0 = time.perf_counter()
     traj = api.plan_to_pose_single(
         list(map(float, cur_cfg)), goal_pose, world,
         **_plan_kwargs(cfg, buffer, checker_type))
+    print(f"[计时] plan_pose_single（建planner+IK+STOMP）{time.perf_counter() - _t0:.3f}s "
+          f"-> {'None' if traj is None else 'ok'}")
     return None if traj is None else np.asarray(traj, float)
 
 
@@ -105,6 +113,187 @@ def plan_pose_multi(cfg, world, cur_cfg, goal_pose, *, buffer: Optional[float] =
     trajs = api.plan_to_pose_multi(
         list(map(float, cur_cfg)), goal_pose, world, **kw)
     return [np.asarray(t, float) for t in trajs] if trajs else []
+
+
+def plan_joint_single(cfg, world, cur_cfg, target_cfg, *, buffer: Optional[float] = None,
+                      checker_type: Any = None) -> Optional[np.ndarray]:
+    """用 STOMP 规划 cur_cfg -> target_cfg（关节空间目标），返回【单条最优】避障轨迹。
+
+    调 stomp_planning_api.plan_to_joint_single：跑 num_batch 条并行 STOMP，在所有「无碰撞
+    (n_collision_steps==0) 且在限位(in_limit)」的候选里取 state_cost 最小那条；无合格候选返回 None。
+
+    入参同 plan_pose_single，但目标是关节角 target_cfg（长度=dof）而非位姿。
+    返回：(T,dof) ndarray 或 None。
+    """
+    api = _ensure_api(cfg)
+    _t0 = time.perf_counter()
+    traj = api.plan_to_joint_single(
+        list(map(float, cur_cfg)), list(map(float, target_cfg)), world,
+        **_plan_kwargs(cfg, buffer, checker_type))
+    print(f"[计时] plan_joint_single（建planner+STOMP，无IK）{time.perf_counter() - _t0:.3f}s "
+          f"-> {'None' if traj is None else 'ok'}")
+    return None if traj is None else np.asarray(traj, float)
+
+
+def plan_joint_multi(cfg, world, cur_cfg, target_cfg, *, buffer: Optional[float] = None,
+                     checker_type: Any = None) -> list:
+    """用 STOMP 规划 cur_cfg -> target_cfg（关节空间目标），返回【所有合格】避障轨迹（按 state_cost 升序）。
+
+    调 stomp_planning_api.plan_to_joint_multi。入参同 plan_joint_single。
+    返回：list[(T,dof) ndarray]（无合格候选时为 []）。
+    """
+    api = _ensure_api(cfg)
+    trajs = api.plan_to_joint_multi(
+        list(map(float, cur_cfg)), list(map(float, target_cfg)), world,
+        **_plan_kwargs(cfg, buffer, checker_type))
+    return [np.asarray(t, float) for t in trajs] if trajs else []
+
+
+def world_from_voxmap(cfg, voxmap, inflate_voxels: Optional[int] = None):
+    """三态体素图的「非 FREE」(OCCUPIED ∪ UNKNOWN) 区域 → 单个 mesh 的 WorldConfig（供 STOMP 用）。
+
+    STOMP 不支持 VOXEL 碰撞检查（stomp_planning_api 只 MESH/PRIMITIVE），故把探索世界的障碍区
+    转成一个 mesh：用 marching cubes 只网格化「自由泡」边界 + ROI 外壳（面数千量级，逐体素 cuboid
+    在 UNKNOWN 占满 ROI 时不可行）。
+
+    膨胀层数 inflate_voxels 缺省取 cfg.voxel_inflate_voxels（与 collision_sync.sync_collision_world
+    同一单一来源）——保证 STOMP 与 cuRobo 在【相同障碍集】上规划，行为一致。
+
+    顶点 base 系映射：matrix_to_marching_cubes 顶点 = 原矩阵索引×voxel_size（角点在索引 0），
+    voxmap voxel i 中心在 origin+(i+0.5)·vs，故 world = origin + mc_verts + 0.5·vs（表面正好落在
+    障碍体素外缘面上，与 voxmap 占据对齐、不错位）。
+
+    返回 (WorldConfig, CollisionCheckerType.MESH)；非 FREE 全空时返回空 world（仅自碰撞）。
+    """
+    import gt_gen.compat  # noqa: F401  trimesh shim
+    gt_gen.compat.apply_trimesh_shim()
+    import trimesh
+    from curobo.geom.types import WorldConfig, Mesh
+    from curobo.geom.sdf.world import CollisionCheckerType
+
+    mask = np.asarray(voxmap.non_free_mask(), bool)
+    if inflate_voxels is None:
+        inflate_voxels = int(getattr(cfg, "voxel_inflate_voxels", 0))
+    if inflate_voxels and mask.any() and not mask.all():
+        from scipy import ndimage
+        st = ndimage.generate_binary_structure(3, 3)             # 26 邻接，覆盖对角
+        mask = ndimage.binary_dilation(mask, structure=st, iterations=int(inflate_voxels))
+    if not mask.any():
+        return WorldConfig(mesh=[]), CollisionCheckerType.MESH
+
+    vs = float(voxmap.voxel_size)
+    _t0 = time.perf_counter()
+    tm = trimesh.voxel.ops.matrix_to_marching_cubes(mask, pitch=vs)
+    verts = np.asarray(tm.vertices, float) + np.asarray(voxmap.origin, float) + 0.5 * vs
+    mesh = Mesh(name="explore_obstacles", vertices=verts.tolist(),
+                faces=np.asarray(tm.faces, np.int64).tolist(),
+                pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    print(f"[计时] world_from_voxmap（非FREE体素={int(mask.sum())} -> "
+          f"mesh 顶点={len(tm.vertices)} 面={len(tm.faces)}）{time.perf_counter() - _t0:.3f}s")
+    return WorldConfig(mesh=[mesh]), CollisionCheckerType.MESH
+
+
+def _greedy_boxes(sub):
+    """贪心 3D 盒分解：把 bool 子掩码 sub(nx,ny,nz) 恰好覆盖成若干轴对齐大盒（不重叠、无近似）。
+
+    每步取一个未认领的占据体素当种子，先沿 X 长到连续占据的最远处，再沿 Y（整行占据才扩）、
+    再沿 Z（整板占据才扩），标记认领后继续。实心块 → 1 个大盒；三态体素的成片占据收缩极猛。
+    返回 list[(i0,j0,k0,i1,j1,k1)]（含端点，相对 sub 原点的索引）。
+    """
+    claimed = ~np.ascontiguousarray(sub, dtype=bool)         # 非占据视为已认领
+    nx, ny, nz = claimed.shape
+    boxes = []
+    xs, ys, zs = np.nonzero(~claimed)                        # 原始占据体素（C 序）
+    for x0, y0, z0 in zip(xs.tolist(), ys.tolist(), zs.tolist()):
+        if claimed[x0, y0, z0]:
+            continue
+        x1 = x0
+        while x1 + 1 < nx and not claimed[x1 + 1, y0, z0]:
+            x1 += 1
+        y1 = y0
+        while y1 + 1 < ny and not claimed[x0:x1 + 1, y1 + 1, z0].any():
+            y1 += 1
+        z1 = z0
+        while z1 + 1 < nz and not claimed[x0:x1 + 1, y0:y1 + 1, z1 + 1].any():
+            z1 += 1
+        claimed[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1] = True
+        boxes.append((x0, y0, z0, x1, y1, z1))
+    return boxes
+
+
+def world_from_voxmap_cuboid(cfg, voxmap, n: Optional[float] = None,
+                             inflate_voxels: Optional[int] = None):
+    """三态体素图「非 FREE」区 → 一批 cuRobo Cuboid 的 WorldConfig（PRIMITIVE，供 STOMP 用）。
+
+    与 world_from_voxmap(mesh 版) 并列的另一种转法：
+      - 仅转【以 base 原点(0,0,0)为心、半边长 n 的盒 [−n,n]³】与 ROI 交集内的非 FREE 体素；
+        盒外 UNKNOWN 当 FREE（可穿行）——放宽「只走确认空域」保守性换速度（见 default.yaml 注释）。
+      - 体素本就是立方体，逐格转 Cuboid 是占据的【精确】表示（无 marching-cubes 表面近似）；
+        再用 _greedy_boxes 把成片占据【合并成少量大盒】，避免 PRIMITIVE 检查器线性扫几万个 cuboid。
+
+    n 缺省取 cfg.stomp_params['local_box_m']；inflate_voxels 缺省同 cfg.voxel_inflate_voxels（同一来源）。
+    返回 (WorldConfig(cuboid=[...]), CollisionCheckerType.PRIMITIVE)；盒内无占据时返回空 world。
+
+    盒覆盖 voxel 索引 [i0..i1] → Cuboid 中心 = origin+(i0+i1+1)/2·vs，边长 = (i1−i0+1)·vs
+    （voxel i 中心在 origin+(i+0.5)·vs，故盒面正好贴体素外缘，与 voxmap 占据精确对齐）。
+    """
+    import gt_gen.compat  # noqa: F401  trimesh shim
+    gt_gen.compat.apply_trimesh_shim()
+    from curobo.geom.types import WorldConfig, Cuboid
+    from curobo.geom.sdf.world import CollisionCheckerType
+
+    mask = np.asarray(voxmap.non_free_mask(), bool)
+    if inflate_voxels is None:
+        inflate_voxels = int(getattr(cfg, "voxel_inflate_voxels", 0))
+    if inflate_voxels and mask.any() and not mask.all():
+        from scipy import ndimage
+        st = ndimage.generate_binary_structure(3, 3)
+        mask = ndimage.binary_dilation(mask, structure=st, iterations=int(inflate_voxels))
+
+    if n is None:
+        n = float(cfg.stomp_params.get("local_box_m", 2.0))
+    vs = float(voxmap.voxel_size)
+    origin = np.asarray(voxmap.origin, float)
+    grid = np.asarray(mask.shape, int)
+    # [−n, n]^3（base 原点为心）→ index 子盒，与 ROI 取交：voxel i 中心 = origin+(i+0.5)·vs ∈ [−n,n]
+    lo = np.ceil((-n - origin) / vs - 0.5).astype(int)
+    hi = np.floor((n - origin) / vs - 0.5).astype(int)
+    lo = np.maximum(lo, 0)
+    hi = np.minimum(hi, grid - 1)
+    if np.any(lo > hi):
+        print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒与 ROI 无交）-> 空 world")
+        return WorldConfig(cuboid=[]), CollisionCheckerType.PRIMITIVE
+
+    sub = mask[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1]
+    n_occ = int(sub.sum())
+    if n_occ == 0:
+        print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE=0）-> 空 world")
+        return WorldConfig(cuboid=[]), CollisionCheckerType.PRIMITIVE
+
+    _t0 = time.perf_counter()
+    boxes = _greedy_boxes(sub)
+    cuboids = []
+    for bi, (i0, j0, k0, i1, j1, k1) in enumerate(boxes):
+        g0 = lo + np.array([i0, j0, k0])
+        g1 = lo + np.array([i1, j1, k1])
+        center = origin + (g0 + g1 + 1) * 0.5 * vs
+        bdims = (g1 - g0 + 1).astype(float) * vs
+        cuboids.append(Cuboid(name=f"vox_{bi}", dims=bdims.tolist(),
+                              pose=center.tolist() + [1.0, 0.0, 0.0, 0.0]))
+    print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE格={n_occ} -> 合并大盒={len(cuboids)}）"
+          f"{time.perf_counter() - _t0:.3f}s")
+    return WorldConfig(cuboid=cuboids), CollisionCheckerType.PRIMITIVE
+
+
+def world_from_voxmap_auto(cfg, voxmap, inflate_voxels: Optional[int] = None):
+    """按 cfg.stomp_params['voxel_world'] 选转法：'cuboid'→world_from_voxmap_cuboid，否则 mesh 版。
+
+    步①/步⑤ 都经此把探索 voxmap 转成 STOMP 世界，保证两处用同一种转法。
+    """
+    mode = str(cfg.stomp_params.get("voxel_world", "mesh")).lower()
+    if mode == "cuboid":
+        return world_from_voxmap_cuboid(cfg, voxmap, inflate_voxels=inflate_voxels)
+    return world_from_voxmap(cfg, voxmap, inflate_voxels=inflate_voxels)
 
 
 def _visualize_ik(cfg, world, goal_pose, *, checker_type=None, buffer=None,

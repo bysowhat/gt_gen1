@@ -257,6 +257,15 @@ class StompPlanner:
             position_threshold=ik_position_threshold,
             rotation_threshold=ik_rotation_threshold, return_info=True)
 
+        # 所有 IK 解都进入碰撞/缓冲 → 目标位姿本身不可行，STOMP 终点只能固定在碰撞构型上、
+        # 必产垃圾轨迹。此处直接判规划失败、不再跑 STOMP；返回空候选，下游 _valid_candidates
+        # 取不到合格解 → plan_to_pose_single/multi 返回 None（默认轨迹判 FAIL / 绕行判 no_solution）。
+        if not ik_info["collision_free"]:
+            print(f"[plan_pose] 所有 IK 解都进入碰撞/缓冲"
+                  f"(最小碰撞距离={ik_info['collision_distance']:.4f}) → 目标位姿不可行，"
+                  f"不再继续 STOMP，直接判规划失败。")
+            return [], []
+
         trajs, infos = self.plan_joint(cur_cfg, target_cfg, **plan_kwargs)
         for info in infos:
             info["target_cfg"] = target_cfg

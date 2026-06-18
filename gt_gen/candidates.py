@@ -207,6 +207,44 @@ def _cam_to_ee_transform(handle, camera_model) -> np.ndarray:
     return np.linalg.inv(T_base_cam) @ T_base_ee
 
 
+def _debug_viz_candidate(handle, voxmap, cur_cfg, cfg, B):
+    """调试用：可视化 cur_cfg / 候选 cfg 两条整臂 + voxmap(FREE/OCCUPIED) + 阻塞集 B。
+    被调用即弹窗(需显示器+open3d)；无显示器/服务器跑时把调用行注释掉即可（调用行本身就是开关）。
+
+    画 cur_cfg 整臂(绿) + cfg 整臂(青) + FREE 格(蓝半透明) + OCCUPIED 格(橙) + B(品红) +
+    ROI/base。UNKNOWN 几乎是整个网格、画出来挡视线，故不画。依赖 verify_step8 的 open3d 工具。
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from verify_step8 import _arm_mesh, _cells_mesh, _draw, _roi_and_base
+    from gt_gen.voxmap import FREE, OCCUPIED
+
+    a_cur = _arm_mesh(handle, list(cur_cfg)); a_cur.paint_uniform_color([0.20, 0.72, 0.32])
+    a_cfg = _arm_mesh(handle, list(cfg)); a_cfg.paint_uniform_color([0.10, 0.75, 0.85])
+    geoms = [("cur_cfg", a_cur, "lit", None), ("cfg", a_cfg, "lit", None)]
+
+    free_c = voxmap.state_centers(FREE)
+    occ_c = voxmap.state_centers(OCCUPIED)
+    n_free = int(free_c.shape[0]); n_occ = int(occ_c.shape[0])
+    if n_free:
+        geoms.append(("free", _cells_mesh(voxmap, free_c), "fill", [0.20, 0.45, 0.95, 0.20]))
+    if n_occ:
+        om = _cells_mesh(voxmap, occ_c); om.paint_uniform_color([1.0, 0.55, 0.0])
+        geoms.append(("occupied", om, "lit", None))
+
+    Bw = np.asarray(B).reshape(-1, 3)
+    n_b = int(Bw.shape[0])
+    if n_b:
+        bm = _cells_mesh(voxmap, voxmap.voxel_to_world(Bw)); bm.paint_uniform_color([1.0, 0.0, 0.85])
+        geoms.append(("B", bm, "lit", None))
+
+    geoms += _roi_and_base(voxmap)
+    _draw(geoms, f"candidate: 绿=cur_cfg 青=候选cfg | FREE={n_free}(蓝) "
+                 f"OCCUPIED={n_occ}(橙) B={n_b}(品红)")
+
+
 # ---------- ③ 顶层：生成候选关节构型 ----------
 
 def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
@@ -268,6 +306,7 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
                 look_deg = float(np.degrees(np.arccos(np.clip(np.dot(axis, look), -1, 1))))
                 if look_deg > max_look_deg:
                     continue
+                # _debug_viz_candidate(handle, voxmap, cur_cfg, cfg, B)  # 看 cur_cfg/候选整臂 + voxmap(FREE/OCC) + B（去注释开窗）
                 # ③ 保守可达：当前构型 → 候选，整臂扫掠 ⊆ FREE
                 ok, _ = motion_stays_in_free(handle, voxmap, cur_cfg, cfg)
                 if not ok:

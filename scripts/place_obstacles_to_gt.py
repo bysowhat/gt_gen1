@@ -117,8 +117,10 @@ def build_scene(args):
         h_truth_plan = ci.init_curobo(cfg, world_model=world_inflated,
                                       collision_checker_type=CollisionCheckerType.MESH,
                                       position_threshold=0.05, rotation_threshold=0.5)
+        world_plan = world_inflated
     else:
         h_truth_plan = None
+        world_plan = world                                       # P* 退回用 h_truth 的真实尺寸世界
         print(f"buffer={buf}m（≤0 或无障碍）→ P* 规划退回用 h_truth（无 buffer）")
     print("初始化 h_expl（VOXEL，纯三态，无 mesh）...")
     h_expl = ci.init_curobo(cfg)
@@ -141,7 +143,7 @@ def build_scene(args):
     return dict(cfg=cfg, h_truth=h_truth, h_expl=h_expl, h_truth_plan=h_truth_plan, vm=vm, cam=cam,
                 scene=scene, goal_pose=goal_pose, data=data, joint_names=joint_names, mesh_pose=mesh_pose,
                 obj_path=obj_path, prims_raw=list(data["obstacle_prims"]), link=link, otype=otype,
-                p_star_init=p_star_init)
+                p_star_init=p_star_init, world_plan=world_plan)
 
 
 def run_generate_gt(ctx):
@@ -152,7 +154,8 @@ def run_generate_gt(ctx):
     GT, status, info = generate_gt(ctx["h_truth"], ctx["h_expl"], ctx["vm"], ctx["scene"],
                                    ctx["goal_pose"], camera_model=ctx["cam"],
                                    h_truth_plan=ctx.get("h_truth_plan"),
-                                   p_star_init=ctx.get("p_star_init"))
+                                   p_star_init=ctx.get("p_star_init"),
+                                   world_plan=ctx.get("world_plan"))
     print(f"  status={status}  GT 路点={len(GT)}  轮数={info['rounds']}  P*长={info['P_len']}")
     print(f"  status 轨迹={info['status_seq']}")
     print(f"  |B| 轨迹={info['n_B']}")
@@ -165,7 +168,11 @@ def save_gt(ctx, GT, out):
     """存 npz：GT 同时写进 positions / detour_positions，并带上工件+障碍信息，
     字段与 place_obstacles 输出对齐 → 可直接喂 viz_placed_obstacle_isaacsim.py（工件+障碍+GT 一起显示）。"""
     data = ctx["data"]
+    cfg = ctx["cfg"]
     positions = np.asarray([np.asarray(q, float) for q in GT])
+    # 回放 dt 跟随【本次产 GT 的后端】（不继承源 npz）：STOMP 段按 delta_t（默认 0.1），
+    # cuRobo 探索插值按 interpolation_dt(=0.02)。主循环 GT 全程同一后端 → 节奏一致。
+    traj_dt = float(cfg.stomp_params["delta_t"]) if cfg.planner_backend == "stomp" else 0.02
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     np.savez(
         out,
@@ -175,7 +182,7 @@ def save_gt(ctx, GT, out):
         n_detour=1,
         joint_names=np.array(ctx["joint_names"]),
         retract=np.asarray(data["retract"], float) if "retract" in data.files
-        else np.asarray(ctx["cfg"].retract_config, float),
+        else np.asarray(cfg.retract_config, float),
         obstacle_prims=np.array(ctx["prims_raw"], dtype=object),
         anchor=np.asarray(data["anchor"], float) if "anchor" in data.files else np.zeros(3),
         link=ctx["link"], otype=ctx["otype"],
@@ -185,7 +192,7 @@ def save_gt(ctx, GT, out):
         seam_mid=np.asarray(data["seam_mid"], float) if "seam_mid" in data.files else np.zeros(3),
         seam_bisector=np.asarray(data["seam_bisector"], float) if "seam_bisector" in data.files
         else np.zeros(3),
-        dt=float(data["dt"]) if "dt" in data.files else 0.02,
+        dt=traj_dt,
     )
     print(f"  ✓ GT 已存: {out}  (positions={positions.shape})")
     print(f"    可视化: conda run -n env_isaaclab python scripts/viz_placed_obstacle_isaacsim.py "

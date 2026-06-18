@@ -96,23 +96,28 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
   time_dilation_factor: 1.0 # 轨迹时间放慢系数 ∈(0,1]：把速度/加速度上限按比例缩小，松动力学约束。
                             #   对「几何可行但太赶、撞速度/加速度极限」的失败有效；只改快慢不改路径形状（GT 轨迹更慢）。
   # ↓ 规划后端开关：obstacle_placement 的「默认轨迹 / 绕行解」用哪种规划器（碰撞判定 check_state 不受影响，恒用 cuRobo）
-  backend: stomp           # curobo | stomp。curobo=MotionGen(graph+trajopt)；stomp=参考项目 gt_overall 的 STOMP。
-  stomp:                    # backend=stomp 时透传 gt_overall/stomp_planning_api 的旋钮（curobo 时整段忽略）
-    gt_overall_dir: "/home/a/Projects/Github/kejian_guihua/gt_overall"  # 参考项目目录（含 stomp_planning_api）；环境变量 GT_OVERALL_DIR 可覆盖
+  backend: stomp           # curobo | stomp。curobo=MotionGen(graph+trajopt)；stomp=本项目 stomp_planner 的 STOMP。
+  stomp:                    # backend=stomp 时透传 stomp_planner/stomp_planning_api 的旋钮（curobo 时整段忽略）
+    # STOMP 核心已 vendoring 到本项目 stomp_planner/；默认用项目内目录（见 config.py），
+    # 无需在此写绝对路径。如需覆盖：加 stomp_planner_dir: <路径> 或设 env STOMP_PLANNER_DIR。
     num_iterations: 120     # 迭代轮数（搜索深度）：越大收敛越充分越能绕开，越慢
-    num_batch: 16            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
-    num_timesteps: 151       # 轨迹时间步数
+    num_batch: 2            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
+    num_timesteps: 101       # 轨迹时间步数
     delta_t: 0.1            # 步长（秒）；也是产出 npz 的回放 dt
     collision_weight: 80.0  # 碰撞代价权重
     buffer_m: 0.001         # STOMP 自身的碰撞激活距离≈0：间隙完全来自障碍物理膨胀(obstacle_buffer_m)，工件不膨胀，
                             #   两后端在同一个 world（默认=仅工件 / 绕行=障碍已膨胀）里规划，只换规划器
+    voxel_world: cuboid     # 探索世界 voxmap→STOMP 世界的转法：mesh=marching-cubes 网格化全 ROI 自由泡边界；
+                            #   cuboid=仅 base 原点为心 ±local_box_m 盒内的非 FREE 体素→贪心合并成大盒(PRIMITIVE)
+    local_box_m: 2          # cuboid 模式：以 base 原点(0,0,0)为心、半边长 n=此值(米) 的盒 [−n,n]³ 内才转换；
+                            #   盒外 UNKNOWN 当 FREE 可穿行（放宽保守性换速度）。盒内占据会贪心合并成少量大盒
 
 # 以下参数留待对应步骤填实（先放占位/默认）
 params:
   nbv:
     k_lookahead: 6                      # B 取 P* 前方几个路点（Step 7）
-    standoff_d_m: [0.55, 0.75, 0.95]    # 站位距离档（Step 8）
-    n_view_dirs: 8                      # 每档观察方向数（Step 8）
+    standoff_d_m: [0.55, 0.85, 1.05]    # 站位距离档（Step 8）
+    n_view_dirs: 32                      # 每档观察方向数（Step 8）
     max_look_deg: 20                    # 候选看向校验：相机光轴对准 T 的最大夹角°（Step 8，兜 cuRobo 朝向阈值偏松）
     cluster:                            # 阻塞段 B 聚类（Step 8，scipy 层次聚类 linkage+fcluster）
       max: 3                            # 最多簇数（超出则保留最大的簇心 + 全部点重指派到最近簇心覆盖）
@@ -123,7 +128,7 @@ params:
   loop:
     max_rounds: 200                     # 主循环最大轮次（Step 10）
     stuck_rounds: 5                     # 连续无进展判卡死（Step 10）
-    observe_every_n: 3                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
+    observe_every_n: 20                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
     interp_resolution_m: 0.01           # 扫掠体积插值精度（Step 6）
 
