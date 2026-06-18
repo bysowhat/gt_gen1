@@ -161,6 +161,26 @@ class Config:
         """轨迹时间放慢系数 ∈(0,1]：<1 把速度/加速度上限按比例缩小，松动力学约束→成功率↑（轨迹更慢）。"""
         return float(self.raw.get("planner", {}).get("time_dilation_factor", 0.5))
 
+    # ---- 规划后端（curobo | stomp，见 gt_gen/stomp_iface.py） ----
+    @property
+    def planner_backend(self) -> str:
+        """obstacle_placement 的「默认轨迹/绕行解」用哪种规划器：curobo(MotionGen) | stomp(gt_overall)。
+        碰撞判定 check_state 不受此影响（恒用 cuRobo handle）。"""
+        return str(self.raw.get("planner", {}).get("backend", "curobo")).lower()
+
+    @property
+    def stomp_params(self) -> dict:
+        """STOMP 旋钮（planner.stomp 段，单一来源；backend=stomp 时透传 stomp_planning_api）。缺省给兜底。"""
+        sp = dict(self.raw.get("planner", {}).get("stomp", {}))
+        sp.setdefault("gt_overall_dir", "/home/a/Projects/Github/kejian_guihua/gt_overall")
+        sp.setdefault("num_iterations", 120)
+        sp.setdefault("num_batch", 8)
+        sp.setdefault("num_timesteps", 51)
+        sp.setdefault("delta_t", 0.1)
+        sp.setdefault("collision_weight", 80.0)
+        sp.setdefault("buffer_m", 0.001)
+        return sp
+
     @property
     def params(self) -> dict:
         return self.raw.get("params", {})
@@ -181,6 +201,8 @@ class Config:
         op.setdefault("angle_jitter_deg", 30.0)
         op.setdefault("pos_jitter_m", 0.10)
         op.setdefault("detour_min_joint_rad", 0.30)
+        op.setdefault("detour_ik_position_threshold", 0.005)
+        op.setdefault("detour_ik_rotation_threshold", 0.05)
         op.setdefault("obstacle_types", [])
         op.setdefault("span_clip_m", [0.15, 1.2])
         op.setdefault("tube_r_clip_m", [0.04, 0.20])

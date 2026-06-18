@@ -82,6 +82,8 @@ def main():
 
     print("seam   :", args.seam)
     print("obj    :", obj_path)
+    print("规划后端:", cfg.planner_backend,
+          ("(STOMP 旋钮 " + str(cfg.stomp_params) + ")") if cfg.planner_backend == "stomp" else "")
     print("关键 link:", op["key_links"], " M=", op["max_per_scene"], " N=", op["max_attempts"])
 
     # 工件 mesh @ 机械臂基座系（同 plan_seam）
@@ -100,7 +102,9 @@ def main():
     metric = ci.free_pose_metric(h, free_rot=(0,))
 
     print("== 规划默认无障碍轨迹 retract→goal ==")
-    traj_default = opl.plan_default_traj(h, retract, goal_pose, metric, cfg.plan_max_attempts)
+    traj_default = opl.plan_default_traj(h, retract, goal_pose, metric, cfg.plan_max_attempts,
+                                         cfg=cfg, world=world0,
+                                         checker_type=CollisionCheckerType.MESH)
     if traj_default is None:
         print("PLACE_OBSTACLES_FAIL: 默认轨迹规划失败（无障碍都到不了 goal）")
         return
@@ -116,6 +120,8 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     robot_usd = cfg.robot_cfg["robot_cfg"]["kinematics"].get("usd_path", "")
+    # 回放 dt：STOMP 轨迹按 delta_t（默认 0.1）；cuRobo 插值按 interpolation_dt(=0.02)
+    traj_dt = float(cfg.stomp_params["delta_t"]) if cfg.planner_backend == "stomp" else 0.02
     n_ok = 0
     used_types = []
     for i, sc in enumerate(scenes):
@@ -140,7 +146,7 @@ def main():
                 robot_usd=robot_usd,
                 seam_mid=np.array(seam_dbg["seam_mid"], float),
                 seam_bisector=np.array(seam_dbg["seam_bisector"], float),
-                dt=0.02,
+                dt=traj_dt,
             )
             print(f"  [{i:02d}] {sc['link']:<22} {sc['otype']:<16} ✓ 第{sc['attempt']}次成功 "
                   f"碰撞点={sc['n_bad']} 绕行偏差={sc['dist']:.3f}rad 绕行解={len(detours)}条 "

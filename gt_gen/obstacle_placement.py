@@ -30,8 +30,18 @@ from gt_gen import curobo_iface as ci
 
 
 # ------------------------------------------------------------------ 默认轨迹
-def plan_default_traj(handle, retract, goal_pose, metric, max_attempts) -> Optional[np.ndarray]:
-    """在「只含工件 mesh」的世界里规划 retract→goal 的默认无障碍轨迹。返回插值 (T,dof)，失败 None。"""
+def plan_default_traj(handle, retract, goal_pose, metric, max_attempts, *,
+                      cfg=None, world=None, checker_type=None) -> Optional[np.ndarray]:
+    """在「只含工件 mesh」的世界里规划 retract→goal 的默认无障碍轨迹。返回插值 (T,dof)，失败 None。
+
+    后端由 cfg.planner_backend 决定（curobo|stomp，见 gt_gen/stomp_iface.py）：
+    - curobo：MotionGen(graph+trajopt)，用 handle 内部世界，metric 放开 roll；
+    - stomp ：在传入的 world（仅工件、不膨胀）上跑 STOMP，固定朝向（metric 忽略），buffer≈0.001。
+    """
+    backend = cfg.planner_backend if cfg is not None else "curobo"
+    if backend == "stomp":
+        from gt_gen import stomp_iface as si
+        return si.plan_pose_single(cfg, world, retract, goal_pose, checker_type=checker_type)
     res = ci.plan_to_pose(handle, retract, goal_pose, max_attempts=max_attempts,
                           pose_cost_metric=metric)
     if res is None or not bool(res.success.item()):
@@ -464,10 +474,33 @@ def path_collides(handle, traj) -> Tuple[bool, int]:
 
 
 def detour_exists(handle, retract, goal_pose, metric, max_attempts,
-                  max_solutions: int = 1, dedup_rad: float = 0.3):
-    """当前(含障碍)世界里能否规划出绕行解。返回 (ok, trajs)：
-    trajs 是 list[ndarray]，按 IK 误差升序、互不相同（关节偏差峰值 ≥ dedup_rad 才算不同）。
-    max_solutions=1 时只取首个成功解（等价旧行为）；>1 时收集多条不同绕行解供存多份 GT。"""
+                  max_solutions: int = 1, dedup_rad: float = 0.3, *,
+                  cfg=None, world=None, checker_type=None):
+    """当前(含障碍)世界里能否规划出绕行解。返回 (ok, trajs)：trajs 是 list[ndarray]。
+
+    后端由 cfg.planner_backend 决定（两后端用的是【同一个 world_inflated】：障碍膨胀、工件不膨胀）：
+    - curobo：世界已由 validate_scene 的 update_world 灌进 handle，这里用 handle 规划，
+              按 IK 误差升序收集多条互不相同(关节偏差峰值 ≥ dedup_rad)的绕行解；
+    - stomp ：把 world 作【参数】直接传入 STOMP，固定朝向、buffer≈0.001；plan_to_pose_multi 返回
+              所有合格候选(无碰撞+在限位，按 state_cost 升序、终点同一 IK 解)，本函数再按 dedup_rad
+              贪心去重、收满 max_solutions 即停（与 curobo 分支同语义）。
+    """
+    backend = cfg.planner_backend if cfg is not None else "curobo"
+    if backend == "stomp":
+        from gt_gen import stomp_iface as si
+        from gt_gen.curobo_iface import _traj_max_joint_dist
+        op = cfg.obstacle_placement
+        cands = si.plan_pose_multi(
+            cfg, world, retract, goal_pose, checker_type=checker_type,
+            ik_position_threshold=float(op["detour_ik_position_threshold"]),
+            ik_rotation_threshold=float(op["detour_ik_rotation_threshold"]))
+        kept = []
+        for traj in cands:                                    # 已按 state_cost 升序
+            if max_solutions and len(kept) >= max_solutions:
+                break
+            if all(_traj_max_joint_dist(traj, k) >= dedup_rad for k in kept):
+                kept.append(traj)
+        return (len(kept) > 0), kept
     trajs = ci.plan_to_pose_all(handle, retract, goal_pose, max_attempts=max_attempts,
                                 pose_cost_metric=metric, max_solutions=max_solutions,
                                 dedup_rad=dedup_rad)
@@ -530,11 +563,13 @@ def validate_scene(handle, traj_default, retract, goal_pose, metric, cfg,
     if not collides:
         return dict(ok=False, fail_reason="too_weak", n_bad=0, dist=0.0, detour_trajs=[])
     # ②③ 膨胀尺寸：绕行解与真实障碍留 buffer 间隙；收集多条互不相同的绕行解
-    handle.mg.update_world(world_inflated)
+    if cfg.planner_backend != "stomp":
+        handle.mg.update_world(world_inflated)            # cuRobo：世界经 handle 内部状态传入
     max_sol = int(op.get("detour_max_solutions", 1))
     ok2, trajs = detour_exists(handle, retract, goal_pose, metric,
                                int(op["detour_max_attempts"]),
-                               max_solutions=max_sol, dedup_rad=thresh)
+                               max_solutions=max_sol, dedup_rad=thresh,
+                               cfg=cfg, world=world_inflated)   # STOMP：世界作参数直接传入
     if not ok2:
         return dict(ok=False, fail_reason="no_solution", n_bad=n_bad, dist=0.0, detour_trajs=[])
     # ③ 只保留「明显不同于默认」的绕行解

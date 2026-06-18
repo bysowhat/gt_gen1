@@ -95,6 +95,17 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
                             #   代价：更慢。trajopt 种子里一部分由 graph 解插值生成，故与 num_*_seeds 搭配调最有效。
   time_dilation_factor: 1.0 # 轨迹时间放慢系数 ∈(0,1]：把速度/加速度上限按比例缩小，松动力学约束。
                             #   对「几何可行但太赶、撞速度/加速度极限」的失败有效；只改快慢不改路径形状（GT 轨迹更慢）。
+  # ↓ 规划后端开关：obstacle_placement 的「默认轨迹 / 绕行解」用哪种规划器（碰撞判定 check_state 不受影响，恒用 cuRobo）
+  backend: stomp           # curobo | stomp。curobo=MotionGen(graph+trajopt)；stomp=参考项目 gt_overall 的 STOMP。
+  stomp:                    # backend=stomp 时透传 gt_overall/stomp_planning_api 的旋钮（curobo 时整段忽略）
+    gt_overall_dir: "/home/a/Projects/Github/kejian_guihua/gt_overall"  # 参考项目目录（含 stomp_planning_api）；环境变量 GT_OVERALL_DIR 可覆盖
+    num_iterations: 120     # 迭代轮数（搜索深度）：越大收敛越充分越能绕开，越慢
+    num_batch: 16            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
+    num_timesteps: 151       # 轨迹时间步数
+    delta_t: 0.1            # 步长（秒）；也是产出 npz 的回放 dt
+    collision_weight: 80.0  # 碰撞代价权重
+    buffer_m: 0.001         # STOMP 自身的碰撞激活距离≈0：间隙完全来自障碍物理膨胀(obstacle_buffer_m)，工件不膨胀，
+                            #   两后端在同一个 world（默认=仅工件 / 绕行=障碍已膨胀）里规划，只换规划器
 
 # 以下参数留待对应步骤填实（先放占位/默认）
 params:
@@ -135,6 +146,8 @@ obstacle_placement:                     # 沿「关键 link 扫掠走廊」自�
   detour_max_solutions: 10              # 每个场景收集多少条【互不相同】的绕行解存为多份 GT 候选：
                                        # 对多 IK 分支各规划，按关节偏差峰值 ≥ detour_min_joint_rad 去重，
                                        # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
+  detour_ik_position_threshold: 0.8   # 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
+  detour_ik_rotation_threshold: 0.5    # 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
   obstacle_buffer_m: 0.1               # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
                                         # ②③绕行规划用膨胀尺寸→绕行解与真实障碍留 buffer；工件不受影响。0=关闭
   obstacle_types: []                    # 空=用 obstacles.list_obstacles() 全部 15 种
