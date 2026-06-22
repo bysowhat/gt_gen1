@@ -69,6 +69,30 @@ from omni.isaac.core.utils.stage import add_reference_to_stage  # noqa: E402
 from helper import add_robot_to_scene  # noqa: E402
 
 
+def _goal_z(robot_cfg, q):
+    """FK 默认轨迹末帧（=规划到 goal 的构型），返回末端在 base 系的 z。
+    用 CudaRobotModel 纯做 FK（不起 MotionGen，不 warmup），与 check_collision_spheres.py 同套。"""
+    import torch
+    from curobo.types.base import TensorDeviceType
+    from curobo.types.robot import RobotConfig
+    from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
+    ta = TensorDeviceType()
+    model = CudaRobotModel(RobotConfig.from_dict(robot_cfg, ta).kinematics)
+    st = model.get_state(torch.tensor([list(q)], dtype=torch.float32, device=ta.device))
+    return float(st.ee_position[0, 2].detach().cpu().numpy())
+
+
+def _set_light_rig(name="Grey Studio"):
+    """切换视口灯光预设到指定 light rig（GUI 灯泡菜单的程序化等价；
+    走官方 _set_lighting_mode→自动处理 Y-up/Z-up 朝向）。headless/扩展未加载则静默跳过。"""
+    try:
+        from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
+        ok = _set_lighting_mode(name)
+        print(f"light rig -> {name}: ok={ok[0] if isinstance(ok, tuple) else ok}")
+    except Exception as e:
+        print("warn: 设置 light rig 失败（可能 headless 或扩展未加载）:", e)
+
+
 def _pad(positions):
     """轨迹首尾各补 30 帧静止，便于看清起止姿态。"""
     positions = np.asarray(positions, float)
@@ -129,6 +153,9 @@ def main():
     joint_names = [str(x) for x in data["joint_names"]]
     piece_pose_to_robot = np.asarray(data["piece_pose_to_robot"], float)
     obj_path = str(data["obj_path"])
+
+    # obj_path = '/tmp/placed_obstacles_active/BEAM_1Dz0SS001LpJ4pC3SuD3Gt_part_watertight.obj'
+
     prims = list(data["obstacle_prims"])
     link = str(data["link"]); otype = str(data["otype"])
     print(f"场景: {os.path.basename(scene_path)}  link={link} otype={otype} "
@@ -140,7 +167,11 @@ def main():
     robot_cfg = load_yaml(cfg.robot_cfg_path)["robot_cfg"]
 
     world = World(stage_units_in_meters=1.0)
-    world.scene.add_default_ground_plane()
+    # 地面置于 goal pose 下方 0.5m：goal 高度用默认轨迹末帧（=规划到 goal 的构型）FK 的末端 z。
+    goal_q = np.asarray(data["positions"], float)[-1]
+    gz = _goal_z(robot_cfg, goal_q)
+    print(f"goal z = {gz:.3f} m，地面置于 z = {gz - 0.5:.3f} m")
+    world.scene.add_default_ground_plane(z_position=gz - 0.5)
 
     # 工件资产：优先用同名 .usd；服务器数据常只有 _watertight.obj（无预转 usd），
     # 此时用 trimesh 读 obj 顶点/面手搓 UsdGeom.Mesh（不依赖 Isaac 的 OBJ 文件格式插件，
@@ -233,6 +264,7 @@ def main():
         simulation_app.close()
         return
 
+    _set_light_rig("Grey Studio")
     maxlen = max(int(p.shape[0]) for _, _, p in robots)
     i = hold = 0
     print(f"开始播放 {args.which}（{n_lane} 套并排，关闭窗口结束）…")
