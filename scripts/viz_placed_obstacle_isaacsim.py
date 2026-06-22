@@ -142,15 +142,38 @@ def main():
     world = World(stage_units_in_meters=1.0)
     world.scene.add_default_ground_plane()
 
+    # 工件资产：优先用同名 .usd；服务器数据常只有 _watertight.obj（无预转 usd），
+    # 此时用 trimesh 读 obj 顶点/面手搓 UsdGeom.Mesh（不依赖 Isaac 的 OBJ 文件格式插件，
+    # 顶点即 base-local 几何、单位米，与规划器一致）。
     usd_obj = obj_path.replace("_watertight.obj", ".usd")
+    use_usd = os.path.exists(usd_obj)
+    workpiece_asset = usd_obj if use_usd else obj_path
+
+    def _spawn_obj_mesh(pth):
+        """trimesh 读 obj → 在 pth 定义一个灰色 UsdGeom.Mesh（纯视觉，无物理）。"""
+        import trimesh
+        import omni.usd
+        from pxr import UsdGeom, Gf
+        tm = trimesh.load(obj_path, force="mesh")
+        verts = np.asarray(tm.vertices, float)
+        faces = np.asarray(tm.faces, np.int64).reshape(-1, 3)
+        stage = omni.usd.get_context().get_stage()
+        mesh = UsdGeom.Mesh.Define(stage, pth)
+        mesh.CreatePointsAttr([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in verts])
+        mesh.CreateFaceVertexCountsAttr([3] * len(faces))
+        mesh.CreateFaceVertexIndicesAttr(faces.flatten().tolist())
+        mesh.CreateDisplayColorAttr([Gf.Vec3f(0.72, 0.72, 0.72)])
 
     def spawn_workpiece(i, off):
-        """第 i 套工件 USD（基座系 + 整体平移 off），关物理当纯视觉。"""
-        if not os.path.exists(usd_obj):
-            print("warn: 未找到工件 usd:", usd_obj)
+        """第 i 套工件（基座系 + 整体平移 off），关物理当纯视觉。usd 缺失则用 trimesh 建 Mesh。"""
+        if not os.path.exists(workpiece_asset):
+            print("warn: 未找到工件资产(usd/obj 均缺):", usd_obj, "/", obj_path)
             return
         pth = f"/World/workpiece_{i}"
-        add_reference_to_stage(usd_path=usd_obj, prim_path=pth)
+        if use_usd:
+            add_reference_to_stage(usd_path=workpiece_asset, prim_path=pth)
+        else:
+            _spawn_obj_mesh(pth)
         from omni.isaac.core.prims import XFormPrim
         XFormPrim(pth).set_world_pose(
             position=(piece_pose_to_robot[:3] + off).tolist(),

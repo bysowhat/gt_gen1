@@ -20,33 +20,15 @@ export CUROBO_ISAAC="${CUROBO_ISAAC:-/kpfs_dataset/dataset/baiyu/code/render/cur
 # ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # cd "$ROOT"
 
-OUT_DIR="${OUT_DIR:-/tmp/placed_obstacles}"
-INDEX="${INDEX:-0}"
-WHICH="${WHICH:-detour}"
-FPS="${FPS:-30}"
-DETOUR_INDEX="${DETOUR_INDEX:-0}"
-
-# 选场景：给了 SCENE 就直接指定文件（忽略 OUT_DIR/INDEX）；否则用 目录+序号。
-if [ -n "${SCENE:-}" ]; then
-    SCENE_ARGS=(--scene "$SCENE")
-else
-    SCENE_ARGS=(--out_dir "$OUT_DIR" --index "$INDEX")
-fi
-
-# HEADLESS 非空则加 --headless（store_true）。
-HEADLESS_ARGS=()
-if [ -n "${HEADLESS:-}" ]; then
-    HEADLESS_ARGS=(--headless)
-fi
-
-# /isaac-sim/python.sh -u scripts/viz_placed_obstacle_isaacsim.py \
-#     "${SCENE_ARGS[@]}" \
-#     --which "$WHICH" \
-#     --fps "$FPS" \
-#     "${HEADLESS_ARGS[@]}"
-
+SCENE="${SCENE:-/tmp/placed_obstacles}"
 
 /isaac-sim/python.sh -u scripts/viz_placed_obstacle_isaacsim.py \
-    # --scene /tmp/placed_obstacles_active/scene_00_xiaoyu_accessory_link_plate_gt.npz \
-    --scene /tmp/placed_obstacles/scene_00_xiaoyu_accessory_link_plate.npz \
-    --which default
+    --scene "$SCENE" \
+    --which default \
+    "$@"
+
+
+# /isaac-sim/python.sh -u scripts/viz_placed_obstacle_isaacsim.py \
+#     # --scene /tmp/placed_obstacles_active/scene_00_xiaoyu_accessory_link_plate_gt.npz \
+#     --scene /tmp/placed_obstacles/scene_00_xiaoyu_accessory_link_plate.npz \
+#     --which default
