@@ -65,6 +65,7 @@ from curobo.util_file import load_yaml  # noqa: E402
 from omni.isaac.core import World  # noqa: E402
 from omni.isaac.core.objects import cuboid as _cuboid  # noqa: E402
 from omni.isaac.core.objects import cylinder as _cylinder  # noqa: E402
+from omni.isaac.core.objects import sphere as _sphere  # noqa: E402
 from omni.isaac.core.utils.stage import add_reference_to_stage  # noqa: E402
 from helper import add_robot_to_scene  # noqa: E402
 
@@ -128,6 +129,14 @@ def spawn_prim_dict(lane, k, p, off):
                                  height=float(p["height"]), color=color)
 
 
+def spawn_seam_marker(lane, seam_mid, off):
+    """在焊缝中点(base 系)放一个红色纯视觉球，标出焊缝位置。off=该套整体平移。"""
+    pos = np.asarray(seam_mid, float) + off
+    _sphere.VisualSphere(prim_path=f"/World/seam/lane{lane}/mid",
+                         name=f"seam_{lane}", position=pos, radius=0.02,
+                         color=np.array([1.0, 0.0, 0.0]))
+
+
 def main():
     data = np.load(scene_path, allow_pickle=True)
 
@@ -157,6 +166,7 @@ def main():
     # obj_path = '/tmp/placed_obstacles_active/BEAM_1Dz0SS001LpJ4pC3SuD3Gt_part_watertight.obj'
 
     prims = list(data["obstacle_prims"])
+    seam_mid = np.asarray(data["seam_mid"], float) if "seam_mid" in data.files else None
     link = str(data["link"]); otype = str(data["otype"])
     print(f"场景: {os.path.basename(scene_path)}  link={link} otype={otype} "
           f"障碍原语={len(prims)}  套数={n_lane}")
@@ -240,6 +250,8 @@ def main():
         spawn_workpiece(i, off)
         for k, p in enumerate(prims):
             spawn_prim_dict(i, k, p, off)
+        if seam_mid is not None:
+            spawn_seam_marker(i, seam_mid, off)
         if i == 0 or not os.path.exists(dest_path):
             robot, _ = add_robot_to_scene(
                 robot_cfg, world, robot_name=f"robot_{i}",
