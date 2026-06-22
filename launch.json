@@ -17,11 +17,12 @@
             "type": "debugpy",
             "request": "launch",
             "program": "scripts/viz_seam_isaacsim.py",
-            "console": "int1egratedTerminal",
+            "console": "integratedTerminal",
             "args": [
                 // "--traj", "/tmp/seam_traj.npz",
                 // "--traj", "/tmp/seam_traj_step7.npz",
-                "--traj", "/tmp/seam_traj_step10.npz",
+                // "--traj", "/tmp/seam_traj_step10.npz",
+                "--traj", "/tmp/seam_traj_stomp.npz",
             ]
         },
         {
@@ -34,6 +35,21 @@
                 "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
                 "--max_attempts", "200",
                 "--offset_cm", "10",
+            ]
+        },
+        {
+            "name": "plan_seam_stomp",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/plan_seam_stomp.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
+                "--out", "/tmp/seam_traj_stomp.npz",
+                "--offset_cm", "10",
+                "--num_iterations", "200",
+                "--num_batch", "16",
+                "--buffer", "0.001"
             ]
         },
         {
@@ -152,7 +168,185 @@
                 // "--obstacle", "frame_with_brace","--anchor", "0.6,0,0.7", "--params", "width=0.8,height=0.8,beam=0.08,brace=0.06",
             ]
         },
+        {
+            "name": "place_obstacles",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/place_obstacles.py",
+            "console": "integratedTerminal",
+            // 沿「关键 link 扫掠走廊」自动放障碍 + 三条件验证，每个成功场景存一个 npz 到 --out_dir。
+            // M（每场景障碍数）、N（重试次数）、key_links、各阈值在 configs/default.yaml 的 obstacle_placement 段。
+            "args": [
+                // 焊缝 pkl（默认就是这个 seam_22；换焊缝改这里）：
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
+                // 末端目标沿 bisector 后退的 offset（厘米，默认 10）：
+                "--offset_cm", "10",
+                // 场景 npz 输出目录（默认 /tmp/placed_obstacles）：
+                "--out_dir", "/tmp/placed_obstacles",
+                // 随机种子（控尺寸/角度/位置采样 + 类型抽取，可复现；默认 0）：
+                "--seed", "0",
+                // ---- 以下为可选覆盖，注释掉则用 default.yaml 的值 ----
+                // 覆盖 key_links（逗号分隔；缺省=配置里 6 个关键 link）。例：只跑 Link3、Link5：
+                "--links", "xiaoyu_accessory_link",
+                // 覆盖障碍类型集合（逗号分隔；缺省=obstacles 的全部 15 种，未用优先随机抽）。例：只用这 3 种：
+                "--types", "plate",
+                // "--types", "l_bracket",
+                // "--types", "u_channel",
+                // "--types", "open_box",
+                // "--types", "pipe",
+                // "--types", "parallel_pipes",
+                // "--types", "crossed_pipes",
+                // "--types", "box_beam",
+                // "--types", "rect_frame",
+                // "--types", "gantry",
+                // "--types", "braced_frame",
+                // "--types", "tripod",
+                // "--types", "steps",
+                // "--types", "box_with_pipe",
+                // "--types", "frame_with_brace",
+                // 覆盖 N（单个 link 放置失败后的最大重试次数；缺省=配置 max_attempts）。调试时设小加快：
+                "--max_attempts", "20",
+            ]
+        },
+        {
+            "name": "viz_seam_plate_candidates_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_seam_plate_candidates_isaacsim.py",
+            "console": "integratedTerminal",
+            // 并排展示焊缝旁遮挡板的几种候选摆法（C1~C4），供肉眼选择；红色折线=焊缝，纯视觉无机器人。
+            // --seam 支持多条（同一工件下各 seam 叠到同一块工件上对比）；也可给目录或通配。
+            "args": [
+                // 焊缝 pkl（可多条，空格分隔；或给目录/通配如 .../seam_1*.pkl）：
+                "--seam",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_46.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_0.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_27.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_37.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_52.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_62.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_71.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_44.pkl",
+                // n：C1/C2 抬高量、C3/C4 横挪量（cm）：
+                "--n_cm", "10",
+                // 板宽(cm)：
+                "--width_cm", "30",
+                // 板长占焊缝弧长百分比(%)（实际板长 = max(此%×焊缝弧长, length_min_cm)）：
+                "--length_pct", "100",
+                // 板长下限(cm)：
+                "--length_min_cm", "3",
+                // 板厚(cm)：
+                "--thickness_cm", "2",
+                // 只看哪些候选（逗号分隔，如 C1,C2；空=全部）：
+                "--only", "C1",
+                // 无显示器自检（store_true）：
+                // "--headless",
+            ]
+        },
+        {
+            "name": "place_seam_plate",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/place_seam_plate.py",
+            "console": "integratedTerminal",
+            // 在焊缝旁放 1 块 plate，与两面构成 C 型：板平行于 a/b 之一(--parallel)，沿另一面(脊)表面方向挪开 n_cm。
+            // 产出与 place_obstacles 同格式 npz（含规划好的默认轨迹），可直接用 viz_placed_obstacle_isaacsim 回放。
+            "args": [
+                // 焊缝 pkl：
+                "--seam", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl",
+                // 板平行于哪个面：a=seam_limits[0] / b=seam_limits[1]（位移沿另一面表面方向构成 C 型）：
+                "--parallel", "a",
+                // n：C 型两臂间距，沿脊面(另一面)表面方向离焊缝的距离(cm)：
+                "--n_cm", "10",
+                // m：板长占焊缝弧长的百分比(%)：
+                "--length_pct", "80",
+                // l：板宽(cm)：
+                "--width_cm", "30",
+                // o：板厚(cm)：
+                "--thickness_cm", "3",
+                // p：朝向绕焊缝切线自转角度(度，0=正好平行所选面)：
+                "--angle_deg", "0",
+                // 轨迹目标沿 bisector 的 standoff(cm，与 place_obstacles 一致)：
+                "--offset_cm", "10",
+                // 场景 npz 输出路径：
+                "--out", "/tmp/seam_plate/scene_seam_plate.npz",
+                "--seed", "0",
+            ]
+        },
+        {
+            "name": "viz_placed_obstacle_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_placed_obstacle_isaacsim.py",
+            "console": "integratedTerminal",
+            // 回放 place_obstacles.py 为 seam_22 产出的场景（npz 在 --out_dir 里，名形如 scene_00_Link2_plate.npz）。
+            // 先跑产场景：
+            //   conda run -n env_isaaclab --no-capture-output python -u scripts/place_obstacles.py \
+            //     --seam /media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl --seed 0
+            "args": [
+                // === 选场景：(A) 目录+序号 与 (B) 直接指定文件，二选一 ===
+                // (A) 目录 + 序号（按文件名排序取第 index 个；index 越界自动夹到首/尾）：
+                // "--out_dir", "/tmp/placed_obstacles",   // place_obstacles.py 的输出目录（脚本默认值，可改）
+                // "--index", "0",                          // 取该目录第几个 npz（默认 0，即第一个场景）
+                // (B) 或直接给某个场景文件（给了 --scene 就忽略 --out_dir/--index）：
+                // "--scene", "/tmp/placed_obstacles/scene_00_xiaoyu_accessory_link_plate.npz",
+                // "--scene", "/tmp/placed_obstacles_active/scene_00_gt.npz",
+                // "--scene", "/tmp/placed_obstacles_active/scene_00_Link5_l_bracket_gt.npz",
+                "--scene", "/tmp/seam_plate/scene_seam_plate.npz",
 
+                // === 回放哪条轨迹（默认 detour）===
+                // "--which", "detour",    // detour=绕行轨迹(应绕开障碍)；default=默认无障碍轨迹(应撞障碍)
+                "--which", "default",
 
+                // === 帧率（默认 30）===
+                "--fps", "30",          // 轨迹回放帧率；播完保持 fps*2 帧后循环重播
+
+                // === 无显示器自检（store_true，加上即生效）===
+                // 加 --headless：只 spawn + 跑 3 帧即退，打印障碍数/轨迹点数 + VIZ_PLACED_DONE（不开窗口）。
+                // "--headless",
+                // "--detour_index", "1"
+            ]
+        },
+        {
+            "name": "place_obstacles_to_gt",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/place_obstacles_to_gt.py",
+            "console": "integratedTerminal",
+            // 把 place_obstacles.py 产出的场景（npz）改造成「边看边走」探索 GT（真值含工件+障碍）。
+            // 先跑产场景：
+            //   conda run -n env_isaaclab --no-capture-output python -u scripts/place_obstacles.py \
+            //     --seam /media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_22.pkl --seed 0
+            "args": [
+                // === 选场景：(A) 目录+序号 与 (B) 直接指定文件，二选一 ===
+                // (A) 目录 + 序号（按文件名排序取第 index 个；index 越界自动夹到首/尾）：
+                // "--out_dir", "/tmp/placed_obstacles",   // place_obstacles.py 的输出目录（脚本默认值，可改）
+                // "--index", "0",                          // 取该目录第几个 npz（默认 0，即第一个场景）
+                // (B) 或直接给某个场景文件（给了 --scene 就忽略 --out_dir/--index）：
+                "--scene", "/tmp/placed_obstacles/scene_00_xiaoyu_accessory_link_plate.npz",
+
+                // === GT 存盘路径（缺省按场景名放 /tmp/placed_gt/<场景名>_gt.npz）===
+                "--out", "/tmp/placed_obstacles_active/scene_00_gt.npz",
+            ]
+        },
+        {
+            "name": "viz_obstacle_buffer_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_obstacle_buffer_isaacsim.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--buffer", "0.1",
+            ]
+        },
+        {
+            "name": "plan_two_cfgs",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/plan_two_cfgs.py",
+            "console": "integratedTerminal",
+            "args": [
+            ]
+        },
     ]
 }
