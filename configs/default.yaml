@@ -1,8 +1,8 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
 robot:                                  # 决策 B
-  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
-  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
+  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e.yml"
+  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e/ur12e.yml"
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
 
 # constraint:                             # 决策 A
@@ -67,6 +67,8 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
                                         # 碰撞球最低扎到 base 系 z≈-0.002m（实测 FK），体素中心落到 z=-0.01 层；
                                         # 底面取 -0.02m 才盖得住这层、又不会多拉进下一层(z=-0.05)，否则这层恒为
                                         # UNKNOWN→每段运动都假阳性非 FREE。(voxel=0.04m；与 swept 排除底座球互为冗余兜底)
+  box_min_m: [-0.6, -1.3, -0.5]         # 立方体法：AABB 盒下界角点（米，base_link 系，轴对齐）
+  box_max_m: [2.5, 1.3, 1.7]            # 立方体法：AABB 盒上界角点（米）。中心落在 base_link，整块置 FREE
 
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定

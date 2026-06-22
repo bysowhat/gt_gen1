@@ -7,10 +7,12 @@ home）邻域一小块"已知自由"活动空间，机械臂即可起步、转�
 本函数既用于 Step7 自测（verify_compute_reach_pt 的第二种验证），也用于正式 GT 生成的
 起步引导——两处共用同一份定义与参数（dq 来自 configs/default.yaml 的 init_free 段）。
 
-提供两种方案（均把"起步活动空间"标 FREE，可在 calibrate_init_free.py 中并排标定/对比）：
+提供三种方案（均把"起步活动空间"标 FREE，可在 calibrate_init_free.py 中并排标定/对比）：
 - set_initial_free_space ：按各关节 ±dq 整臂扫掠并集，精确贴合活动 blob，体素更省。
 - set_initial_free_cylinder：以 base 竖直轴为中心、外接 retract 整臂 + margin 的圆柱整块，
   规整、与轨迹无关，但体素更多、可能更靠近工件。
+- set_initial_free_box   ：base_link 系下一个轴对齐长方体 [box_min, box_max] 整块，
+  同样规整、与轨迹无关；按整臂可达工作空间裁一个矩形起步区。
 
 空间大小由 tmp/plan_seam 已规划轨迹标定（见 docs/initial-free-space.md 与
 scripts/calibrate_init_free.py）：dq=0.05rad 已让 122/122 条轨迹 reach_idx≥4，
@@ -75,7 +77,49 @@ def set_initial_free_space(handle, voxmap, config=None,
     return (n, cells) if return_cells else n
 
 
-def base_cylinder_bounds(handle, retract, margin: float = 0.0):
+def set_initial_free_box(handle, voxmap, config=None,
+                         box_min: Optional[Sequence[float]] = None,
+                         box_max: Optional[Sequence[float]] = None,
+                         return_cells: bool = False):
+    """把一个轴对齐立方体（AABB）盒内的体素整块标 FREE（初始 FREE 空间的第三种方案）。
+
+    与 set_initial_free_cylinder 同思路（规整、与轨迹无关），但用 base_link 系下一个轴对齐
+    长方体 [box_min, box_max] 替代竖直圆柱：盒中心落在 base_link，整块置 FREE。半径/高度无关，
+    直接由两个角点给定，便于按整臂可达工作空间裁一个矩形起步区。
+
+    参数：
+      handle  : CuroboHandle（本方案不做 FK，保留以与其它方案同签名；可传 None）。
+      voxmap  : ThreeStateVoxelMap（就地修改）。
+      config  : Config；box_min/box_max 为 None 时从它取（init_free_box_min / init_free_box_max）。
+      box_min : 盒下界角点 (x,y,z)（米，base 系）；None 时取 config.init_free_box_min。
+      box_max : 盒上界角点 (x,y,z)（米）；None 时取 config.init_free_box_max。
+      return_cells : True 则额外返回标记的体素下标 (M,3)。
+
+    返回：标记为 FREE 的体素数 n（return_cells=True 时返回 (n, cells)）。
+    """
+    from gt_gen.voxmap import FREE
+
+    if box_min is None:
+        if config is None:
+            raise ValueError("需要 box_min 或 config 之一来确定盒下界")
+        box_min = config.init_free_box_min
+    if box_max is None:
+        if config is None:
+            raise ValueError("需要 box_max 或 config 之一来确定盒上界")
+        box_max = config.init_free_box_max
+    lo = np.asarray(box_min, dtype=float)
+    hi = np.asarray(box_max, dtype=float)
+
+    # 枚举 voxmap 内中心落在盒内的体素（向量化）
+    nx, ny, nz = voxmap.shape
+    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
+    c = voxmap.voxel_to_world(idx)
+    inside = np.all((c >= lo) & (c <= hi), axis=1)
+    cells = idx[inside]
+
+    n = voxmap.set_many(cells, FREE)
+    return (n, cells) if return_cells else n
     """返回刚好罩住整条 retract 机械臂的最小竖直圆柱尺寸 (radius, height)（轴过 base 原点 x=y=0）。
 
     仅作参考/默认值来源（如想让圆柱自动贴合整臂时取这个尺寸）：

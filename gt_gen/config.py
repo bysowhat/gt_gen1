@@ -110,6 +110,16 @@ class Config:
         碰撞球扎到 z<0 的那层体素（实测最低球点 z≈-0.002m，体素中心 -0.01m），避免每段运动假阳性非 FREE。"""
         return float(self.raw.get("init_free", {}).get("cyl_z_min_m", 0.0))
 
+    @property
+    def init_free_box_min(self) -> list:
+        """初始引导 FREE 空间（立方体法）：AABB 盒下界角点（米，base_link 系）。见 default.yaml init_free.box_min_m。"""
+        return list(self.raw.get("init_free", {}).get("box_min_m", [-0.6, -1.3, -0.5]))
+
+    @property
+    def init_free_box_max(self) -> list:
+        """初始引导 FREE 空间（立方体法）：AABB 盒上界角点（米，base_link 系）。见 default.yaml init_free.box_max_m。"""
+        return list(self.raw.get("init_free", {}).get("box_max_m", [2.5, 1.3, 1.7]))
+
     # ---- cuRobo IK / 规划 ----
     @property
     def ik_num_seeds(self) -> int:
