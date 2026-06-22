@@ -15,10 +15,17 @@
   C4 竖直板·C型臂(从地面起): 同 C3 朝向，但板心再沿壁方向 b_dir 平移 +宽/2 → 下边贴地面、从地面向上立起（竖直版 C 臂）。
 颜色：C1 绿 / C2 蓝 / C3 橙 / C4 品红；焊缝线红。
 
+板的【外形】由 --shape 控（与 C1-C4 的位置/朝向正交，每个候选都按此形状切，仍是同一块薄板、只改轮廓）：
+  plate     : 完整矩形（宽×长），默认。
+  triangle  : 按角平分线切出的三角形——在板的「宽×长」正面里，关于角平分线在板面内的投影方向对称，
+              尖端朝角平分线(+)方向，底边为对侧整条边（等腰三角形）。
+  trapezoid : 从矩形【随机】倒掉 1~多个角（每个被选中的角沿两邻边各内缩一段）→ 梯形/多边形。随机受 --seed 控可复现。
+plate 也走同一条「薄棱柱 Mesh」渲染（profile 在宽×长平面、沿法向挤出 thickness），外观与原矩形板一致。
+
 运行（带显示器）：
     conda run -n env_isaaclab python scripts/viz_seam_plate_candidates_isaacsim.py \
         --seam .../seam_22.pkl .../seam_5.pkl .../seam_8.pkl \
-        --n_cm 10 --width_cm 30 --length_pct 80 --thickness_cm 3
+        --shape triangle --n_cm 10 --width_cm 30 --length_pct 80 --thickness_cm 3
     # --seam 也支持给一个目录（自动收 seam_*.pkl）或通配（如 '.../seam_1*.pkl'）
 无显示器自检：加 --headless（spawn + 跑几帧即退，打印焊缝/候选数 + VIZ_CANDIDATES_DONE）。
 只看某几个候选：--only C3   或   --only C1,C2
@@ -27,6 +34,7 @@ import argparse
 import glob
 import os
 import pickle
+import random
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +45,8 @@ DEFAULT_SEAM = ("/media/a/新加卷/hanfeng/segment_sub_output/"
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--seam", nargs="+", default=[DEFAULT_SEAM],
                  help="一条或多条 seam pkl；也可给目录（收 seam_*.pkl）或通配符")
+_ap.add_argument("--shape", choices=["plate", "triangle", "trapezoid"], default="plate",
+                 help="板外形：plate=完整矩形 / triangle=按角平分线切的三角形 / trapezoid=随机倒角的梯形")
 _ap.add_argument("--n_cm", type=float, default=10.0, help="离焊缝距离 n(cm)：C1/C2 抬高量、C3/C4 横挪量")
 _ap.add_argument("--width_cm", type=float, default=30.0, help="板宽(cm)")
 _ap.add_argument("--length_pct", type=float, default=80.0, help="板长占焊缝弧长百分比(%)")
@@ -44,6 +54,7 @@ _ap.add_argument("--length_min_cm", type=float, default=10.0,
                  help="板长下限(cm)：实际板长 = max(length_pct%%×焊缝弧长, 此值)")
 _ap.add_argument("--thickness_cm", type=float, default=3.0, help="板厚(cm)")
 _ap.add_argument("--only", default="", help="只看哪些候选，逗号分隔，如 C1,C2（空=全部）")
+_ap.add_argument("--seed", type=int, default=0, help="trapezoid 随机倒角的种子（可复现）")
 _ap.add_argument("--headless", action="store_true")
 args = _ap.parse_args()
 
@@ -111,9 +122,13 @@ def seam_polyline_world(d):
 
 
 def build_candidates(d):
-    """据 seam 几何造各候选板 → [(key, desc, color, prims)]。prims 为 world 系 Box（含板心+朝向）。"""
+    """据 seam 几何造各候选板 → [(key, desc, color, anchor, R, apex_sign)]。
+
+    anchor=板心(world)，R=板局部→world 的 3x3（列=[法向X, 宽向Y, 焊缝切线Z]），
+    apex_sign=角平分线在板面内沿 +Y(宽向) 的符号（triangle 尖端朝向）。形状由调用方按 --shape 在
+    板局部 (宽=Y, 长=Z) 平面里切 profile，再沿法向 X 挤出 thickness 成薄棱柱。
+    """
     import numpy as np
-    from gt_gen import obstacles as ob
     mid, t, d1, d2, bis, seam_len = seam_frame_world(d)
 
     a_dir = _unit(d1 - float(np.dot(d1, t)) * t)        # a 面(d1)表面方向，⊥t
@@ -129,30 +144,78 @@ def build_candidates(d):
     width = float(args.width_cm) / 100.0
     length = max(float(args.length_pct) / 100.0 * seam_len, float(args.length_min_cm) / 100.0)
     thickness = float(args.thickness_cm) / 100.0
-    from scipy.spatial.transform import Rotation as Rsp
 
-    def make(normal, anchor):
+    def frame(normal, anchor):
         x_axis = _unit(normal)                          # 板法向 → local X
         z_axis = t                                      # 板长方向 → local Z
         y_axis = _unit(np.cross(z_axis, x_axis))        # 板宽方向 → local Y
-        R0 = np.column_stack([x_axis, y_axis, z_axis])
-        rpy = [float(v) for v in Rsp.from_matrix(R0).as_euler("xyz", degrees=True)]
-        return ob.build("plate", np.asarray(anchor, float).tolist(), anchor_rpy_deg=tuple(rpy),
-                        length=length, width=width, thickness=thickness)
+        R = np.column_stack([x_axis, y_axis, z_axis])
+        apex_sign = 1.0 if float(np.dot(bis, y_axis)) >= 0 else -1.0
+        return np.asarray(anchor, float), R, apex_sign
 
-    cands = [
+    cands = []
+    for key, desc, color, normal, anchor in [
         ("C1", "水平板·焊缝正上方对称(∥地面a, 沿壁方向抬高n, 宽±对称)",
-         [0.0, 0.85, 0.0], make(na, mid + n * b_dir)),
+         [0.0, 0.85, 0.0], na, mid + n * b_dir),
         ("C2", "水平板·C型上臂(∥地面a, 抬高n + 沿地面平移宽/2, 内边贴壁盖地面臂上方)",
-         [0.1, 0.3, 1.0], make(na, mid + n * b_dir + (width / 2.0) * a_dir)),
+         [0.1, 0.3, 1.0], na, mid + n * b_dir + (width / 2.0) * a_dir),
         ("C3", "竖直板·∥壁b·沿地面横挪n(=现--parallel b, 板心与焊缝同高, 宽竖直对称)",
-         [1.0, 0.5, 0.0], make(nb, mid + n * a_dir)),
+         [1.0, 0.5, 0.0], nb, mid + n * a_dir),
         ("C4", "竖直板·C型臂(∥壁b, 横挪n + 沿壁平移宽/2, 下边贴地面向上立)",
-         [1.0, 0.0, 1.0], make(nb, mid + n * a_dir + (width / 2.0) * b_dir)),
-    ]
+         [1.0, 0.0, 1.0], nb, mid + n * a_dir + (width / 2.0) * b_dir),
+    ]:
+        anchor_w, R, apex_sign = frame(normal, anchor)
+        cands.append((key, desc, color, anchor_w, R, apex_sign))
+
     info = dict(mid=mid, t=t, a_dir=a_dir, b_dir=b_dir, na=na, nb=nb, bis=bis,
                 seam_len=seam_len, width=width, length=length, thickness=thickness)
     return cands, info
+
+
+# ---------------------------------------------------------------- 板外形 profile（板局部 宽=u, 长=v 平面）
+def profile_rect(hw, hl):
+    """完整矩形：四角 (±宽/2, ±长/2)。"""
+    return [(-hw, -hl), (hw, -hl), (hw, hl), (-hw, hl)]
+
+
+def profile_triangle(hw, hl, apex_sign):
+    """等腰三角形：尖端在角平分线 +Y 一侧的整条宽边中点，底边为对侧整条边（关于长向中线对称）。"""
+    apex = (apex_sign * hw, 0.0)
+    base0 = (-apex_sign * hw, -hl)
+    base1 = (-apex_sign * hw, hl)
+    return [apex, base0, base1]
+
+
+def profile_trapezoid(hw, hl, rng):
+    """从矩形随机倒掉 1~4 个角（每个被选中角沿两邻边各内缩一段）→ 梯形/多边形。"""
+    import numpy as np
+    rect = [np.array(p, float) for p in profile_rect(hw, hl)]
+    nc = len(rect)
+    k = rng.randint(1, nc)                              # 切几个角：1~4（含）
+    chosen = set(rng.sample(range(nc), k))
+    out = []
+    for i in range(nc):
+        ci = rect[i]
+        if i in chosen:
+            prev = rect[(i - 1) % nc]
+            nxt = rect[(i + 1) % nc]
+            t_in = rng.uniform(0.2, 0.45)               # 沿邻边内缩比例（<0.5 防相邻倒角重叠）
+            t_out = rng.uniform(0.2, 0.45)
+            out.append(tuple(ci + t_in * (prev - ci)))  # 入边点
+            out.append(tuple(ci + t_out * (nxt - ci)))  # 出边点
+        else:
+            out.append(tuple(ci))
+    return out
+
+
+def shape_profile(shape, info, apex_sign, rng):
+    hw = float(info["width"]) / 2.0
+    hl = float(info["length"]) / 2.0
+    if shape == "plate":
+        return profile_rect(hw, hl)
+    if shape == "triangle":
+        return profile_triangle(hw, hl, apex_sign)
+    return profile_trapezoid(hw, hl, rng)
 
 
 # ----------------------------------------------------------------------------
@@ -174,12 +237,41 @@ from omni.isaac.core.objects import cuboid as _cuboid  # noqa: E402
 from omni.isaac.core.utils.stage import add_reference_to_stage  # noqa: E402
 
 
-def spawn_box(path, name, box, color):
-    """world 系 Box → 纯视觉 VisualCuboid。box.pose=[x,y,z,qw,qx,qy,qz]。"""
-    pos = np.asarray(box.pose[:3], float)
-    quat = np.asarray(box.pose[3:7], float)             # wxyz
-    _cuboid.VisualCuboid(prim_path=path, name=name, position=pos, orientation=quat,
-                         size=1.0, scale=np.asarray(box.dims, float), color=np.asarray(color, float))
+def spawn_prism(path, name, anchor, R, profile, thickness, color):
+    """板局部 profile(宽=u, 长=v) 沿法向 X 挤出 thickness → 薄棱柱 UsdGeom.Mesh（纯视觉，双面）。
+
+    顶点：每个 profile 点在 X=±thickness/2 各一份（前/后环）；面：前盖 n 边形 + 后盖 n 边形 + n 个侧四边形。
+    local(x,u,v) → world = anchor + R @ [x, u, v]（R 列=[法向X, 宽向Y, 长向Z]）。
+    """
+    import omni.usd
+    from pxr import UsdGeom, Gf
+    nseg = len(profile)
+    half = float(thickness) / 2.0
+    R = np.asarray(R, float)
+    anchor = np.asarray(anchor, float)
+    pts = []
+    for (u, v) in profile:                              # 前环 X=+half
+        pts.append(anchor + R @ np.array([half, float(u), float(v)]))
+    for (u, v) in profile:                              # 后环 X=-half
+        pts.append(anchor + R @ np.array([-half, float(u), float(v)]))
+
+    counts, faces = [], []
+    counts.append(nseg)                                 # 前盖
+    faces += list(range(nseg))
+    counts.append(nseg)                                 # 后盖（反序，朝外）
+    faces += list(range(2 * nseg - 1, nseg - 1, -1))
+    for i in range(nseg):                               # 侧面四边形
+        j = (i + 1) % nseg
+        counts.append(4)
+        faces += [i, j, nseg + j, nseg + i]
+
+    stage = omni.usd.get_context().get_stage()
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    mesh.CreatePointsAttr([Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in pts])
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(faces)
+    mesh.CreateDisplayColorAttr([Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
+    mesh.CreateDoubleSidedAttr(True)
 
 
 def spawn_segment(path, name, p0, p1, color, thick=0.01):
@@ -278,6 +370,7 @@ def main():
     obj0, ppose0 = seams[0]["obj"], seams[0]["ppose"]
 
     print(f"工件     : {obj0}")
+    print(f"外形     : {args.shape}（plate=矩形 / triangle=角平分线三角 / trapezoid=随机倒角，seed={args.seed}）")
     print(f"焊缝     : 共 {len(seams)} 条；每条候选 {len(seams[0]['cands'])} 种（only={only or '全部'}）")
     for s in seams:
         info = s["info"]
@@ -297,16 +390,18 @@ def main():
 
     for si, s in enumerate(seams):
         spawn_seam_line(f"/World/seam/s{si}", f"seam_{si}", s["seam_pts"], color=[1.0, 0.0, 0.0])
-        for key, desc, color, prims in s["cands"]:
-            for k, b in enumerate(prims):
-                spawn_box(f"/World/cand/s{si}/{key}/box{k}", f"cand_{si}_{key}_{k}", b, color)
+        for ci, (key, desc, color, anchor, R, apex_sign) in enumerate(s["cands"]):
+            rng = random.Random(args.seed * 100003 + si * 101 + ci)   # 每(seam,候选)独立可复现
+            profile = shape_profile(args.shape, s["info"], apex_sign, rng)
+            spawn_prism(f"/World/cand/s{si}/{key}", f"cand_{si}_{key}",
+                        anchor, R, profile, s["info"]["thickness"], color)
 
     world.reset()
 
     if args.headless:
         for _ in range(3):
             world.step(render=False)
-        print(f"已 spawn 1 个工件 + {len(seams)} 条 seam（各含焊缝线 + 候选板）。")
+        print(f"已 spawn 1 个工件 + {len(seams)} 条 seam（各含焊缝线 + {args.shape} 候选板）。")
         print("VIZ_CANDIDATES_DONE")
         simulation_app.close()
         return

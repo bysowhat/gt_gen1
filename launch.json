@@ -239,6 +239,8 @@
                 "--thickness_cm", "2",
                 // 只看哪些候选（逗号分隔，如 C1,C2；空=全部）：
                 "--only", "C1",
+                // {plate,triangle,trapezoid}
+                "--shape", "triangle"
                 // 无显示器自检（store_true）：
                 // "--headless",
             ]
