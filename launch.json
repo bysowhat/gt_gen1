@@ -219,7 +219,10 @@
             "args": [
                 // 焊缝 pkl（可多条，空格分隔；或给目录/通配如 .../seam_1*.pkl）：
                 "--seam",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_16.pkl",
                 // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_46.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_89.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_163.pkl",
                 "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_0.pkl",
                 "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_27.pkl",
                 "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_37.pkl",
@@ -241,6 +244,30 @@
                 "--only", "C1",
                 // {plate,triangle,trapezoid}
                 "--shape", "triangle"
+                // 无显示器自检（store_true）：
+                // "--headless",
+            ]
+        },
+        {
+            "name": "viz_seam_open_box_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_seam_open_box_isaacsim.py",
+            "console": "integratedTerminal",
+            // 用 1 个开口障碍把指定焊缝包住；大小+焊缝在其中的位置由 6 个面到焊缝的最近距离 dis 解出。
+            // 上/下=世界±Z；开口面=后(back)，朝焊缝角平分线 bis 水平投影方向（bis 从开口穿出）。纯视觉，无机器人。
+            // --obstacle open_box=开1面的盒 / open_cylinder=开1面的圆筒(圆管杯，轴=bis、开口朝bis、半径外接等效盒截面)。
+            "args": [
+                // 障碍类型：open_box（默认）或 open_cylinder：
+                // "--obstacle", "open_box",
+                "--obstacle", "open_cylinder",
+                // 焊缝 pkl（可多条，空格分隔；或给目录/通配如 .../seam_1*.pkl），每条各套一个障碍：
+                "--seam",
+                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_27.pkl",
+                // 焊缝到盒 6 面的最近距离(cm)，顺序固定=上 下 左 右 前 后；后=开口面（dis 为正=该面在焊缝外侧 dis 处）：
+                "--dis_cm", "100", "100", "100", "100", "100", "100",
+                // 盒壁厚(cm)：
+                "--wall_cm", "2",
                 // 无显示器自检（store_true）：
                 // "--headless",
             ]

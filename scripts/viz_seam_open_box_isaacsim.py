@@ -1,7 +1,12 @@
-"""在 Isaac Sim 里把一个【开口盒 open_box】套在指定焊缝上，并和工件叠加显示（独立脚本，不动业务代码）。
+"""在 Isaac Sim 里把一个【开口障碍】套在指定焊缝上，并和工件叠加显示（独立脚本，不动业务代码）。
 
-需求：在工件基础上、对指定焊缝，用【1 个 open_box】把焊缝那一段包住（不必包住整个工件，工件可与盒穿模）。
-盒大小与「焊缝在盒中的位置」由 6 个面到焊缝的最近距离 dis（上下左右前后，cm）唯一解出。
+需求：在工件基础上、对指定焊缝，用【1 个开口障碍】把焊缝那一段包住（不必包住整个工件，工件可与盒穿模）。
+障碍大小与「焊缝在其中的位置」由 6 个面到焊缝的最近距离 dis（上下左右前后，cm）唯一解出。
+
+障碍类型 --obstacle：
+  · open_box      ：开 1 面的盒（5 块薄 Box 壁），开口面=后(back)。
+  · open_cylinder ：开 1 面的圆筒（圆管杯，纯视觉光滑 mesh：侧壁 + 封底圆盘、开口端不封）。轴=水平角平分线 bis_h、
+                    开口端朝 +bis_h、封底圆盘在工件侧；半径=外接「等效 open_box 的 Y-Z 截面」=max(盒宽,盒高)/2、轴心=盒心。
 
 盒局部坐标约定（与 gt_gen/obstacles.open_box 一致：front=+X / back=−X / left=+Y / right=−Y / top=+Z / bottom=−Z）：
   · 上/下轴 = 世界 ±Z（重力上下）；盒只绕世界 Z 偏航、不翻滚（top/bottom 面恒水平）。
@@ -15,8 +20,8 @@ dis 顺序固定为 --dis_cm 上 下 左 右 前 后（cm）；开口面恒为�
 
 运行（带显示器）：
     conda run -n env_isaaclab python scripts/viz_seam_open_box_isaacsim.py \
-        --seam .../seam_22.pkl --dis_cm 10 10 10 10 10 10 --wall_cm 2
-    # --seam 支持多条 / 目录(收 seam_*.pkl) / 通配；每条焊缝各套一个 open_box
+        --seam .../seam_22.pkl --obstacle open_cylinder --dis_cm 10 10 10 10 10 10 --wall_cm 2
+    # --seam 支持多条 / 目录(收 seam_*.pkl) / 通配；每条焊缝各套一个障碍
 无显示器自检：加 --headless（spawn + 跑几帧即退，打印盒尺寸/实测面距 + VIZ_OPEN_BOX_DONE）。
 """
 import argparse
@@ -33,6 +38,8 @@ DEFAULT_SEAM = ("/media/a/新加卷/hanfeng/segment_sub_output/"
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--seam", nargs="+", default=[DEFAULT_SEAM],
                  help="一条或多条 seam pkl；也可给目录（收 seam_*.pkl）或通配符")
+_ap.add_argument("--obstacle", choices=["open_box", "open_cylinder"], default="open_box",
+                 help="障碍类型：open_box=开1面的盒 / open_cylinder=开1面的圆筒(圆管杯)")
 _ap.add_argument("--dis_cm", nargs=6, type=float, default=[10, 10, 10, 10, 10, 10],
                  metavar=("上", "下", "左", "右", "前", "后"),
                  help="焊缝到盒 6 个面的最近距离(cm)，顺序=上 下 左 右 前 后；后=开口面")
@@ -103,15 +110,14 @@ def seam_polyline_world(d):
     return np.asarray(d["seam_line"], float)
 
 
-def build_open_box(d, dis_cm, wall):
-    """据焊缝几何 + 6 个面距离(上下左右前后, 米) 造一个 open_box（open_face=back）。
+def _box_geom(d, dis_cm):
+    """共用几何：据焊缝 + 6 面距离(上下左右前后, 米) 解出盒局部系/尺寸/盒心/三轴投影。
 
     盒轴：Z=世界+Z(上)；开口 back(−X) 朝水平角平分线 bis_h（bis 穿过开口）；front(+X)=−bis_h；Y=Z×X。
-    焊缝折线投到三轴得跨度，配 6 个 dis 唯一解出 size 与盒心。返回 (prims, info)。
+    open_box 与 open_cylinder 共用此函数（圆筒轴=X、半径外接 Y-Z 截面）。返回 dict。
     """
     import numpy as np
     from scipy.spatial.transform import Rotation as Rsp
-    from gt_gen import obstacles as ob
 
     mid, t, d1, d2, bis, seam_len = seam_frame_world(d)
     pts = seam_polyline_world(d)                         # (N,3) world
@@ -146,18 +152,66 @@ def build_open_box(d, dis_cm, wall):
     C = cen_a * x_axis + cen_b * y_axis + cen_c * z_axis  # 盒心(world)
 
     rpy = [float(v) for v in Rsp.from_matrix(Rm).as_euler("xyz", degrees=True)]
-    prims = ob.build("open_box", C.tolist(), anchor_rpy_deg=tuple(rpy),
-                     size=(float(sx), float(sy), float(sz)),
-                     wall=float(wall), open_face="back")
+    return dict(mid=mid, bis=bis, bis_h=bis_h, seam_len=seam_len, pts=pts,
+                x_axis=x_axis, y_axis=y_axis, z_axis=z_axis, Rm=Rm, rpy=rpy,
+                a0=a0, a1=a1, b0=b0, b1=b1, c0=c0, c1=c1,
+                sx=float(sx), sy=float(sy), sz=float(sz),
+                cen_a=cen_a, cen_b=cen_b, cen_c=cen_c, C=C)
+
+
+def build_open_box(d, dis_cm, wall):
+    """据焊缝几何 + 6 个面距离(上下左右前后, 米) 造一个 open_box（open_face=back）。
+
+    焊缝折线投到三轴得跨度，配 6 个 dis 唯一解出 size 与盒心。返回 (prims, info)。
+    """
+    from gt_gen import obstacles as ob
+    g = _box_geom(d, dis_cm)
+    sx, sy, sz = g["sx"], g["sy"], g["sz"]
+    cen_a, cen_b, cen_c = g["cen_a"], g["cen_b"], g["cen_c"]
+    prims = ob.build("open_box", g["C"].tolist(), anchor_rpy_deg=tuple(g["rpy"]),
+                     size=(sx, sy, sz), wall=float(wall), open_face="back")
 
     achieved = {                                         # 实测各面到焊缝最近距离（应=输入 dis）
-        "上": cen_c + sz / 2 - c1, "下": c0 - (cen_c - sz / 2),
-        "左": cen_b + sy / 2 - b1, "右": b0 - (cen_b - sy / 2),
-        "前": cen_a + sx / 2 - a1, "后": a0 - (cen_a - sx / 2)}
-    info = dict(mid=mid, bis=bis, bis_h=bis_h, center=C, rpy=rpy,
-                size=(float(sx), float(sy), float(sz)), seam_len=seam_len,
-                achieved=achieved)
+        "上": cen_c + sz / 2 - g["c1"], "下": g["c0"] - (cen_c - sz / 2),
+        "左": cen_b + sy / 2 - g["b1"], "右": g["b0"] - (cen_b - sy / 2),
+        "前": cen_a + sx / 2 - g["a1"], "后": g["a0"] - (cen_a - sx / 2)}
+    info = dict(kind="box", mid=g["mid"], bis=g["bis"], bis_h=g["bis_h"],
+                center=g["C"], rpy=g["rpy"], size=(sx, sy, sz), z_half=sz / 2.0,
+                seam_len=g["seam_len"], achieved=achieved)
     return prims, info
+
+
+def build_open_cylinder(d, dis_cm, wall):
+    """开口圆筒（圆管杯）：轴=水平角平分线，开口端朝 +bis_h，封底圆盘在工件(−bis_h)侧。
+
+    复用 open_box 局部系：圆筒轴=X(−bis_h)，长度/轴向位置同盒；半径=外接盒 Y-Z 截面=max(盒宽,盒高)/2、
+    轴心=盒心（4 个径向 dis 上下左右都满足，最紧取等、其余更松）。纯视觉光滑 mesh、开口端不封。
+    返回 (geom, info)；wall 仅占位（光滑 mesh 无壁厚）。
+    """
+    import numpy as np
+    g = _box_geom(d, dis_cm)
+    sx, sy, sz = g["sx"], g["sy"], g["sz"]
+    u = g["x_axis"]                                      # 圆筒轴（+X=朝工件/封底侧）
+    r = 0.5 * max(sy, sz)                                # 外接盒 Y-Z 截面
+    C = g["C"]
+    p_close = C + (sx / 2.0) * u                         # 封底圆盘心（+X，工件侧）
+    p_open = C - (sx / 2.0) * u                          # 开口圈心（−X，+bis_h 侧）
+
+    pts = g["pts"]                                       # 焊缝离轴最大径向距 → 实测径向最近壁距
+    rel_b = pts @ g["y_axis"] - g["cen_b"]
+    rel_c = pts @ g["z_axis"] - g["cen_c"]
+    rad_ext = float(np.max(np.sqrt(rel_b ** 2 + rel_c ** 2)))
+    cen_a = g["cen_a"]
+    achieved = {                                         # 前/后应=输入 dis；径向取实际最近壁距
+        "前": cen_a + sx / 2 - g["a1"], "后": g["a0"] - (cen_a - sx / 2),
+        "径向最近": r - rad_ext}
+    geom = dict(p_close=p_close, p_open=p_open, u=u,
+                y_axis=g["y_axis"], z_axis=g["z_axis"], radius=float(r), length=sx)
+    info = dict(kind="cyl", mid=g["mid"], bis=g["bis"], bis_h=g["bis_h"],
+                center=C, rpy=g["rpy"], radius=float(r), length=sx,
+                size=(sx, sy, sz), z_half=float(r), seam_len=g["seam_len"],
+                achieved=achieved)
+    return geom, info
 
 
 # ----------------------------------------------------------------------------
@@ -186,6 +240,49 @@ def spawn_box_prim(path, name, prim, color):
     _cuboid.VisualCuboid(prim_path=path, name=name, position=pos, orientation=quat,
                          size=1.0, scale=np.asarray(prim.dims, float),
                          color=np.asarray(color, float))
+
+
+def spawn_open_cylinder(path, geom, color, nseg=48):
+    """开口圆筒 geom → 光滑 UsdGeom.Mesh（侧壁环 + 封底圆盘；开口端不封）。纯视觉、双面。
+
+    顶点：开口环 nseg 点(p_open) + 封底环 nseg 点(p_close) + 封底圆心 1 点；
+    面：nseg 个侧壁四边形 + nseg 个封底三角扇。圆周 = radius·(cosθ·y_axis + sinθ·z_axis)。
+    """
+    import omni.usd
+    from pxr import UsdGeom, Gf
+    p_close = np.asarray(geom["p_close"], float)
+    p_open = np.asarray(geom["p_open"], float)
+    ey = np.asarray(geom["y_axis"], float)
+    ez = np.asarray(geom["z_axis"], float)
+    r = float(geom["radius"])
+
+    pts = []
+    for i in range(nseg):                               # 0..nseg-1：开口环
+        th = 2.0 * np.pi * i / nseg
+        pts.append(p_open + r * (np.cos(th) * ey + np.sin(th) * ez))
+    for i in range(nseg):                               # nseg..2nseg-1：封底环
+        th = 2.0 * np.pi * i / nseg
+        pts.append(p_close + r * (np.cos(th) * ey + np.sin(th) * ez))
+    c_idx = len(pts)
+    pts.append(p_close)                                 # 2nseg：封底圆心
+
+    counts, faces = [], []
+    for i in range(nseg):                               # 侧壁四边形
+        j = (i + 1) % nseg
+        counts.append(4)
+        faces += [i, j, nseg + j, nseg + i]
+    for i in range(nseg):                               # 封底三角扇
+        j = (i + 1) % nseg
+        counts.append(3)
+        faces += [c_idx, nseg + j, nseg + i]
+
+    stage = omni.usd.get_context().get_stage()
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    mesh.CreatePointsAttr([Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in pts])
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(faces)
+    mesh.CreateDisplayColorAttr([Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
+    mesh.CreateDoubleSidedAttr(True)
 
 
 def spawn_segment(path, name, p0, p1, color, thick=0.01):
@@ -270,52 +367,65 @@ def main():
     seams = []
     for sp in seam_paths:
         d = pickle.load(open(sp, "rb"))
-        prims, info = build_open_box(d, dis_m, wall_m)
+        if args.obstacle == "open_cylinder":
+            payload, info = build_open_cylinder(d, dis_m, wall_m)
+        else:
+            payload, info = build_open_box(d, dis_m, wall_m)
         seams.append(dict(
             name=os.path.join(os.path.basename(os.path.dirname(sp)), os.path.basename(sp)),
             obj=find_obj(sp), ppose=piece_pose_world(d),
-            seam_pts=seam_polyline_world(d), prims=prims, info=info))
+            seam_pts=seam_polyline_world(d), payload=payload, info=info))
 
     objs = sorted(set(s["obj"] for s in seams))
     if len(objs) > 1:
-        print("警告: 多条 seam 指向不同工件 obj，只显示第 1 个工件，其余焊缝/盒仍按 world 坐标叠加：")
+        print("警告: 多条 seam 指向不同工件 obj，只显示第 1 个工件，其余焊缝/障碍仍按 world 坐标叠加：")
         for o in objs:
             print("   ", o)
     obj0, ppose0 = seams[0]["obj"], seams[0]["ppose"]
 
     print(f"工件     : {obj0}")
+    print(f"障碍     : {args.obstacle}（开口面=后，朝角平分线 bis）")
     print(f"dis(cm)  : 上={args.dis_cm[0]} 下={args.dis_cm[1]} 左={args.dis_cm[2]} "
           f"右={args.dis_cm[3]} 前={args.dis_cm[4]} 后(开口)={args.dis_cm[5]}  壁厚={args.wall_cm}cm")
-    print(f"焊缝     : 共 {len(seams)} 条；每条套 1 个 open_box（开口面=后，朝角平分线）")
+    print(f"焊缝     : 共 {len(seams)} 条；每条套 1 个 {args.obstacle}")
     for s in seams:
         info = s["info"]
-        sx, sy, sz = info["size"]
         ach = info["achieved"]
-        print(f"  {s['name']:>40s}  盒尺寸(X前后,Y左右,Z上下)="
-              f"[{sx:.3f},{sy:.3f},{sz:.3f}]m  盒心={np.round(info['center'], 3)}")
-        print(f"      实测面距(m) 上={ach['上']:.3f} 下={ach['下']:.3f} 左={ach['左']:.3f} "
-              f"右={ach['右']:.3f} 前={ach['前']:.3f} 后={ach['后']:.3f}（应=输入 dis）")
+        if info["kind"] == "cyl":
+            print(f"  {s['name']:>40s}  圆筒 半径={info['radius']:.3f}m 长(轴向)={info['length']:.3f}m "
+                  f"轴心={np.round(info['center'], 3)}")
+            print(f"      实测(m) 前={ach['前']:.3f} 后={ach['后']:.3f} "
+                  f"径向最近={ach['径向最近']:.3f}（前/后应=输入 dis；径向=外接盒最近壁距）")
+        else:
+            sx, sy, sz = info["size"]
+            print(f"  {s['name']:>40s}  盒尺寸(X前后,Y左右,Z上下)="
+                  f"[{sx:.3f},{sy:.3f},{sz:.3f}]m  盒心={np.round(info['center'], 3)}")
+            print(f"      实测面距(m) 上={ach['上']:.3f} 下={ach['下']:.3f} 左={ach['左']:.3f} "
+                  f"右={ach['右']:.3f} 前={ach['前']:.3f} 后={ach['后']:.3f}（应=输入 dis）")
 
     world = World(stage_units_in_meters=1.0)
 
-    # 地面置于所有盒底最低处下方 0.3m
-    zmin = min(float(s["info"]["center"][2] - s["info"]["size"][2] / 2.0) for s in seams)
+    # 地面置于所有障碍最低处下方 0.3m（盒用 sz/2、圆筒用半径 r 作竖直半高）
+    zmin = min(float(s["info"]["center"][2] - s["info"]["z_half"]) for s in seams)
     world.scene.add_default_ground_plane(z_position=zmin - 0.3)
 
     spawn_workpiece("/World/workpiece", obj0, ppose0)
 
     for si, s in enumerate(seams):
         spawn_seam_line(f"/World/seam/s{si}", f"seam_{si}", s["seam_pts"], color=[1.0, 0.0, 0.0])
-        for k, prim in enumerate(s["prims"]):
-            spawn_box_prim(f"/World/box/s{si}/face{k}", f"box_{si}_{k}",
-                           prim, color=[0.62, 0.64, 0.67])
+        if s["info"]["kind"] == "cyl":
+            spawn_open_cylinder(f"/World/box/s{si}/cyl", s["payload"], color=[0.62, 0.64, 0.67])
+        else:
+            for k, prim in enumerate(s["payload"]):
+                spawn_box_prim(f"/World/box/s{si}/face{k}", f"box_{si}_{k}",
+                               prim, color=[0.62, 0.64, 0.67])
 
     world.reset()
 
     if args.headless:
         for _ in range(3):
             world.step(render=False)
-        print(f"已 spawn 1 个工件 + {len(seams)} 条 seam（各含焊缝红线 + open_box 5 面）。")
+        print(f"已 spawn 1 个工件 + {len(seams)} 条 seam（各含焊缝红线 + {args.obstacle}）。")
         print("VIZ_OPEN_BOX_DONE")
         simulation_app.close()
         return
@@ -325,7 +435,7 @@ def main():
         _set_lighting_mode("Grey Studio")
     except Exception:
         pass
-    print("播放中（关闭窗口结束）。焊缝红线被 open_box 套住，开口面朝角平分线方向。")
+    print(f"播放中（关闭窗口结束）。焊缝红线被 {args.obstacle} 套住，开口面朝角平分线方向。")
     while simulation_app.is_running():
         world.step(render=True)
     simulation_app.close()
