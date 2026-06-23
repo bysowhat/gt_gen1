@@ -7,12 +7,14 @@ home）邻域一小块"已知自由"活动空间，机械臂即可起步、转�
 本函数既用于 Step7 自测（verify_compute_reach_pt 的第二种验证），也用于正式 GT 生成的
 起步引导——两处共用同一份定义与参数（dq 来自 configs/default.yaml 的 init_free 段）。
 
-提供三种方案（均把"起步活动空间"标 FREE，可在 calibrate_init_free.py 中并排标定/对比）：
+提供四种方案（均把"起步活动空间"标 FREE，可在 calibrate_init_free.py 中并排标定/对比）：
 - set_initial_free_space ：按各关节 ±dq 整臂扫掠并集，精确贴合活动 blob，体素更省。
 - set_initial_free_cylinder：以 base 竖直轴为中心、外接 retract 整臂 + margin 的圆柱整块，
   规整、与轨迹无关，但体素更多、可能更靠近工件。
 - set_initial_free_box   ：base_link 系下一个轴对齐长方体 [box_min, box_max] 整块，
   同样规整、与轨迹无关；按整臂可达工作空间裁一个矩形起步区。
+- set_initial_free_swept ：加载【预计算并存盘】的整臂扫掠体素（retract + 若干关键关节角
+  两两规划轨迹的扫掠并集，scripts/viz_joints_open3d.py --save-init-free 产出），免每次重算。
 
 空间大小由 tmp/plan_seam 已规划轨迹标定（见 docs/initial-free-space.md 与
 scripts/calibrate_init_free.py）：dq=0.05rad 已让 122/122 条轨迹 reach_idx≥4，
@@ -184,6 +186,54 @@ def set_initial_free_cylinder(handle, voxmap, config=None,
     rxy = np.hypot(c[:, 0], c[:, 1])                      # 到 base 竖直轴(x=y=0)的水平距离
     inside = (rxy <= radius) & (c[:, 2] >= float(z_min)) & (c[:, 2] <= z_max)
     cells = idx[inside]
+
+    n = voxmap.set_many(cells, FREE)
+    return (n, cells) if return_cells else n
+
+
+def set_initial_free_swept(handle, voxmap, config=None,
+                           path: Optional[str] = None,
+                           return_cells: bool = False):
+    """把【预计算并存盘】的整臂扫掠体素整块标 FREE（初始 FREE 空间的第四种方案）。
+
+    与前三种"运行时现算"不同：本法直接加载离线算好的扫掠体素中心（base 系），免每次重算。
+    存盘由 scripts/viz_joints_open3d.py --save-init-free 产出 = retract + 若干关键关节角
+    两两规划轨迹的整臂扫掠并集（剔除固定底座球）。适合把"一批典型起步/转移动作扫过的空间"
+    固化成固定起步引导区。
+
+    存盘格式：.npz，键 centers(M,3 float, base 系米) + voxel_size(标量)。加载时按当前
+    voxmap.world_to_voxel 映射回体素下标、滤掉越界者再置 FREE（故对 ROI 平移/缩放鲁棒；
+    voxel_size 与存盘不一致时打印告警，仍按当前 voxmap 粒度落格）。
+
+    参数：
+      handle  : CuroboHandle（本方案不做 FK，保留以与其它方案同签名；可传 None）。
+      voxmap  : ThreeStateVoxelMap（就地修改）。
+      config  : Config；path 为 None 时取 config.init_free_swept_path。
+      path    : 预存 .npz 路径；None 时取 config.init_free_swept_path。
+      return_cells : True 则额外返回标记的体素下标 (M,3)。
+
+    返回：标记为 FREE 的体素数 n（return_cells=True 时返回 (n, cells)）。
+    """
+    from gt_gen.voxmap import FREE
+
+    if path is None:
+        if config is None:
+            raise ValueError("需要 path 或 config 之一来确定预存扫掠文件路径")
+        path = config.init_free_swept_path
+
+    data = np.load(path)
+    centers = np.asarray(data["centers"], dtype=float).reshape(-1, 3)
+    vs_saved = float(data["voxel_size"]) if "voxel_size" in data.files else None
+    if vs_saved is not None and abs(vs_saved - voxmap.voxel_size) > 1e-6:
+        print(f"[init_free] 警告：预存 voxel_size={vs_saved} 与当前 voxmap={voxmap.voxel_size} "
+              f"不一致，按当前粒度落格")
+
+    if centers.shape[0] == 0:
+        cells = np.empty((0, 3), dtype=np.int64)
+    else:
+        idx = voxmap.world_to_voxel(centers)
+        idx = idx[voxmap.in_bounds(idx)]
+        cells = np.unique(idx, axis=0) if idx.shape[0] else idx.astype(np.int64)
 
     n = voxmap.set_many(cells, FREE)
     return (n, cells) if return_cells else n

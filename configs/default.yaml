@@ -69,6 +69,10 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
                                         # UNKNOWN→每段运动都假阳性非 FREE。(voxel=0.04m；与 swept 排除底座球互为冗余兜底)
   box_min_m: [-0.6, -1.3, -0.5]         # 立方体法：AABB 盒下界角点（米，base_link 系，轴对齐）
   box_max_m: [2.5, 1.3, 1.7]            # 立方体法：AABB 盒上界角点（米）。中心落在 base_link，整块置 FREE
+  # 预存扫掠法（第四种）：retract + 若干关键关节角两两规划轨迹的整臂扫掠并集，离线算好存盘、免每次重算。
+  # 由 scripts/viz_joints_open3d.py --save-init-free 产出（centers=体素中心 base 系米, voxel_size）；
+  # set_initial_free_swept 加载并按当前 voxmap 映射回体素置 FREE。相对路径按项目根解析。
+  swept_path: "configs/init_free_swept.npz"
 
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定

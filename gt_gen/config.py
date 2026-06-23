@@ -120,6 +120,13 @@ class Config:
         """初始引导 FREE 空间（立方体法）：AABB 盒上界角点（米，base_link 系）。见 default.yaml init_free.box_max_m。"""
         return list(self.raw.get("init_free", {}).get("box_max_m", [2.5, 1.3, 1.7]))
 
+    @property
+    def init_free_swept_path(self) -> str:
+        """初始引导 FREE 空间（预存扫掠法）：预计算的整臂扫掠体素中心(.npz)路径。
+        相对路径按项目根解析。见 default.yaml init_free.swept_path 与 scripts/viz_joints_open3d.py --save-init-free。"""
+        p = self.raw.get("init_free", {}).get("swept_path", "configs/init_free_swept.npz")
+        return p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
+
     # ---- cuRobo IK / 规划 ----
     @property
     def ik_num_seeds(self) -> int:
