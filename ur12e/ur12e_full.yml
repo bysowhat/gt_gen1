@@ -172,6 +172,17 @@ robot_cfg:
           "radius": 0.01914
         - "center": [-0.389, 0.108, -0.21]
           "radius": 0.02275
+        # --- weld_wire/visuals (Cylinder r=0.001, h=0.02, axis Z) covered by spheres along +X ---
+        - "center": [0.0405, 0.0, 0.0]
+          "radius": 0.003
+        - "center": [0.0355, 0.0, 0.0]
+          "radius": 0.003
+        - "center": [0.0305, 0.0, 0.0]
+          "radius": 0.003
+        - "center": [0.0255, 0.0, 0.0]
+          "radius": 0.003
+        - "center": [0.0205, 0.0, 0.0]
+          "radius": 0.003
       Link1:
         - "center": [0.0, -0.007, -0.003]
           "radius": 0.08495

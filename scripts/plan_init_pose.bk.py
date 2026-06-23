@@ -357,6 +357,12 @@ class InitPoseLookupSolver:
         self._load_robot()
         self.robot_world = None
         self.world_voxel_coll = None
+        # 精确碰撞用：直接查工件 mesh 的 signed distance（不经体素，无量化误差）。
+        # _voxel 路径的体素分辨率(voxel_size≈0.02)远大于最小碰撞球半径(0.003)，
+        # 球心落在表面附近的体素时 ESDF 仍读“自由”→ 漏判；mesh 查询按三角面解析距离，无此问题。
+        self.mesh_coll = None
+        self._mesh_weight = self.tensor_args.to_device([1.0])
+        self._mesh_act = self.tensor_args.to_device([0.0])
         self._esdf_feature = None
         self._esdf_dims = None
         self._esdf_center_world = None
@@ -411,6 +417,7 @@ class InitPoseLookupSolver:
              "n_envs": 1, "cache": {"mesh": 1, "obb": 1}},
             mesh_wc, self.tensor_args)
         mesh_coll = WorldMeshCollision(mesh_cfg)
+        self.mesh_coll = mesh_coll  # 留住：碰撞判定直接查 mesh（精确），不查体素化后的 ESDF
 
         bbox_cuboid = Cuboid(
             name="workpiece",
@@ -495,11 +502,28 @@ class InitPoseLookupSolver:
             name="workpiece",
             w_obj_pose=Pose.from_list(voxel_pose7.tolist(), self.tensor_args))
 
-    def _voxel_collision_distance_batch(self, spheres):
-        """spheres (B,K,4)(xyz,r) 在 mesh_world 系 → (B,) max-over-spheres 穿透值（>0 撞）。"""
+    def _mesh_penetration_batch(self, spheres):
+        """spheres (B,K,4)(xyz,r) 在 mesh 系 → (B,) 最深单球穿透深度（米，>0 撞）。
+
+        直接查工件 mesh 的精确 signed distance（compute_esdf）：每个球心到工件面的
+        带符号距离 sdf（约定 正=工件内、负=工件外，由 mesh 解析三角面距离给出，无体素量化）。
+        球壳穿透深度 = sdf + r：>0 即该球扎入工件。取所有球的最大值=最坏穿透。
+        半径<0 的“关闭球”由 kernel 返回 sdf=0，penetration=负，自然被 max 忽略（再额外屏蔽以防万一）。
+        """
+        import torch
+        from curobo.geom.sdf.world import CollisionQueryBuffer
         x_sph = spheres.unsqueeze(1)  # (B,1,K,4)
-        d = self.robot_world.get_collision_distance(x_sph, env_query_idx=None)
-        return d.squeeze(-1)
+        buf = CollisionQueryBuffer.initialize_from_shape(
+            x_sph.shape, self.tensor_args, self.mesh_coll.collision_types)
+        sdf = self.mesh_coll.get_sphere_distance(
+            x_sph, buf, self._mesh_weight, self._mesh_act, compute_esdf=True)  # (B,1,K) 正=工件内
+        B, _, K = sdf.shape
+        sdf = sdf.view(B, K)
+        radii = spheres[..., 3]                       # (B,K)
+        penetration = sdf + radii                     # >0 即球壳扎入工件
+        penetration = torch.where(radii > 0, penetration,
+                                  torch.full_like(penetration, -1e9))  # 屏蔽关闭球
+        return penetration.amax(dim=-1)               # (B,) 最坏单球穿透
 
     # ---- 离线预计算 ----
     def precompute_joint_table(self):
@@ -578,7 +602,7 @@ class InitPoseLookupSolver:
                               phis_deg: Tuple[float, ...] = (0.0, 15.0, -15.0, 30.0, -30.0),
                               diagnostic: bool = False) -> Optional[Dict]:
         """每条焊缝 batch GPU 求解。θ×φ axis 偏移 → align(bisector→axis) → t=ee_pos−R@mid →
-        球反变到 mesh world → ESDF batch 碰撞 → safe → upright*10+cube 评分取 best。
+        球反变到 mesh world → mesh 精确穿透 batch 碰撞 → safe → upright*10+cube 评分取 best。
         （源 solve_arm_pose_lookup.py L346–539 原样。）"""
         import torch
         device = self.tensor_args.device
@@ -634,9 +658,9 @@ class InitPoseLookupSolver:
                     d_link_list, d_ret_list = [], []
                     for i in range(0, N, chunk):
                         d_link_list.append(
-                            self._voxel_collision_distance_batch(link_spheres_w[i:i + chunk]))
+                            self._mesh_penetration_batch(link_spheres_w[i:i + chunk]))
                         d_ret_list.append(
-                            self._voxel_collision_distance_batch(ret_spheres_w[i:i + chunk]))
+                            self._mesh_penetration_batch(ret_spheres_w[i:i + chunk]))
                     d_link = torch.cat(d_link_list)
                     d_ret = torch.cat(d_ret_list)
 
