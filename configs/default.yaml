@@ -80,9 +80,11 @@ plan_init_pose:                         # lookup 式初始位姿求解（scripts
   ee_xy_range_m: [0.4, 1.0]             # 焊枪末端 xy 平面到 base_link 原点距离 [下限,上限]（米）
   ee_z_range_m: [-0.1, 0.1]             # 焊枪末端在 base_link 系 z [下限,上限]（米）
   n_per_dof: 12                          # 每关节采样档数，q_table = n_per_dof^6
-  collision_tolerance_m: 0.01           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
+  collision_tolerance_m: 0.00           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
   voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
   n_seg: 20                             # save_seam_pkl 的 seam_line 插值点数
+  standoff_cm: 2.0                     # 焊枪头落点沿焊缝角平分线(bisector，远离工件方向)外移的 standoff 距离(cm)；
+                                        # 0=落在焊缝中点。与 goal.standoff_cm 同义，但作用于初始位姿求解。
   # 角度采样：先把焊缝平分线 align 到名义焊枪轴(-ee_x)得基准姿态 R0，再【绕 xiaoyu_tip_link 末端局部
   # x/y/z 轴】各转一点组成扰动 R_delta，R=R_delta@R0（三角全有效）。名义焊枪轴=末端局部 -x，故绕 x
   # 即焊枪自转 roll（指向不变），绕 y/z 为 tilt（改变焊枪指向）。可视化核实见 plan_init_pose.viz_tip_frame。

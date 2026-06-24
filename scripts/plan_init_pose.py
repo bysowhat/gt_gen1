@@ -657,6 +657,11 @@ class InitPoseLookupSolver:
         bisector = torch.tensor(weld["bisector_world"], device=device, dtype=dtype)
         bisector = bisector / (torch.norm(bisector) + 1e-12)
 
+        # 落枪点(tip 目标) = 焊缝中点沿角平分线(bisector，远离工件方向)外移 standoff 米；
+        # standoff=0 即落在中点。t=ee_pos−R@target 让 tip 落在此点，真实焊缝中点随之退后 standoff。
+        standoff = float(self.cfg.plan_init_standoff)
+        target = mid + standoff * bisector
+
         # 焊缝起点/终点（mesh world）→ 在线按 R,t 变到 base 后须落在与 tip 同一组工作空间范围内
         # （复用 precompute 的 ee_xy_range_m / ee_z_range_m；中点=tip 已在 precompute 保证，无需再算）。
         p0_world = torch.tensor(weld["p0_world"], device=device, dtype=dtype)
@@ -692,8 +697,10 @@ class InitPoseLookupSolver:
                         Rz = batch_axis_angle_rotmat(eaz, az_r.expand(N))
                         R_delta = Rz @ Ry @ Rx                       # (N,3,3)
                         R = R_delta @ R0                             # (N,3,3) R=R_delta@R0
+                        R_target = torch.einsum("nij,j->ni", R, target)
+                        t_arr = self.ee_pos_t - R_target  # (N,3) tip 落在 standoff 落枪点
                         R_mid = torch.einsum("nij,j->ni", R, mid)
-                        t_arr = self.ee_pos_t - R_mid  # (N,3)
+                        mid_base_arr = R_mid + t_arr  # (N,3) 真实焊缝中点在 base（standoff>0 时 ≠ ee_pos，供排序/sanity）
 
                         # 焊缝起/终点变到 base：p_base = R@p_world + t；须落在 ee_xy_range(xy 环)+ee_z_range(z) 内
                         p0_base = torch.einsum("nij,j->ni", R, p0_world) + t_arr   # (N,3)
@@ -759,6 +766,7 @@ class InitPoseLookupSolver:
                             "rot_y_deg": ay_deg,
                             "rot_z_deg": az_deg,
                             "ee_pos_in_base": self.ee_pos_t[gi].cpu().numpy(),
+                            "mid_in_base": mid_base_arr[gi].cpu().numpy(),
                             "ee_x_in_base": self.ee_x_t[gi].cpu().numpy(),
                             "d_link": float(d_link[gi].item()),
                             "d_retract": float(d_ret[gi].item()),
@@ -782,18 +790,19 @@ class InitPoseLookupSolver:
             return None
 
         all_solutions.sort(key=lambda s: -s["combined_score"])
-        # 二次稳定排序：焊缝中点(base 系=ee_pos)的 x>0 的结果排前、x<=0 的拍到后面；
+        # 二次稳定排序：真实焊缝中点(base 系，standoff>0 时 ≠ ee_pos)的 x>0 的结果排前、x<=0 的拍到后面；
         # 稳定排序保证各组内部仍保持上面的 combined_score 降序。
-        all_solutions.sort(key=lambda s: 0 if float(s["ee_pos_in_base"][0]) > 0.0 else 1)
+        all_solutions.sort(key=lambda s: 0 if float(s["mid_in_base"][0]) > 0.0 else 1)
         self.last_all_solutions = all_solutions   # 供可视化分页浏览全部候选（x>0 优先、组内按分降序）
         best = all_solutions[0]
         if diagnostic:
             R, t = best["R"], best["t"]
-            mid_in_base = R @ weld["mid_world"] + t
-            err_mid_pos = float(np.linalg.norm(mid_in_base - best["ee_pos_in_base"]))
+            target_np = np.asarray(weld["mid_world"], float) + standoff * np.asarray(weld["bisector_world"], float)
+            target_in_base = R @ target_np + t
+            err_tip_pos = float(np.linalg.norm(target_in_base - best["ee_pos_in_base"]))  # 落枪点应贴 ee_pos
             so3_err = float(np.linalg.norm(R @ R.T - np.eye(3)))
-            print(f"      [sanity best] err_mid_pos={err_mid_pos:.4f} |R*R^T-I|={so3_err:.4f} "
-                  f"align={best['align_score']:.2f} "
+            print(f"      [sanity best] standoff={standoff:.3f}m err_tip_pos={err_tip_pos:.4f} "
+                  f"|R*R^T-I|={so3_err:.4f} align={best['align_score']:.2f} "
                   f"αx={best['rot_x_deg']:+.0f}° βy={best['rot_y_deg']:+.0f}° γz={best['rot_z_deg']:+.0f}°")
         return best
 
@@ -821,7 +830,7 @@ def _lookup_solution_geoms(cfg, obj_fp: str, weld: Dict, sol: Dict):
         mesh.paint_uniform_color([0.7, 0.7, 0.72])
         geoms.append(mesh)
 
-    # 焊缝线 p0→p1（绿色）+ 焊枪头落点（= R@mid + t，应贴在 ee_pos）
+    # 焊缝线 p0→p1（绿色）+ 焊缝中点（绿球）+ 焊枪头实际落点（红球，= standoff 落枪点，应贴在 ee_pos）
     def _to_base(p):
         return (R @ np.asarray(p, float) + t).tolist()
     p0b, p1b = _to_base(weld["p0_world"]), _to_base(weld["p1_world"])
@@ -835,6 +844,16 @@ def _lookup_solution_geoms(cfg, obj_fp: str, weld: Dict, sol: Dict):
     tip.compute_vertex_normals()
     tip.paint_uniform_color([0.1, 0.85, 0.1])
     geoms.append(tip)
+
+    # standoff 落枪点：中点沿 bisector(远离工件)外移 standoff 米，焊枪头实际落在这（standoff>0 时与中点分离）
+    standoff = float(cfg.plan_init_standoff)
+    if standoff != 0.0:
+        target_world = np.asarray(weld["mid_world"], float) + standoff * np.asarray(weld["bisector_world"], float)
+        gun = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+        gun.translate(_to_base(target_world))
+        gun.compute_vertex_normals()
+        gun.paint_uniform_color([0.9, 0.1, 0.1])
+        geoms.append(gun)
     return geoms
 
 

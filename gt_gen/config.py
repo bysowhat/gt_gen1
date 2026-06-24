@@ -178,6 +178,13 @@ class Config:
         """save_seam_pkl 的 seam_line 插值点数。见 default.yaml plan_init_pose.n_seg。"""
         return int(self.raw.get("plan_init_pose", {}).get("n_seg", 20))
 
+    @property
+    def plan_init_standoff(self) -> float:
+        """初始位姿求解：焊枪头落点沿焊缝角平分线(bisector，远离工件方向)外移的 standoff 距离（米）。
+        焊枪头不再落在焊缝中点，而是落在「中点 + standoff·bisector」处（中点退后 standoff 进入自由空间）。
+        与 goal.standoff_cm 同义但作用于初始位姿求解。见 default.yaml plan_init_pose.standoff_cm。"""
+        return float(self.raw.get("plan_init_pose", {}).get("standoff_cm", 0.0)) / 100.0
+
     # ---- cuRobo IK / 规划 ----
     @property
     def ik_num_seeds(self) -> int:
