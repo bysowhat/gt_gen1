@@ -127,6 +127,57 @@ class Config:
         p = self.raw.get("init_free", {}).get("swept_path", "configs/init_free_swept.npz")
         return p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
 
+    # ---- plan_init_pose（lookup 式初始位姿求解的关节角过滤范围） ----
+    @property
+    def plan_init_ee_xy_range(self) -> list:
+        """焊枪末端在 base_link 系 xy 平面到原点距离的 [下限,上限]（米）。
+        见 default.yaml plan_init_pose.ee_xy_range_m。"""
+        return list(self.raw.get("plan_init_pose", {}).get("ee_xy_range_m", [0.4, 1.0]))
+
+    @property
+    def plan_init_ee_z_range(self) -> list:
+        """焊枪末端在 base_link 系 z 的 [下限,上限]（米）。见 default.yaml plan_init_pose.ee_z_range_m。"""
+        return list(self.raw.get("plan_init_pose", {}).get("ee_z_range_m", [-0.1, 0.1]))
+
+    @property
+    def plan_init_n_per_dof(self) -> int:
+        """lookup 每关节采样档数，q_table = n_per_dof^6。见 default.yaml plan_init_pose.n_per_dof。"""
+        return int(self.raw.get("plan_init_pose", {}).get("n_per_dof", 7))
+
+    @property
+    def plan_init_rot_x_deg(self) -> list:
+        """绕 xiaoyu_tip_link 末端局部 +x 轴的旋转采样 [min,max,step]（度，闭区间）。
+        见 default.yaml plan_init_pose.rot_x_deg。"""
+        return list(self.raw.get("plan_init_pose", {}).get("rot_x_deg", [-30.0, 30.0, 15.0]))
+
+    @property
+    def plan_init_rot_y_deg(self) -> list:
+        """绕 xiaoyu_tip_link 末端局部 +y 轴的旋转采样 [min,max,step]（度，闭区间）。
+        见 default.yaml plan_init_pose.rot_y_deg。"""
+        return list(self.raw.get("plan_init_pose", {}).get("rot_y_deg", [-30.0, 30.0, 15.0]))
+
+    @property
+    def plan_init_rot_z_deg(self) -> list:
+        """绕 xiaoyu_tip_link 末端局部 +z 轴（焊枪自转 roll）的旋转采样 [min,max,step]（度，闭区间）。
+        见 default.yaml plan_init_pose.rot_z_deg。"""
+        return list(self.raw.get("plan_init_pose", {}).get("rot_z_deg", [0.0, 0.0, 1.0]))
+
+    @property
+    def plan_init_collision_tolerance(self) -> float:
+        """整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）。
+        见 default.yaml plan_init_pose.collision_tolerance_m。"""
+        return float(self.raw.get("plan_init_pose", {}).get("collision_tolerance_m", 0.03))
+
+    @property
+    def plan_init_voxel_size(self) -> float:
+        """工件 ESDF 体素大小（米）。见 default.yaml plan_init_pose.voxel_size_m。"""
+        return float(self.raw.get("plan_init_pose", {}).get("voxel_size_m", 0.02))
+
+    @property
+    def plan_init_n_seg(self) -> int:
+        """save_seam_pkl 的 seam_line 插值点数。见 default.yaml plan_init_pose.n_seg。"""
+        return int(self.raw.get("plan_init_pose", {}).get("n_seg", 20))
+
     # ---- cuRobo IK / 规划 ----
     @property
     def ik_num_seeds(self) -> int:

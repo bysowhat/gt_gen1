@@ -74,6 +74,23 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
   # set_initial_free_swept 加载并按当前 voxmap 映射回体素置 FREE。相对路径按项目根解析。
   swept_path: "configs/init_free_swept.npz"
 
+plan_init_pose:                         # lookup 式初始位姿求解（scripts/plan_init_pose.py --solve）的关节角过滤
+  # precompute_joint_table 对 n^6 采样的关节角做 FK 后，只保留焊枪末端位姿（base_link 系）满足下列约束的：
+  #   ① xy 平面到原点距离 ∈ ee_xy_range_m；② z ∈ ee_z_range_m；③ 落在 init_free.box_min_m/box_max_m 盒内。
+  ee_xy_range_m: [0.4, 1.0]             # 焊枪末端 xy 平面到 base_link 原点距离 [下限,上限]（米）
+  ee_z_range_m: [-0.1, 0.1]             # 焊枪末端在 base_link 系 z [下限,上限]（米）
+  n_per_dof: 12                          # 每关节采样档数，q_table = n_per_dof^6
+  collision_tolerance_m: 0.01           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
+  voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
+  n_seg: 20                             # save_seam_pkl 的 seam_line 插值点数
+  # 角度采样：先把焊缝平分线 align 到名义焊枪轴(-ee_x)得基准姿态 R0，再【绕 xiaoyu_tip_link 末端局部
+  # x/y/z 轴】各转一点组成扰动 R_delta，R=R_delta@R0（三角全有效）。名义焊枪轴=末端局部 -x，故绕 x
+  # 即焊枪自转 roll（指向不变），绕 y/z 为 tilt（改变焊枪指向）。可视化核实见 plan_init_pose.viz_tip_frame。
+  # 每行 [min,max,step]（度，闭区间含端点）；step<=0 或 min==max 表示该轴只取 min（不转）。
+  rot_x_deg: [-180, 180, 30]              # 绕末端局部 +x 轴（=名义焊枪轴 -x，焊枪自转 roll）：[min,max,step]（度）
+  rot_y_deg: [-30, 30, 15]              # 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
+  rot_z_deg: [-30, 30, 15]                  # 绕末端局部 +z 轴（tilt）：[min,max,step]（度）
+
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定
 

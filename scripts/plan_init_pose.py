@@ -19,7 +19,7 @@
    （文档同目录 docs/solve_arm_pose_lookup.md）。给定工件 mesh(_part.obj) + 焊缝
    (_weld_angle3.json)，离线一次性预计算 N=n_per_dof^6 个关节角的 FK（EE 位置/焊枪轴/连杆碰撞球），
    在线对每条焊缝反解出唯一工件位姿 (R,t)（焊枪头到焊缝中点、焊枪轴对准 bisector），只用「连杆球 +
-   retract 球 vs 工件 ESDF」做碰撞过滤，按 upright/cube 评分取最优。碰撞后端用裸 cuRobo
+   retract 球 vs 工件 ESDF」做碰撞过滤，按「绕自身三轴离 90° 整倍数偏差和」评分取最优。碰撞后端用裸 cuRobo
    RobotWorld + WorldVoxelCollision + 工件 ESDF（本项目 CuroboHandle 是固定位姿 MESH 世界，
    做不了"工件逐候选移动"的 batch 球碰撞查询）。
    运行（需 GPU；可选 --viz 复用 ① 的可视化）：
@@ -170,18 +170,25 @@ def batch_align_rotation(a_unit, b_unit):
     return R
 
 
-def cube_score_batch(R):
-    """R 各元素接近 {-1,0,1} 的程度（负的"到最近整值距离和"）；越大越接近 90° 倍数正交姿态。"""
+def axis_align_score_batch(R):
+    """工件姿态(R=T_workpiece_in_base 旋转部分)按【绕自身三轴 内旋 X→Y→Z】拆成 (rx,ry,rz)，
+    每轴各算「离最近 90° 整倍数的偏差」d=|a−90°×round(a/90°)|∈[0°,45°]，三轴 d 相加取负作分数。
+    =0 表示三轴恰好都落在 90° 整倍数(工件三轴对齐 base 三轴)，分最高；越斜各轴偏差越大、分越低。
+    （round-to-nearest 自动覆盖 …−2,−1,0,1,2… 各 90° 倍数，过 45° 即归到下一倍数→单轴偏差恒≤45°。）"""
     import torch
-    abs_r = torch.abs(R)
-    dist = torch.minimum(abs_r, 1.0 - abs_r)
-    return -torch.sum(dist, dim=(-2, -1))
+    half_pi = float(np.pi / 2.0)
+    rad2deg = float(180.0 / np.pi)
+    # 内旋 XYZ 分解：R = Rx(rx)·Ry(ry)·Rz(rz)
+    sy = torch.clamp(R[..., 0, 2], -1.0, 1.0)
+    ry = torch.asin(sy)
+    rx = torch.atan2(-R[..., 1, 2], R[..., 2, 2])
+    rz = torch.atan2(-R[..., 0, 1], R[..., 0, 0])
 
+    def _dev_deg(a):
+        nearest = torch.round(a / half_pi) * half_pi   # 最近的 90° 整倍数(rad)
+        return torch.abs(a - nearest) * rad2deg        # 偏差(度)，∈[0,45]
 
-def upright_score_batch(R):
-    """工件竖直程度 |R[2,2]| ∈ [0,1]，≥0.9 表示不歪。"""
-    import torch
-    return torch.abs(R[..., 2, 2])
+    return -(_dev_deg(rx) + _dev_deg(ry) + _dev_deg(rz))   # ∈[-135,0]，越大越对齐
 
 
 def quat_wxyz_to_x_axis_batch(quat):
@@ -193,6 +200,24 @@ def quat_wxyz_to_x_axis_batch(quat):
         2.0 * (x * y + w * z),
         2.0 * (x * z - w * y),
     ], dim=-1)
+
+
+def quat_wxyz_to_rotmat_batch(quat):
+    """四元数 (B,4 wxyz) → 旋转矩阵 (B,3,3)，各列 = 末端局部 x/y/z 轴在 base 的方向。
+    （第 0 列与 quat_wxyz_to_x_axis_batch 一致。）"""
+    import torch
+    q = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-12)
+    w = q[..., 0]; x = q[..., 1]; y = q[..., 2]; z = q[..., 3]
+    col0 = torch.stack([1.0 - 2.0 * (y * y + z * z),
+                        2.0 * (x * y + w * z),
+                        2.0 * (x * z - w * y)], dim=-1)
+    col1 = torch.stack([2.0 * (x * y - w * z),
+                        1.0 - 2.0 * (x * x + z * z),
+                        2.0 * (y * z + w * x)], dim=-1)
+    col2 = torch.stack([2.0 * (x * z + w * y),
+                        2.0 * (y * z - w * x),
+                        1.0 - 2.0 * (x * x + y * y)], dim=-1)
+    return torch.stack([col0, col1, col2], dim=-1)  # (B,3,3) 列向量为各轴
 
 
 # ---- 纯位姿工具（numpy/scipy；父 solve_arm_pose_parallel.py L59–79 原样） ----
@@ -324,9 +349,10 @@ def to_save_format(weld: Dict, sol: Dict, joint_names: List[str]) -> Dict:
         "weld_p1_world": weld["p1_world"].tolist(),
         "joint_angles": sol["q"].tolist(),
         "joint_names": joint_names,
-        "_theta_deg": sol["theta_deg"],
-        "_phi_deg": sol.get("phi_deg", 0.0),
-        "_cube_score": sol["cube_score"],
+        "_rot_x_deg": sol["rot_x_deg"],
+        "_rot_y_deg": sol["rot_y_deg"],
+        "_rot_z_deg": sol["rot_z_deg"],
+        "_align_score": sol["align_score"],
         "_d_link": sol["d_link"],
         "_d_retract": sol["d_retract"],
     }
@@ -503,8 +529,14 @@ class InitPoseLookupSolver:
 
     # ---- 离线预计算 ----
     def precompute_joint_table(self):
-        """6 关节限位等距 n^6 采样 → batch FK 算 (ee_pos, ee_x, link_spheres)。
-        （源 solve_arm_pose_lookup.py L206–308 原样。）"""
+        """6 关节限位等距 n^6 采样 → 逐块 batch FK 算 (ee_pos, ee_x, link_spheres) 并【当场过滤】。
+        （源 solve_arm_pose_lookup.py L206–308；改为逐块过滤以免 n_per_dof 大时 n^6 link_spheres OOM。）
+
+        过滤：只保留焊枪末端位姿（base_link 系）同时满足下列约束的关节角——
+          ① xy 平面到原点距离 ∈ cfg.plan_init_ee_xy_range（default.yaml plan_init_pose.ee_xy_range_m）；
+          ② z ∈ cfg.plan_init_ee_z_range（plan_init_pose.ee_z_range_m）；
+          ③ 落在 init_free 盒 [cfg.init_free_box_min, cfg.init_free_box_max] 内（逐轴）。
+        每块只把满足约束的幸存者保留并 cat 到 GPU 表，不物化全量。"""
         import torch
         kc = self.robot_cfg.kinematics.kinematics_config
         jl = kc.joint_limits.position
@@ -522,30 +554,64 @@ class InitPoseLookupSolver:
         for i, (lo, hi) in enumerate(zip(low, high)):
             print(f"  joint {i}: [{lo:.3f}, {hi:.3f}]")
 
-        grids = [np.linspace(lo, hi, n) for lo, hi in zip(low, high)]
-        mesh = np.meshgrid(*grids, indexing="ij")
-        q_grid = np.stack([m.ravel() for m in mesh], axis=1).astype(np.float32)
-        q_grid_t = torch.tensor(q_grid, device=self.tensor_args.device,
-                                dtype=self.tensor_args.dtype)
+        # —— 过滤范围（base_link 系焊枪末端约束）：从 cfg / default.yaml 读取 ——
+        ee_xy_range = self.cfg.plan_init_ee_xy_range
+        ee_z_range = self.cfg.plan_init_ee_z_range
+        box_min = np.asarray(self.cfg.init_free_box_min, dtype=np.float32)
+        box_max = np.asarray(self.cfg.init_free_box_max, dtype=np.float32)
+        xy_lo, xy_hi = float(ee_xy_range[0]), float(ee_xy_range[1])
+        z_lo, z_hi = float(ee_z_range[0]), float(ee_z_range[1])
+        bmin = torch.tensor(box_min, device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+        bmax = torch.tensor(box_max, device=self.tensor_args.device, dtype=self.tensor_args.dtype)
 
+        # 逐块生成关节角（按 flat 索引 unravel 取网格值，免物化全量 meshgrid）→ FK → 当场过滤，
+        # 只把【满足约束】的幸存者堆到 GPU，避免 n_per_dof 大时 n^6 个 link_spheres OOM。
+        grids = [np.linspace(lo, hi, n).astype(np.float32) for lo, hi in zip(low, high)]
+        shape = (n,) * n_dof
         chunk = 4096
-        ee_pos_list, ee_x_list, link_spheres_list = [], [], []
+        q_keep, ee_pos_keep, ee_x_keep, ee_rot_keep, link_keep = [], [], [], [], []
+        n_before = N
+        n_after = 0
         t0 = time.time()
         with torch.no_grad():
             for i in range(0, N, chunk):
-                qb = q_grid_t[i:i + chunk]
+                idxs = np.arange(i, min(i + chunk, N))
+                coords = np.unravel_index(idxs, shape)            # n_dof 个索引数组
+                qb_np = np.stack([grids[d][coords[d]] for d in range(n_dof)], axis=1)
+                qb = torch.tensor(qb_np, device=self.tensor_args.device,
+                                  dtype=self.tensor_args.dtype)
                 state = self.robot_world.get_kinematics(qb)
-                ee_pos_list.append(state.ee_position.detach().clone())
+                ee_pos = state.ee_position
                 ee_x = quat_wxyz_to_x_axis_batch(state.ee_quaternion)
-                ee_x_list.append(ee_x.detach().clone())
-                link_spheres_list.append(state.link_spheres_tensor.detach().clone())
+                ee_x = ee_x / (torch.norm(ee_x, dim=-1, keepdim=True) + 1e-12)
+                ee_rot = quat_wxyz_to_rotmat_batch(state.ee_quaternion)  # (B,3,3) 末端局部 xyz 轴
+                link_sph = state.link_spheres_tensor
 
-        self.ee_pos_t = torch.cat(ee_pos_list, dim=0)
-        self.ee_x_t = torch.cat(ee_x_list, dim=0)
-        self.ee_x_t = self.ee_x_t / (torch.norm(self.ee_x_t, dim=-1, keepdim=True) + 1e-12)
-        self.link_spheres_t = torch.cat(link_spheres_list, dim=0)
+                xy_dist = torch.norm(ee_pos[:, :2], dim=-1)
+                z_val = ee_pos[:, 2]
+                in_box = ((ee_pos >= bmin) & (ee_pos <= bmax)).all(dim=-1)
+                keep = (xy_dist >= xy_lo) & (xy_dist <= xy_hi) & \
+                       (z_val >= z_lo) & (z_val <= z_hi) & in_box
+                if keep.any():
+                    q_keep.append(qb[keep].detach().clone())
+                    ee_pos_keep.append(ee_pos[keep].detach().clone())
+                    ee_x_keep.append(ee_x[keep].detach().clone())
+                    ee_rot_keep.append(ee_rot[keep].detach().clone())
+                    link_keep.append(link_sph[keep].detach().clone())
+                    n_after += int(keep.sum().item())
+
+        print(f"[lookup] 焊枪末端位姿过滤（xy∈[{xy_lo},{xy_hi}]m, z∈[{z_lo},{z_hi}]m, "
+              f"init_free 盒 {box_min.tolist()}~{box_max.tolist()}）：{n_before} → {n_after}")
+        if n_after == 0:
+            raise RuntimeError("[lookup] 过滤后无任何关节角满足约束，请放宽 plan_init_pose 范围")
+
+        self.q_table_t = torch.cat(q_keep, dim=0)
+        self.ee_pos_t = torch.cat(ee_pos_keep, dim=0)
+        self.ee_x_t = torch.cat(ee_x_keep, dim=0)
+        self.ee_rot_t = torch.cat(ee_rot_keep, dim=0)
+        self.link_spheres_t = torch.cat(link_keep, dim=0)
         self.K_link = self.link_spheres_t.shape[1]
-        self.q_table_t = q_grid_t
+        self.N = n_after
 
         retract_q = torch.tensor(self.retract_config[None],
                                  device=self.tensor_args.device, dtype=self.tensor_args.dtype)
@@ -574,12 +640,15 @@ class InitPoseLookupSolver:
 
     # ---- 在线求解 ----
     def solve_one_weld_lookup(self, weld: Dict,
-                              thetas_deg: Tuple[float, ...] = (0.0, 15.0, -15.0, 30.0, -30.0),
-                              phis_deg: Tuple[float, ...] = (0.0, 15.0, -15.0, 30.0, -30.0),
+                              rot_x_deg: Tuple[float, ...] = (0.0,),
+                              rot_y_deg: Tuple[float, ...] = (0.0,),
+                              rot_z_deg: Tuple[float, ...] = (0.0,),
                               diagnostic: bool = False) -> Optional[Dict]:
-        """每条焊缝 batch GPU 求解。θ×φ axis 偏移 → align(bisector→axis) → t=ee_pos−R@mid →
-        球反变到 mesh world → ESDF batch 碰撞 → safe → upright*10+cube 评分取 best。
-        （源 solve_arm_pose_lookup.py L346–539 原样。）"""
+        """每条焊缝 batch GPU 求解。先 align(bisector→名义焊枪轴 -ee_x) 得基准姿态 R0，再【绕
+        xiaoyu_tip_link 末端局部 x/y/z 轴】分别转 (αx,βy,γz) 组成扰动 R_delta：R=R_delta@R0；
+        t=ee_pos−R@mid → 球反变到 mesh world → ESDF batch 碰撞 → safe → 三轴 90° 偏差和评分取 best。
+        （角度参数化由 θ(绕焊缝法向)×φ(绕切向) 改为绕末端自身 xyz 轴，三角全有效，绕 z 即焊枪自转 roll；
+        三轴各按 default.yaml plan_init_pose.rot_{x,y,z}_deg 采样后取笛卡尔积。）"""
         import torch
         device = self.tensor_args.device
         dtype = self.tensor_args.dtype
@@ -587,110 +656,136 @@ class InitPoseLookupSolver:
         mid = torch.tensor(weld["mid_world"], device=device, dtype=dtype)
         bisector = torch.tensor(weld["bisector_world"], device=device, dtype=dtype)
         bisector = bisector / (torch.norm(bisector) + 1e-12)
-        p0 = torch.tensor(weld["p0_world"], device=device, dtype=dtype)
-        p1 = torch.tensor(weld["p1_world"], device=device, dtype=dtype)
-        tangent_w = (p1 - p0) / (torch.norm(p1 - p0) + 1e-12)
-        normal_w = torch.cross(bisector, tangent_w, dim=-1)
-        normal_w = normal_w / (torch.norm(normal_w) + 1e-12)
+
+        # 焊缝起点/终点（mesh world）→ 在线按 R,t 变到 base 后须落在与 tip 同一组工作空间范围内
+        # （复用 precompute 的 ee_xy_range_m / ee_z_range_m；中点=tip 已在 precompute 保证，无需再算）。
+        p0_world = torch.tensor(weld["p0_world"], device=device, dtype=dtype)
+        p1_world = torch.tensor(weld["p1_world"], device=device, dtype=dtype)
+        xy_lo, xy_hi = float(self.cfg.plan_init_ee_xy_range[0]), float(self.cfg.plan_init_ee_xy_range[1])
+        z_lo, z_hi = float(self.cfg.plan_init_ee_z_range[0]), float(self.cfg.plan_init_ee_z_range[1])
 
         N = self.N
-        axis_q = -self.ee_x_t  # (N,3)
+        axis_q = -self.ee_x_t  # (N,3) 名义焊枪轴 = 末端 -x
+        axis_q = axis_q / (torch.norm(axis_q, dim=-1, keepdim=True) + 1e-12)
+        # 末端 tip_link 局部 x/y/z 轴在 base 的方向（ee_rot_t 各列）→ 扰动绕这三根轴转
+        eax = self.ee_rot_t[:, :, 0]
+        eay = self.ee_rot_t[:, :, 1]
+        eaz = self.ee_rot_t[:, :, 2]
         self._ensure_voxel_pose_set()
+
+        # 基准姿态 R0：把焊缝平分线对齐到名义焊枪轴（零扰动），R0@bisector = axis_q
+        with torch.no_grad():
+            R0 = batch_align_rotation(bisector, axis_q)  # (N,3,3)
 
         all_solutions = []
         diag_stats = []
-        for theta_deg in thetas_deg:
-            for phi_deg in phis_deg:
-                theta_rad = torch.tensor(np.deg2rad(theta_deg), device=device, dtype=dtype)
-                phi_rad = torch.tensor(np.deg2rad(phi_deg), device=device, dtype=dtype)
-                with torch.no_grad():
-                    R_normal_th = batch_axis_angle_rotmat(
-                        normal_w.unsqueeze(0), theta_rad.expand(1))[0]
-                    R_tangent_negph = batch_axis_angle_rotmat(
-                        tangent_w.unsqueeze(0), (-phi_rad).expand(1))[0]
-                    R_extra = R_tangent_negph @ R_normal_th
-                    axis_tp = axis_q @ R_extra.T
-                    axis_tp = axis_tp / (torch.norm(axis_tp, dim=-1, keepdim=True) + 1e-12)
-                    R = batch_align_rotation(bisector, axis_tp)  # (N,3,3)
-                    R_mid = torch.einsum("nij,j->ni", R, mid)
-                    t_arr = self.ee_pos_t - R_mid  # (N,3)
+        for ax_deg in rot_x_deg:
+            for ay_deg in rot_y_deg:
+                for az_deg in rot_z_deg:
+                    ax_r = torch.tensor(np.deg2rad(ax_deg), device=device, dtype=dtype)
+                    ay_r = torch.tensor(np.deg2rad(ay_deg), device=device, dtype=dtype)
+                    az_r = torch.tensor(np.deg2rad(az_deg), device=device, dtype=dtype)
+                    with torch.no_grad():
+                        # 绕 base 系下的末端局部 x/y/z 轴各转一点，组成姿态扰动（绕尖端支点）
+                        Rx = batch_axis_angle_rotmat(eax, ax_r.expand(N))
+                        Ry = batch_axis_angle_rotmat(eay, ay_r.expand(N))
+                        Rz = batch_axis_angle_rotmat(eaz, az_r.expand(N))
+                        R_delta = Rz @ Ry @ Rx                       # (N,3,3)
+                        R = R_delta @ R0                             # (N,3,3) R=R_delta@R0
+                        R_mid = torch.einsum("nij,j->ni", R, mid)
+                        t_arr = self.ee_pos_t - R_mid  # (N,3)
 
-                    # 球反变到 mesh_world：p_world = R^T @ (p_base - t)
-                    link_xyz_b = self.link_spheres_t[..., :3]
-                    link_r = self.link_spheres_t[..., 3]
-                    deltas_link = link_xyz_b - t_arr[:, None, :]
-                    link_xyz_w = torch.einsum("nji,nkj->nki", R, deltas_link)
-                    link_spheres_w = torch.cat([link_xyz_w, link_r.unsqueeze(-1)], dim=-1)
+                        # 焊缝起/终点变到 base：p_base = R@p_world + t；须落在 ee_xy_range(xy 环)+ee_z_range(z) 内
+                        p0_base = torch.einsum("nij,j->ni", R, p0_world) + t_arr   # (N,3)
+                        p1_base = torch.einsum("nij,j->ni", R, p1_world) + t_arr
+                        def _in_ws(p):
+                            xy = torch.norm(p[:, :2], dim=-1)
+                            z = p[:, 2]
+                            return (xy >= xy_lo) & (xy <= xy_hi) & (z >= z_lo) & (z <= z_hi)
+                        endpoints_ok = _in_ws(p0_base) & _in_ws(p1_base)   # (N,) 起+终都在范围内
 
-                    ret_xyz_b = self.retract_spheres_t[:, :3]
-                    ret_r = self.retract_spheres_t[:, 3]
-                    ret_xyz_b_n = ret_xyz_b[None, :, :].expand(N, -1, -1)
-                    deltas_ret = ret_xyz_b_n - t_arr[:, None, :]
-                    ret_xyz_w = torch.einsum("nji,nkj->nki", R, deltas_ret)
-                    ret_r_n = ret_r[None, :].expand(N, -1)
-                    ret_spheres_w = torch.cat([ret_xyz_w, ret_r_n.unsqueeze(-1)], dim=-1)
+                        # 球反变到 mesh_world：p_world = R^T @ (p_base - t)
+                        link_xyz_b = self.link_spheres_t[..., :3]
+                        link_r = self.link_spheres_t[..., 3]
+                        deltas_link = link_xyz_b - t_arr[:, None, :]
+                        link_xyz_w = torch.einsum("nji,nkj->nki", R, deltas_link)
+                        link_spheres_w = torch.cat([link_xyz_w, link_r.unsqueeze(-1)], dim=-1)
 
-                    chunk = 8192
-                    d_link_list, d_ret_list = [], []
-                    for i in range(0, N, chunk):
-                        d_link_list.append(
-                            self._voxel_collision_distance_batch(link_spheres_w[i:i + chunk]))
-                        d_ret_list.append(
-                            self._voxel_collision_distance_batch(ret_spheres_w[i:i + chunk]))
-                    d_link = torch.cat(d_link_list)
-                    d_ret = torch.cat(d_ret_list)
+                        ret_xyz_b = self.retract_spheres_t[:, :3]
+                        ret_r = self.retract_spheres_t[:, 3]
+                        ret_xyz_b_n = ret_xyz_b[None, :, :].expand(N, -1, -1)
+                        deltas_ret = ret_xyz_b_n - t_arr[:, None, :]
+                        ret_xyz_w = torch.einsum("nji,nkj->nki", R, deltas_ret)
+                        ret_r_n = ret_r[None, :].expand(N, -1)
+                        ret_spheres_w = torch.cat([ret_xyz_w, ret_r_n.unsqueeze(-1)], dim=-1)
 
-                    safe_mask = (d_link <= self.collision_tolerance) & \
-                                (d_ret <= self.collision_tolerance)
-                    n_safe = int(safe_mask.sum().item())
-                    diag_stats.append((theta_deg, phi_deg, n_safe,
-                                       float(d_link.min()), float(d_ret.min())))
-                    if diagnostic:
-                        print(f"      [θ={theta_deg:+.0f}° φ={phi_deg:+.0f}°] N={N} safe={n_safe} "
-                              f"min_d_link={float(d_link.min()):.4f} "
-                              f"min_d_ret={float(d_ret.min()):.4f}")
-                    if not safe_mask.any():
-                        continue
-                    safe_idx = safe_mask.nonzero(as_tuple=True)[0]
-                    R_safe = R[safe_idx]
-                    upright = upright_score_batch(R_safe)
-                    cube = cube_score_batch(R_safe)
-                    scores = upright * 10.0 + cube
+                        chunk = 8192
+                        d_link_list, d_ret_list = [], []
+                        for i in range(0, N, chunk):
+                            d_link_list.append(
+                                self._voxel_collision_distance_batch(link_spheres_w[i:i + chunk]))
+                            d_ret_list.append(
+                                self._voxel_collision_distance_batch(ret_spheres_w[i:i + chunk]))
+                        d_link = torch.cat(d_link_list)
+                        d_ret = torch.cat(d_ret_list)
 
-                top_per = min(50, safe_idx.shape[0])
-                top_local = torch.argsort(scores, descending=True)[:top_per]
-                for li in top_local:
-                    gi = int(safe_idx[li].item())
-                    all_solutions.append({
-                        "q_idx": gi,
-                        "q": self.q_table_t[gi].cpu().numpy(),
-                        "R": R[gi].cpu().numpy(),
-                        "t": t_arr[gi].cpu().numpy(),
-                        "theta_deg": theta_deg,
-                        "phi_deg": phi_deg,
-                        "ee_pos_in_base": self.ee_pos_t[gi].cpu().numpy(),
-                        "ee_x_in_base": self.ee_x_t[gi].cpu().numpy(),
-                        "d_link": float(d_link[gi].item()),
-                        "d_retract": float(d_ret[gi].item()),
-                        "cube_score": float(cube[li].item()),
-                        "upright_score": float(upright[li].item()),
-                        "combined_score": float(scores[li].item()),
-                    })
+                        safe_mask = (d_link <= self.collision_tolerance) & \
+                                    (d_ret <= self.collision_tolerance) & \
+                                    endpoints_ok
+                        n_safe = int(safe_mask.sum().item())
+                        n_ep = int(endpoints_ok.sum().item())   # 起+终都在范围内的候选数
+                        diag_stats.append((ax_deg, ay_deg, az_deg, n_safe,
+                                           float(d_link.min()), float(d_ret.min()), n_ep))
+                        if diagnostic:
+                            print(f"      [αx={ax_deg:+.0f}° βy={ay_deg:+.0f}° γz={az_deg:+.0f}°] "
+                                  f"N={N} safe={n_safe} min_d_link={float(d_link.min()):.4f} "
+                                  f"min_d_ret={float(d_ret.min()):.4f}")
+                        if not safe_mask.any():
+                            continue
+                        safe_idx = safe_mask.nonzero(as_tuple=True)[0]
+                        R_safe = R[safe_idx]
+                        scores = axis_align_score_batch(R_safe)   # 三轴 90° 偏差和(取负)，越大越对齐
+
+                    top_per = min(50, safe_idx.shape[0])
+                    top_local = torch.argsort(scores, descending=True)[:top_per]
+                    for li in top_local:
+                        gi = int(safe_idx[li].item())
+                        all_solutions.append({
+                            "q_idx": gi,
+                            "q": self.q_table_t[gi].cpu().numpy(),
+                            "R": R[gi].cpu().numpy(),
+                            "t": t_arr[gi].cpu().numpy(),
+                            "rot_x_deg": ax_deg,
+                            "rot_y_deg": ay_deg,
+                            "rot_z_deg": az_deg,
+                            "ee_pos_in_base": self.ee_pos_t[gi].cpu().numpy(),
+                            "ee_x_in_base": self.ee_x_t[gi].cpu().numpy(),
+                            "d_link": float(d_link[gi].item()),
+                            "d_retract": float(d_ret[gi].item()),
+                            "align_score": float(scores[li].item()),
+                            "combined_score": float(scores[li].item()),
+                        })
 
         if not all_solutions:
-            print(f"      [FAIL diag] weld {weld['idx']}: 所有 {len(diag_stats)} 个 (θ,φ) 采样 stats:")
-            for td, pd, sn, dl, dr in sorted(diag_stats, key=lambda x: (x[0], x[1])):
-                reason = "OK" if sn else ("RETRACT撞" if dr > self.collision_tolerance
+            print(f"      [FAIL diag] weld {weld['idx']}: 所有 {len(diag_stats)} 个 (αx,βy,γz) 采样 stats:")
+            for axd, ayd, azd, sn, dl, dr, nep in sorted(diag_stats, key=lambda x: (x[0], x[1], x[2])):
+                reason = "OK" if sn else ("端点超范围" if nep == 0
+                                          else "RETRACT撞" if dr > self.collision_tolerance
                                           else "LINK撞" if dl > self.collision_tolerance else "其他")
-                print(f"        θ={td:+4.0f}° φ={pd:+4.0f}°: safe={sn:6d}/{N}  "
-                      f"min_d_link={dl:.4f}  min_d_ret={dr:.4f}  [{reason}]")
-            n_zero = sum(1 for s in diag_stats if s[2] == 0)
+                print(f"        αx={axd:+4.0f}° βy={ayd:+4.0f}° γz={azd:+4.0f}°: safe={sn:6d}/{N}  "
+                      f"端点OK={nep:6d}/{N}  min_d_link={dl:.4f}  min_d_ret={dr:.4f}  [{reason}]")
+            n_zero = sum(1 for s in diag_stats if s[3] == 0)
             print(f"      [FAIL diag] 共 {n_zero}/{len(diag_stats)} 个采样完全无解 (safe=0)，"
-                  f"全局 min_d_link={min(s[3] for s in diag_stats):.4f}, "
-                  f"min_d_ret={min(s[4] for s in diag_stats):.4f} (tol={self.collision_tolerance:.4f})")
+                  f"全局 min_d_link={min(s[4] for s in diag_stats):.4f}, "
+                  f"min_d_ret={min(s[5] for s in diag_stats):.4f} (tol={self.collision_tolerance:.4f})")
+            self.last_all_solutions = []
             return None
 
         all_solutions.sort(key=lambda s: -s["combined_score"])
+        # 二次稳定排序：焊缝中点(base 系=ee_pos)的 x>0 的结果排前、x<=0 的拍到后面；
+        # 稳定排序保证各组内部仍保持上面的 combined_score 降序。
+        all_solutions.sort(key=lambda s: 0 if float(s["ee_pos_in_base"][0]) > 0.0 else 1)
+        self.last_all_solutions = all_solutions   # 供可视化分页浏览全部候选（x>0 优先、组内按分降序）
         best = all_solutions[0]
         if diagnostic:
             R, t = best["R"], best["t"]
@@ -698,15 +793,16 @@ class InitPoseLookupSolver:
             err_mid_pos = float(np.linalg.norm(mid_in_base - best["ee_pos_in_base"]))
             so3_err = float(np.linalg.norm(R @ R.T - np.eye(3)))
             print(f"      [sanity best] err_mid_pos={err_mid_pos:.4f} |R*R^T-I|={so3_err:.4f} "
-                  f"upright={best['upright_score']:.3f} "
-                  f"θ={best['theta_deg']:+.0f}° φ={best['phi_deg']:+.0f}°")
+                  f"align={best['align_score']:.2f} "
+                  f"αx={best['rot_x_deg']:+.0f}° βy={best['rot_y_deg']:+.0f}° γz={best['rot_z_deg']:+.0f}°")
         return best
 
 
+
 # ---- 求解结果可视化（复用 init_space_geometries） ----
-def show_lookup_solution(cfg, obj_fp: str, weld: Dict, sol: Dict):
-    """复用 init_space_geometries（整臂碰撞球 + init_free 盒 + base 架），再叠加按解出的
-    T_workpiece_in_base 摆放的工件网格（浅灰半透）+ 绿色焊缝线 + 焊枪头落点小球。"""
+def _lookup_solution_geoms(cfg, obj_fp: str, weld: Dict, sol: Dict):
+    """构建单个解的可视化几何体列表（不开窗）：init_space_geometries（整臂碰撞球 + init_free
+    盒 + base 架）+ 按 T_workpiece_in_base 摆放的工件网格（浅灰半透）+ 绿色焊缝线 + 焊枪头落点小球。"""
     import open3d as o3d
 
     geoms, _ = init_space_geometries(cfg, q=sol["q"])
@@ -739,56 +835,274 @@ def show_lookup_solution(cfg, obj_fp: str, weld: Dict, sol: Dict):
     tip.compute_vertex_normals()
     tip.paint_uniform_color([0.1, 0.85, 0.1])
     geoms.append(tip)
+    return geoms
 
+
+def show_lookup_solution(cfg, obj_fp: str, weld: Dict, sol: Dict):
+    """单解可视化（关闭窗口即返回）。"""
+    import open3d as o3d
+    geoms = _lookup_solution_geoms(cfg, obj_fp, weld, sol)
     print(f"显示 weld {weld['idx']} 解（关闭窗口继续）…")
     o3d.visualization.draw_geometries(
         geoms, window_name=f"plan_init_pose: weld {weld['idx']} 解 + 工件 + 整臂碰撞球")
 
 
+def show_lookup_solutions(cfg, obj_fp: str, weld: Dict, solutions: List[Dict]):
+    """逐个可视化该焊缝【所有候选解】(按 combined_score 已降序，第 1 个=best)：同一个窗口里
+    按【C 键】切到下一个，不关窗口；切换时打印「第 i/N 个结果」。到最后一个再按 C 即关闭窗口
+    （进入下一条焊缝 / 结束）。中途也可直接关窗口跳过剩余。"""
+    import open3d as o3d
+
+    n = len(solutions)
+    if n == 0:
+        print(f"[viz] weld {weld['idx']} 无候选解，跳过可视化")
+        return
+
+    state = {"i": 0}
+
+    def _load(vis, idx, reset):
+        vis.clear_geometries()
+        sol = solutions[idx]
+        for g in _lookup_solution_geoms(cfg, obj_fp, weld, sol):
+            vis.add_geometry(g, reset_bounding_box=reset)
+        print(f"[viz] weld {weld['idx']} 第 {idx + 1}/{n} 个结果："
+              f"align={sol.get('align_score', float('nan')):.2f} "
+              f"αx={sol['rot_x_deg']:+.0f}° βy={sol['rot_y_deg']:+.0f}° γz={sol['rot_z_deg']:+.0f}° "
+              f"d_link={sol['d_link']:.3f} d_ret={sol['d_retract']:.3f}（按 C 看下一个）")
+
+    def _next(vis):
+        state["i"] += 1
+        if state["i"] >= n:
+            print(f"[viz] weld {weld['idx']} 已是最后一个（{n}/{n}），关闭窗口继续")
+            vis.close()
+            return False
+        _load(vis, state["i"], reset=False)   # 切换不重置视角，保留用户当前相机
+        return False
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name=f"plan_init_pose: weld {weld['idx']} 全部候选（按 C 切下一个）")
+    vis.register_key_callback(ord("C"), _next)
+    _load(vis, 0, reset=True)   # 第 1 个 fit 一次视角
+    vis.run()
+    vis.destroy_window()
+
+
+def viz_joint_table(cfg, solver, n=3):
+    """可视化 precompute_joint_table 过滤后的结果：焊枪末端 ee_pos 的 xyz 范围（青色 AABB +
+    全体落点灰点云）+ 随机挑 n 个关节角各画一套整臂碰撞球（不同颜色区分）+ base 坐标架；
+    每个被挑构型再在其 ee_pos 处放一个【洋红实心球】标出焊枪末端，便于核对末端位置是否正确。
+
+    无「是否可视化」开关：由调用处自行注释 / 取消注释这行调用来控制是否运行。n 为可视化的
+    关节角个数（调用处写死 3）。"""
+    import open3d as o3d
+    from gt_gen.obstacle_placement import compute_link_sweep
+
+    ee = solver.ee_pos_t.cpu().numpy()        # (N,3) base_link 系焊枪末端位置
+    q_tab = solver.q_table_t.cpu().numpy()    # (N, dof)
+    N = int(ee.shape[0])
+    if N == 0:
+        print("[viz_table] 过滤后无关节角，跳过可视化")
+        return
+    lo = ee.min(axis=0)
+    hi = ee.max(axis=0)
+    print(f"[viz_table] ee_pos xyz 范围：x=[{lo[0]:.3f},{hi[0]:.3f}] "
+          f"y=[{lo[1]:.3f},{hi[1]:.3f}] z=[{lo[2]:.3f},{hi[2]:.3f}]（N={N}）")
+
+    geoms = []
+    # 全体焊枪末端落点（灰点云）
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(ee))
+    pcd.paint_uniform_color([0.5, 0.5, 0.5])
+    geoms.append(pcd)
+    # xyz 范围 AABB（青色线框）
+    aabb = o3d.geometry.AxisAlignedBoundingBox(lo.tolist(), hi.tolist())
+    aabb.color = (0.0, 0.75, 0.75)
+    geoms.append(aabb)
+    # base 坐标架（原点，0.3m）
+    geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3, origin=(0.0, 0.0, 0.0)))
+
+    # 随机挑 n 个关节角，各画一套整臂碰撞球（不同颜色）
+    k = min(int(n), N)
+    pick = np.random.choice(N, size=k, replace=False)
+    print(f"[viz_table] 随机挑 {k} 个关节角可视化：idx={pick.tolist()}")
+    palette = [[0.85, 0.1, 0.1], [0.1, 0.1, 0.85], [0.1, 0.7, 0.1],
+               [0.85, 0.6, 0.1], [0.6, 0.1, 0.85]]
+    EE_COLOR = [1.0, 0.0, 1.0]                        # 焊枪末端标记：洋红实心球（与臂碰撞球区分）
+    for ci, j in enumerate(pick):
+        q = [float(v) for v in q_tab[j]]
+        per_wp, _ = compute_link_sweep(cfg, [q], cfg.collision_link_names)
+        col = palette[ci % len(palette)]
+        for _ln, s in per_wp.items():
+            for c in np.asarray(s, float)[0]:                # (S,4)：取唯一路点
+                cx, cy, cz, r = (float(v) for v in c)
+                if r <= 1e-4:
+                    continue
+                ball = o3d.geometry.TriangleMesh.create_sphere(radius=r, resolution=8)
+                ball.translate((cx, cy, cz))
+                ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+                ls.paint_uniform_color(col)
+                geoms.append(ls)
+        # 焊枪末端位置 ee_pos_t[j]（base 系）：洋红实心球，核对是否落在该构型臂端
+        ee_mark = o3d.geometry.TriangleMesh.create_sphere(radius=0.03, resolution=12)
+        ee_mark.translate(tuple(float(v) for v in ee[j]))
+        ee_mark.compute_vertex_normals()
+        ee_mark.paint_uniform_color(EE_COLOR)
+        geoms.append(ee_mark)
+        print(f"[viz_table]   idx={int(j)} ee_pos={np.round(ee[j], 3).tolist()}（洋红球）")
+
+    print("[viz_table] 显示中（关闭窗口继续）…")
+    o3d.visualization.draw_geometries(
+        geoms, window_name="precompute_joint_table: ee 范围 + 随机关节角")
+
+def viz_tip_frame(cfg, solver, anchor_idx=None,
+                  torch_links=("xiaoyu_accessory_link", "xiaoyu_tip_link"),
+                  axis_len=0.25):
+    """可视化【焊枪碰撞球】+【xiaoyu_tip_link(ee_link) 末端坐标系 xyz 三轴】，肉眼核实焊枪实际沿哪根
+    局部轴指出去 → 绕那根轴转才是「焊枪自转 roll」。
+
+    取一个 anchor 关节角，用其 FK 的末端位姿（solver.ee_pos_t / ee_rot_t）当 tip 坐标系：在 tip
+    原点画一个【有朝向的三轴坐标架】（open3d 约定 x=红 y=绿 z=蓝），并把代码里的【名义焊枪轴 -x】
+    单独用洋红粗线标出；同时用该构型 FK 出 torch_links 的碰撞球（青色线框）。这样「焊枪整支朝向」
+    vs「三轴方向」一眼对照：碰撞球朝哪根轴延伸，绕那根轴转就是 roll（指向不变）。
+
+    判读要点：solve_one_weld_lookup 用 axis_q=-ee_x 当名义焊枪轴 → 理论 roll 轴 = 局部 x（rot_x_deg）。
+    若碰撞球确实沿 -x（洋红线）方向延伸，则确认 rot_x_deg 才是 roll、rot_y/z_deg 是 tilt。
+    无开关：调用处注释/取消注释这行调用控制是否运行。"""
+    import open3d as o3d
+    from gt_gen.obstacle_placement import compute_link_sweep
+
+    ee = solver.ee_pos_t.cpu().numpy()         # (N,3) base 系末端位置
+    ee_rot = solver.ee_rot_t.cpu().numpy()     # (N,3,3) 各列=局部 x/y/z 轴在 base 的方向
+    q_tab = solver.q_table_t.cpu().numpy()     # (N,dof)
+    N = int(ee.shape[0])
+    if N == 0:
+        print("[viz_tip_frame] 空表，跳过")
+        return
+
+    a0 = int(anchor_idx) if anchor_idx is not None else int(np.random.randint(N))
+    p = ee[a0]                                  # tip 原点（base 系）
+    R = ee_rot[a0]                              # tip 坐标系（列=x/y/z 轴）
+    ax_x, ax_y, ax_z = R[:, 0], R[:, 1], R[:, 2]
+    print(f"[viz_tip_frame] anchor idx={a0} tip_xyz={np.round(p, 3).tolist()}")
+    print(f"[viz_tip_frame]   局部 +x={np.round(ax_x, 3).tolist()} (红)  "
+          f"+y={np.round(ax_y, 3).tolist()} (绿)  +z={np.round(ax_z, 3).tolist()} (蓝)")
+    print(f"[viz_tip_frame]   名义焊枪轴 -x={np.round(-ax_x, 3).tolist()}（洋红粗线；绕它转=roll）")
+
+    # base 坐标架（原点，0.3m）
+    geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3, origin=(0.0, 0.0, 0.0))]
+
+    # tip 坐标系：有朝向的三轴架（x=红 y=绿 z=蓝），原点在 tip、姿态=R
+    tip_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=axis_len, origin=(0.0, 0.0, 0.0))
+    T = np.eye(4); T[:3, :3] = R; T[:3, 3] = p
+    tip_frame.transform(T)
+    geoms.append(tip_frame)
+
+    # 名义焊枪轴 -x：洋红线（tip 原点沿 -x 方向画 1.3*axis_len）
+    torch_axis_line = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector([p.tolist(), (p - ax_x * axis_len * 1.3).tolist()]),
+        lines=o3d.utility.Vector2iVector([[0, 1]]))
+    torch_axis_line.paint_uniform_color([1.0, 0.0, 1.0])
+    geoms.append(torch_axis_line)
+
+    # tip 原点小球（洋红实心）
+    mk = o3d.geometry.TriangleMesh.create_sphere(radius=0.01, resolution=12)
+    mk.translate(tuple(float(v) for v in p))
+    mk.compute_vertex_normals()
+    mk.paint_uniform_color([1.0, 0.0, 1.0])
+    geoms.append(mk)
+
+    # 焊枪碰撞球（anchor 构型 FK，青色线框）
+    q_anchor = [float(v) for v in q_tab[a0]]
+    per_wp, _ = compute_link_sweep(cfg, [q_anchor], cfg.collision_link_names)
+    n_sph = 0
+    for ln in torch_links:
+        if ln not in per_wp:
+            print(f"[viz_tip_frame] 警告：torch link '{ln}' 不在 collision_link_names，跳过")
+            continue
+        for c in np.asarray(per_wp[ln], float)[0]:                # (S,4)：取唯一路点
+            cx, cy, cz, r = (float(v) for v in c)
+            if r <= 1e-4:
+                continue
+            ball = o3d.geometry.TriangleMesh.create_sphere(radius=r, resolution=8)
+            ball.translate((cx, cy, cz))
+            ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+            ls.paint_uniform_color([0.1, 0.6, 0.6])
+            geoms.append(ls)
+            n_sph += 1
+    print(f"[viz_tip_frame] 焊枪碰撞球 {n_sph} 个（青色线框；links={list(torch_links)}）")
+    print("[viz_tip_frame] 坐标架：x=红 y=绿 z=蓝；洋红粗线=名义焊枪轴(-x)。显示中（关闭窗口继续）…")
+    o3d.visualization.draw_geometries(
+        geoms, window_name="tip_frame：焊枪碰撞球 + xiaoyu_tip_link 三轴")
+
+
 # ============================================================================
 # CLI
 # ============================================================================
+def _deg_range(spec):
+    """[min,max,step]（度，闭区间）→ 角度元组。step<=0 或 max<=min 时只取 min（该轴不转）。"""
+    lo, hi, step = float(spec[0]), float(spec[1]), float(spec[2])
+    if step <= 0.0 or hi <= lo:
+        return (lo,)
+    k = int(round((hi - lo) / step))
+    return tuple(round(lo + i * step, 6) for i in range(k + 1))
+
+
 def _run_solve(args):
     """lookup 求解子流程（--solve）。"""
     from gt_gen.config import load_config
     cfg = load_config()
-    thetas = tuple(float(x) for x in args.thetas_deg.split(",") if x.strip())
-    phis = tuple(float(x) for x in args.phis_deg.split(",") if x.strip())
+    # n_per_dof / 绕末端 xyz 轴的角度采样 全部读 default.yaml plan_init_pose（不再走命令行）
+    n_per_dof = cfg.plan_init_n_per_dof
+    rot_x = _deg_range(cfg.plan_init_rot_x_deg)
+    rot_y = _deg_range(cfg.plan_init_rot_y_deg)
+    rot_z = _deg_range(cfg.plan_init_rot_z_deg)
     print(f"[solve] obj={args.obj}")
     print(f"[solve] weld-json={args.weld_json}")
-    print(f"[solve] θ={list(thetas)}° φ={list(phis)}° 总采样={len(thetas)}×{len(phis)}="
-          f"{len(thetas) * len(phis)}; q_table={args.n_per_dof}^6={args.n_per_dof ** 6}")
+    print(f"[solve] 绕末端局部轴采样 αx={list(rot_x)}° βy={list(rot_y)}° γz={list(rot_z)}° "
+          f"总采样={len(rot_x)}×{len(rot_y)}×{len(rot_z)}="
+          f"{len(rot_x) * len(rot_y) * len(rot_z)}; q_table={n_per_dof}^6={n_per_dof ** 6}")
 
     solver = InitPoseLookupSolver(
-        cfg, args.obj, collision_tolerance=args.collision_tolerance,
-        voxel_size=args.voxel_size, n_per_dof=args.n_per_dof)
+        cfg, args.obj, collision_tolerance=cfg.plan_init_collision_tolerance,
+        voxel_size=cfg.plan_init_voxel_size, n_per_dof=n_per_dof)
     print("[solve] precomputing joint table（与工件无关，仅一次）…")
     solver.precompute_joint_table()
 
+    # 可视化 precompute_joint_table 结果（ee xyz 范围 + 随机 3 个关节角）；注释此行即关闭可视化
+    # viz_joint_table(cfg, solver, n=10)
+
+    # 可视化焊枪碰撞球 + xiaoyu_tip_link 末端三轴（核实焊枪沿哪根局部轴=roll 轴）；注释此行即关闭可视化
+    # viz_tip_frame(cfg, solver)
+
     welds = load_welds(args.weld_json)
-    if args.limit > 0:
-        welds = welds[:args.limit]
+    if args.welds is not None:
+        want = set(args.welds)
+        welds = [w for w in welds if w["idx"] in want]
+        missing = sorted(want - {w["idx"] for w in welds})
+        if missing:
+            print(f"[solve] 警告：--welds 指定的 idx {missing} 不存在，已忽略")
+        if not welds:
+            raise SystemExit(f"[solve] --welds {sorted(want)} 在 {args.weld_json} 中均不存在")
     stem = os.path.splitext(os.path.basename(args.obj))[0]
 
     n_solved = 0
     for i, w in enumerate(welds):
         ts = time.time()
-        sol = solver.solve_one_weld_lookup(w, thetas, phis, diagnostic=args.diagnostic)
+        sol = solver.solve_one_weld_lookup(w, rot_x, rot_y, rot_z, diagnostic=args.diagnostic)
         dt = (time.time() - ts) * 1000.0
         if sol is None:
             print(f"[{i + 1:3d}/{len(welds)}] weld {w['idx']}: FAIL ({dt:.0f}ms)")
             continue
         n_solved += 1
         print(f"[{i + 1:3d}/{len(welds)}] weld {w['idx']}: OK ({dt:.0f}ms) "
-              f"θ={sol['theta_deg']:+.0f}° φ={sol['phi_deg']:+.0f}° "
-              f"upright={sol['upright_score']:.2f} cube={sol['cube_score']:.2f} "
+              f"αx={sol['rot_x_deg']:+.0f}° βy={sol['rot_y_deg']:+.0f}° γz={sol['rot_z_deg']:+.0f}° "
+              f"align={sol['align_score']:.2f} "
               f"d_link={sol['d_link']:.3f} d_ret={sol['d_retract']:.3f} "
               f"q={np.round(sol['q'], 3).tolist()}")
         target = to_save_format(w, sol, solver.joint_names)
-        fp = save_seam_pkl(args.out_dir, stem, w, target, args.obj, n_seg=args.n_seg)
+        fp = save_seam_pkl(args.out_dir, stem, w, target, args.obj, n_seg=cfg.plan_init_n_seg)
         print(f"      saved → {fp}")
         if args.viz:
-            show_lookup_solution(cfg, args.obj, w, sol)
+            show_lookup_solutions(cfg, args.obj, w, solver.last_all_solutions)
 
     print(f"[solve] done: {n_solved}/{len(welds)} 条求解成功，输出目录 "
           f"{os.path.join(args.out_dir, stem)}")
@@ -808,16 +1122,8 @@ def main():
     ap.add_argument("--obj", default=None, help="solve：工件 _part.obj")
     ap.add_argument("--weld-json", default=None, help="solve：焊缝 _weld_angle3.json")
     ap.add_argument("--out-dir", default="/tmp/plan_init_pose", help="solve：seam pkl 输出根目录")
-    ap.add_argument("--n-per-dof", type=int, default=7, help="solve：每关节采样档数，q_table=n^6")
-    ap.add_argument("--thetas-deg", default="0,15,-15,30,-30",
-                    help="solve：axis 沿 tangent 偏（drag/push）采样（度）")
-    ap.add_argument("--phis-deg", default="0,15,-15,30,-30",
-                    help="solve：axis 沿 normal 偏采样（度）。总采样=thetas×phis")
-    ap.add_argument("--collision-tolerance", type=float, default=0.03,
-                    help="solve：允许穿透阈值（米）")
-    ap.add_argument("--voxel-size", type=float, default=0.02, help="solve：工件 ESDF 体素大小（米）")
-    ap.add_argument("--n-seg", type=int, default=20, help="solve：seam_line 插值点数")
-    ap.add_argument("--limit", type=int, default=-1, help="solve：只处理前 N 条焊缝（-1=全部）")
+    ap.add_argument("--welds", nargs="+", type=int, default=None,
+                    help="solve：指定处理第几个焊缝(按 weld idx，可多个，如 --welds 0 3 5)；缺省=全部")
     ap.add_argument("--viz", action="store_true",
                     help="solve：每条成功焊缝开窗可视化（复用 show_init_space 的几何）")
     ap.add_argument("--diagnostic", action="store_true", help="solve：逐 (θ,φ) 诊断打印")
