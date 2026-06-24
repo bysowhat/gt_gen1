@@ -9,7 +9,10 @@
   · 目标焊缝   ：seam_line 折线，**红色直线**。
   · 每个 pose  ：在该观测位姿放一个相机（cam_pose 在 piece 系 → 经 piece_pose 变到 world）：
                  - 相机视锥（FOV 截头锥，用 scene_pose 同款 p1..p8，apex=光心、+z 朝焊缝）；
-                 - 光心一个小方块当相机机身；序列按青→黄渐变上色，便于看覆盖顺序。
+                 - 序列按青→黄渐变上色，便于看覆盖顺序。
+  · 真实相机   ：在【每个】观测位姿都额外放一个真实 USD 相机（FOV 取 scene_pose 同款，
+                 -z 光轴对齐 frustum 的 +z）。非 headless 下再开第 2 个视口窗口，用其中第
+                 --cam-index 个相机出图：一窗看全局俯视、另一窗看该相机的实拍视角。
 
 运行（带显示器）：
   conda run -n env_isaaclab python scripts/viz_goal_poses_isaacsim.py \
@@ -31,6 +34,8 @@ _ap.add_argument("--usd", default=None, help="工件 USD；缺省取 seam-pkl �
 _ap.add_argument("--save", required=True, help="compute_goal_poses.py --save 落盘的 goal poses pkl")
 _ap.add_argument("--result-index", type=int, default=0, help="save 里第几个 robot_pose 结果（默认 0）")
 _ap.add_argument("--variant", type=int, default=0, help="cam_pose 的第几个变体 K（默认 0）")
+_ap.add_argument("--cam-index", type=int, default=0,
+                 help="第 2 个视口用第几个观测位姿的真实相机出图（默认 0；每个位姿都会放真实相机）")
 _ap.add_argument("--fov-len", type=float, default=1.0,
                  help="视锥缩放：远平面再沿 +z 拉伸的倍数（1=原始 FOV，越大锥越长）")
 _ap.add_argument("--headless", action="store_true")
@@ -138,7 +143,7 @@ def spawn_seam_line(prefix, seam_pts, color=(1.0, 0.0, 0.0), thick=0.008):
 
 
 def spawn_camera(prefix, idx, pos_w, R_w, near, far, color):
-    """在一个观测位姿放相机：视锥截头锥（近矩形 + 远矩形 + 4 条侧棱 + 4 条 apex→近角）+ 光心机身小方块。"""
+    """在一个观测位姿放相机：视锥截头锥（近矩形 + 远矩形 + 4 条侧棱 + 4 条 apex→近角）。"""
     apex = np.asarray(pos_w, float)
     nw = apex + near @ R_w.T                            # (4,3) 近平面角点 world
     fw = apex + far @ R_w.T                             # (4,3) 远平面角点 world
@@ -150,11 +155,39 @@ def spawn_camera(prefix, idx, pos_w, R_w, near, far, color):
         spawn_segment(f"{prefix}/side{k}", f"c{idx}_side{k}", nw[k], fw[k], color, 0.004)
     for k in range(4):                                  # apex（光心）→近角，凸显视锥顶点=相机位置
         spawn_segment(f"{prefix}/apex{k}", f"c{idx}_apex{k}", apex, nw[k], color, 0.004)
+
+
+def spawn_real_camera(prim_path, pos_w, R_w, near):
+    """在一个观测位姿放【真实 USD 相机】并返回其 prim 路径。
+
+    约定：frustum 用 +z 当光轴（朝焊缝），而 USD 相机沿本地 -z 看 → 绕 x 转 180° 把 -z 对到 +z。
+    FOV 由近平面半宽高（fov_corners 同款 scene_pose 几何）反推 focal/aperture，使第 2 个视口的
+    取景与该位姿的视锥一致。
+    """
+    from pxr import UsdGeom, Gf
     from scipy.spatial.transform import Rotation as Rsp
-    quat = Rsp.from_matrix(R_w).as_quat()               # xyzw
-    _cuboid.VisualCuboid(prim_path=f"{prefix}/body", name=f"c{idx}_body", position=apex,
-                         orientation=np.r_[quat[3], quat[:3]], size=1.0,
-                         scale=np.array([0.04, 0.04, 0.03]), color=np.asarray(color, float))
+    import omni.usd
+    stage = omni.usd.get_context().get_stage()
+    cam = UsdGeom.Camera.Define(stage, prim_path)
+
+    R_cam = np.asarray(R_w, float) @ Rsp.from_euler("x", 180, degrees=True).as_matrix()
+    quat = Rsp.from_matrix(R_cam).as_quat()             # xyzw
+    xf = UsdGeom.Xformable(cam.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(float(pos_w[0]), float(pos_w[1]), float(pos_w[2])))
+    xf.AddOrientOp().Set(Gf.Quatf(float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2])))
+
+    half_x = abs(float(near[0][0]))                     # 0.135*scl
+    half_y = abs(float(near[0][1]))                     # 0.20*5/6*scl
+    z_near = float(near[0][2])                          # 0.4
+    h_aper = 20.955                                     # USD 默认水平光圈(mm)，作基准
+    focal = h_aper / (2.0 * (half_x / z_near))          # tan(hFOV/2)=half_x/z_near
+    v_aper = 2.0 * focal * (half_y / z_near)            # 保持竖直 FOV 与 frustum 一致
+    cam.GetFocalLengthAttr().Set(float(focal))
+    cam.GetHorizontalApertureAttr().Set(float(h_aper))
+    cam.GetVerticalApertureAttr().Set(float(v_aper))
+    cam.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 10.0))
+    return prim_path
 
 
 def spawn_workpiece(pth, usd_path, ppose):
@@ -212,7 +245,7 @@ def main():
     print(f"[viz] seam pkl : {seam_pkl}")
     print(f"[viz] 工件 USD : {usd_path}")
     print(f"[viz] goal pkl : {args.save}（result#{ri}/{len(results)}, 变体#{vi}/{K}）")
-    print(f"[viz] 焊缝点数 {len(seam_pts)}（红线）；观测相机 {B} 个（青→黄渐变）")
+    print(f"[viz] 焊缝点数 {len(seam_pts)}（红线）；观测相机 {B} 个（青→黄渐变，每个含真实 USD 相机）")
 
     world = World(stage_units_in_meters=1.0)
     zmin = min(float(seam_pts[:, 2].min()), min(float(p[2]) for p, _ in poses_w))
@@ -220,8 +253,11 @@ def main():
 
     spawn_workpiece("/World/workpiece", usd_path, piece_pose)
     spawn_seam_line("/World/seam", seam_pts, color=[1.0, 0.0, 0.0])
+    real_cam_paths = []
     for i, (pos_w, R_w) in enumerate(poses_w):
         spawn_camera(f"/World/cam/c{i}", i, pos_w, R_w, near, far, cam_color(i, B))
+        real_cam_paths.append(spawn_real_camera(f"/World/real_cam/c{i}", pos_w, R_w, near))
+    ci = max(0, min(args.cam_index, B - 1))             # 第 2 个视口取哪个真实相机
 
     world.reset()
 
@@ -233,7 +269,7 @@ def main():
     if args.headless:
         for _ in range(3):
             world.step(render=False)
-        print(f"已 spawn 工件 + 焊缝红线 + {B} 个观测相机。")
+        print(f"已 spawn 工件 + 焊缝红线 + {B} 个观测相机（含 {B} 个真实 USD 相机）。")
         print("VIZ_GOAL_POSES_DONE")
         simulation_app.close()
         return
@@ -243,7 +279,18 @@ def main():
         _set_lighting_mode("Grey Studio")
     except Exception:
         pass
-    print(f"播放中（关闭窗口结束）。红线=目标焊缝；{B} 个视锥=各观测位姿的相机，+z 朝焊缝。")
+
+    # 第 2 个视口窗口：用第 ci 个观测位姿的真实相机出图（实拍视角）
+    try:
+        from omni.kit.viewport.utility import create_viewport_window
+        vp_win = create_viewport_window(f"RealCam #{ci}", width=640, height=480)
+        vp_win.viewport_api.set_active_camera(real_cam_paths[ci])
+        print(f"[viz] 第 2 个视口 = 真实相机 #{ci} → {real_cam_paths[ci]}")
+    except Exception as e:
+        print(f"[viz] 第 2 个视口创建失败（忽略，仅主视口）：{e}")
+
+    print(f"播放中（关闭窗口结束）。红线=目标焊缝；{B} 个视锥=各观测位姿的相机，+z 朝焊缝；"
+          f"第 2 个视口=真实相机 #{ci} 实拍。")
     while simulation_app.is_running():
         world.step(render=True)
     simulation_app.close()
