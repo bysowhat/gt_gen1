@@ -1462,11 +1462,43 @@ def _kejian2_snap(R_cand, R_valid_list, snap_deg):
     return None, None
 
 
+def _link_z_in_base_batch(cfg, q_rows, link_name: str = "Link6"):
+    """批量 FK：给定关节角 q_rows (N,dof)，返回 link_name 坐标系 +z 轴在 base_link 系的方向 (N,3)。
+
+    复用机器人 yml（cfg.robot_cfg_path）另建一个【仅做 FK】的 CudaRobotModel——把 link_name 注入
+    kinematics.link_names（yml 默认 null，只跟踪 ee_link），get_link_poses 才能取到该 link 位姿；
+    不触碰 solver 的碰撞模型/查表。z 轴 = 该 link 在 base 的旋转矩阵第 3 列（quat wxyz → rotmat 第 2 列）。"""
+    import gt_gen.compat  # noqa: F401  warp shim，须在 import curobo 前
+    import torch
+    from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
+    from curobo.types.base import TensorDeviceType
+    from curobo.types.robot import RobotConfig
+    from curobo.util_file import load_yaml
+    ta = TensorDeviceType()
+    rd = load_yaml(cfg.robot_cfg_path)
+    kin = rd["robot_cfg"]["kinematics"]
+    ln = list(kin.get("link_names") or [])
+    if link_name not in ln:
+        ln.append(link_name)
+    kin["link_names"] = ln
+    robot_cfg = RobotConfig.from_dict(rd["robot_cfg"], ta)
+    kin_model = CudaRobotModel(robot_cfg.kinematics)   # RobotConfig.kinematics 是 Config，需包成 model 才能 FK
+    q = torch.as_tensor(np.asarray(q_rows, dtype=np.float64), device=ta.device, dtype=ta.dtype)
+    if q.ndim == 1:
+        q = q.unsqueeze(0)
+    with torch.no_grad():
+        pose = kin_model.get_link_poses(q, [link_name])
+    R = quat_wxyz_to_rotmat_batch(pose.quaternion.reshape(-1, 4))   # (N,3,3) 列=各轴在 base
+    z = R[:, :, 2]                                                  # +z 轴在 base
+    return z.detach().cpu().numpy().astype(np.float64)
+
+
 def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
     """挨个可视化 kejian2 结果（正手→反手），每 stride 个抽 1 个（取每条手内第 1,1+stride,… 个）。
 
-    同一个窗口里按【C 键】切到下一个，不关窗口（到最后一个再按 C 即关闭）；切换时窗口标题与控制台
-    都写清「正手/反手 第 i/N 个」。几何复用 plan_init_pose.py 风格的 _lookup_solution_geoms（整臂碰撞球
+    每个位姿单开一个窗口（窗口标题写清「正手/反手 第 i/N 个」）；按【C 键】切到下一个、相机视角自动沿用
+    （open3d 0.19 的 legacy Visualizer 无法对存活窗口改标题，故只能每个换新窗口才能让标题随之变化）；
+    直接关窗（不按 C）则退出。几何复用 plan_init_pose.py 风格的 _lookup_solution_geoms（整臂碰撞球
     @ joint_angles + 工件 mesh @ T_workpiece_in_base + 绿色焊缝线 + standoff 落枪点）；sol 由 result 适配。"""
     import open3d as o3d
     step = max(1, int(stride))
@@ -1481,51 +1513,57 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
         print("[kejian2] 无可视化结果")
         return
     n = len(items)
-    print(f"[kejian2] 可视化 {n} 个（每 {step} 个抽 1；按 C 切下一个，最后一个再按 C 关闭）")
+    print(f"[kejian2] 可视化 {n} 个（每 {step} 个抽 1；按 C 切下一个，直接关窗退出）")
 
-    def _label(idx):
-        hand_label, i, N, _ = items[idx]
-        return f"{hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）"
+    cam = {"params": None}   # 跨窗口沿用相机视角，避免每次切换都重置
+    idx = 0
+    while idx < n:
+        hand_label, i, N, sol = items[idx]
+        title = f"kejian2: {hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）— 按 C 下一个 / 关窗退出"
+        print(f"[viz] {hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）")
+        vis = o3d.visualization.VisualizerWithKeyCallback()
+        vis.create_window(window_name=title)
+        for g in _lookup_solution_geoms(cfg, obj_fp, weld, sol):
+            vis.add_geometry(g)
+        if cam["params"] is not None:
+            try:
+                vis.get_view_control().convert_from_pinhole_camera_parameters(
+                    cam["params"], allow_arbitrary=True)
+            except Exception:
+                pass            # 窗口尺寸/版本不兼容时退回默认视角，不致命
+        advance = {"go": False}
 
-    state = {"i": 0}
-
-    def _load(vis, idx, reset):
-        vis.clear_geometries()
-        for g in _lookup_solution_geoms(cfg, obj_fp, weld, items[idx][3]):
-            vis.add_geometry(g, reset_bounding_box=reset)
-        try:
-            vis.update_window_title(f"kejian2: {_label(idx)}（按 C 切下一个）")
-        except Exception:
-            pass            # 老版 open3d 无 update_window_title 时仅靠控制台打印
-        print(f"[viz] {_label(idx)}（按 C 看下一个）")
-
-    def _next(vis):
-        state["i"] += 1
-        if state["i"] >= n:
-            print(f"[viz] 已是最后一个（{n}/{n}），关闭窗口")
-            vis.close()
+        def _next(v):
+            advance["go"] = True
+            v.close()           # 关掉当前窗口 → 退出 run() → 外层 while 开下一个（标题随之变）
             return False
-        _load(vis, state["i"], reset=False)   # 切换不重置视角，保留用户当前相机
-        return False
 
-    vis = o3d.visualization.VisualizerWithKeyCallback()
-    vis.create_window(window_name=f"kejian2: {_label(0)}（按 C 切下一个）")
-    vis.register_key_callback(ord("C"), _next)
-    _load(vis, 0, reset=True)   # 第 1 个 fit 一次视角
-    vis.run()
-    vis.destroy_window()
+        vis.register_key_callback(ord("C"), _next)
+        vis.run()
+        try:
+            cam["params"] = vis.get_view_control().convert_to_pinhole_camera_parameters()
+        except Exception:
+            pass
+        vis.destroy_window()
+        if not advance["go"]:
+            print("[viz] 直接关窗，结束可视化")
+            break               # 用户没按 C 而是关窗 → 退出
+        idx += 1
 
 
 def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
                            viz: bool = False) -> Dict[str, list]:
-    """新逻辑求解（lookup 关节角采样 + 允许朝向 snap + 正反手分类）：
-    返回 {"forehand":[...], "backhand":[...]}（正手=bisector 在 base-x 分量<0）。
+    """新逻辑求解（lookup 关节角采样 + 允许朝向 snap + 正面过滤 + 正反手分类）：
+    返回 {"forehand":[...], "backhand":[...]}。
 
     ① InitPoseLookupSolver（n^6 关节角采样，复用本文件已自带的求解器）对本焊缝反解出候选工件位姿
        (R,t,q)，并用「整臂/retract 碰撞球 vs 工件 ESDF」过滤掉碰撞解（= plan_init_pose 原逻辑碰撞）；
     ② 从候选里挑「旋转 R 与 4 种允许朝向某一种 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、
        重算 t 让焊枪尖端（FK ee_pos）仍精确落在焊缝 standoff 点（snap 后不复检范围/碰撞）；
-    ③ 按 bisector 在 base-x 分量正负分正手/反手。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
+    ③ 过滤：焊缝中心点须在 base 系 x>0；焊缝须在「正面」——bisector（背离工件=焊枪 approach 方向）
+       在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃；
+    ④ 正反手按【Link6 坐标系 +z 轴】在 base-x 的分量定：负 x 方向=正手，正 x 方向=反手（只看关节构型，
+       与工件朝向无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
     from gt_gen.config import load_config
 
     cfg = load_config()
@@ -1569,6 +1607,10 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     bis_world = np.asarray(weld["bisector_world"], dtype=np.float64)
     target_world = mid_world + standoff * bis_world      # 焊枪尖端目标点（mesh world 系）
 
+    # 正反手判据所需：批量 FK 出每个候选 q 的 Link6 +z 轴在 base 的方向（与工件朝向无关，只看关节构型）
+    q_all = np.stack([np.asarray(s["q"], dtype=np.float64) for s in cands], axis=0)
+    link6_z_base = _link_z_in_base_batch(cfg2, q_all, "Link6")    # (N,3)
+
     def _T(R, t):
         T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
         return T
@@ -1578,10 +1620,12 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         return (xy_lo <= r <= xy_hi) and (z_lo <= float(p[2]) <= z_hi)
 
     results = []
-    n_hit = 0
+    n_hit = 0          # 朝向 snap 命中数
+    n_back = 0         # 因「焊缝在背面」(bisector base-z<0) 丢弃
+    n_xneg = 0         # 因「焊缝中心点 base-x<=0」丢弃
     seen = set()
-    for sol in cands:
-        # （req#1, pre-snap）焊缝中点也须在范围内（起/终已由 lookup 端点检查、尖端由 precompute 保证）
+    for i, sol in enumerate(cands):
+        # （pre-snap）焊缝中点也须在径向/z 范围内（起/终已由 lookup 端点检查、尖端由 precompute 保证）
         if not _in_ws(np.asarray(sol["mid_in_base"], dtype=np.float64)):
             continue
         oid, Rv = _kejian2_snap(sol["R"], R_valid_list, snap_deg)
@@ -1590,19 +1634,32 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         n_hit += 1
         ee_pos = np.asarray(sol["ee_pos_in_base"], dtype=np.float64)
         t_new = ee_pos - Rv @ target_world           # 重算平移：焊枪尖端仍落在 standoff 点（snap 后不复检）
+
+        bis_base = Rv @ bis_world
+        bis_base = bis_base / (np.linalg.norm(bis_base) + 1e-12)
+        # （req）焊缝须在正面——bisector(背离工件=焊枪 approach 方向)在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃
+        if float(bis_base[2]) < 0.0:
+            n_back += 1
+            continue
+        # （req）焊缝中心点在 base 必须 x>0（snap 后真实焊缝中点 = ee_pos − standoff·bisector_base）
+        seam_center_base = ee_pos - standoff * bis_base
+        if float(seam_center_base[0]) <= 0.0:
+            n_xneg += 1
+            continue
+
         key = (oid, round(float(t_new[0]), 2), round(float(t_new[1]), 2), round(float(t_new[2]), 2))
         if key in seen:                              # 轻去重：同朝向 + 同位置(2cm 粒度)只留一份
             continue
         seen.add(key)
 
-        bis_base = Rv @ bis_world
-        bis_base = bis_base / (np.linalg.norm(bis_base) + 1e-12)
         R0_ee = _align_rotmat([1.0, 0.0, 0.0], bis_base)   # 末端局部 +x → bisector_base
         goal_quat = rotmat_to_quat_wxyz(R0_ee)
         goal_pose7 = np.concatenate([ee_pos, goal_quat])   # 位置= standoff 落枪点(=ee_pos)
-        if abs(float(bis_base[0])) < 1e-9:
-            print(f"[kejian2] 警告：候选 oid={oid} bisector base-x 分量≈0，归为正手")
-        hand = "forehand" if float(bis_base[0]) < 0.0 else "backhand"
+        # （req）正反手按 Link6 坐标系 +z 轴在 base-x 的分量定：负 x=正手 / 正 x=反手（只看关节构型）
+        z6 = link6_z_base[i]
+        if abs(float(z6[0])) < 1e-9:
+            print(f"[kejian2] 警告：候选 i={i} Link6 +z 轴 base-x 分量≈0，归为正手")
+        hand = "forehand" if float(z6[0]) < 0.0 else "backhand"
         results.append({
             "workpiece_pose7": mat44_to_pose7(_T(Rv, t_new)),
             "T_workpiece_in_base": _T(Rv, t_new),
@@ -1612,14 +1669,16 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
             "rot_y_deg": float(sol["rot_y_deg"]),
             "rot_z_deg": float(sol["rot_z_deg"]),
             "bisector_base": np.asarray(bis_base, dtype=np.float64),
+            "link6_z_base": np.asarray(z6, dtype=np.float64),
+            "seam_center_base": np.asarray(seam_center_base, dtype=np.float64),
             "orientation_id": int(oid),
             "hand": hand,
         })
 
     fore = [r for r in results if r["hand"] == "forehand"]
     back = [r for r in results if r["hand"] == "backhand"]
-    print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 去重后合格 {len(results)} "
-          f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
+    print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 背面丢 {n_back} / x<=0 丢 {n_xneg} "
+          f"→ 去重后合格 {len(results)}（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
 
     if viz and results:
         _show_kejian2_results(cfg2, obj_fp, weld, {"forehand": fore, "backhand": back}, stride=5)
