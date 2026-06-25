@@ -123,12 +123,16 @@ plan_init_pose_kejian2:                  # lookup(n^6 关节角采样, 复用 pl
   #      每条焊缝 batch 反解出候选工件位姿 (R,t,q)，并用「整臂/retract 碰撞球 vs 工件 ESDF」过滤掉碰撞解；
   #   ② 从候选里挑「旋转 R 与 4 种允许朝向（lay_flat / 沿最长轴翻180° / 沿垂直地面轴翻180° / 两者皆翻；
   #      最长轴 ⊥ base-x）某一种的 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、重算 t 让焊枪尖端
-  #      仍落在焊缝 standoff 点（snap 后不复检）；③ 过滤：焊缝中心点须在 base-x>0；且焊缝须在「正面」
-  #      （bisector 在 base-z 分量<0 ⇒ 焊缝朝下=背面，丢弃）；④ 按【bisector】在 base-x 的
-  #      分量分「正手(与 base-x 反向=负x) / 反手(否则)」（焊缝几何，与关节构型无关）。
+  #      仍落在焊缝 standoff 点（snap 后不复检）；③ 过滤：焊缝中心点须在 base-x>0；焊缝须在「正面」
+  #      （bisector 在 base-z 分量<0 ⇒ 焊缝朝下=背面，丢弃）；且固定底座(xiaoyu_base_link)碰撞球与工件
+  #      在 base-xy 投影不能相交（相交=机械臂压在工件下，丢弃；工件投影取顶点 2D 凸包）；④ 按【bisector】
+  #      在 base-x 的分量分「正手(与 base-x 反向=负x) / 反手(否则)」（焊缝几何，与关节构型无关）。
   ee_xy_range_m: [0.4, 1.0]             # 焊缝点 xy 平面到 base_link 原点距离 [下限,上限]（米）
   ee_z_range_m: [-0.1, 0.1]             # 焊缝点在 base_link 系 z [下限,上限]（米）
-  n_per_dof: 12                         # 每关节采样档数，q_table = n_per_dof^6
+  n_per_dof: [10, 24, 24, 24, 36, 36]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,949,120（≈ 旧 12^6=2.99M，不易 OOM）。
+                                        #   也可填标量(如 12)=各关节同档(=n^6，旧行为)。本表：基座 joint0/1/2 取 16(定位更细)，
+                                        #   腕部 joint3/4 取 10/12，joint5(腕滚 ±6.2rad，与 rot_x roll 冗余) 取 6。
+                                        #   想加精度就调大对应关节；显存≈幸存者数×碰撞球，先小步加。改了此值须重算关节表缓存。
   collision_tolerance_m: 0.00           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
   voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
   standoff_cm: 2.0                      # 焊枪头落点沿 bisector（远离工件方向）外移的 standoff 距离（cm）

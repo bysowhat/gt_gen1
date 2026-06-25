@@ -360,6 +360,22 @@ def to_save_format(weld: Dict, sol: Dict, joint_names: List[str]) -> Dict:
     }
 
 
+def _as_n_per_dof_list(n_per_dof, n_dof: int = 6) -> List[int]:
+    """把 n_per_dof 规整成「每关节采样档数」列表 [n0..n_{n_dof-1}]：
+      · 标量 int   → 各关节同档（与旧行为完全一致，q_table = n^n_dof）；
+      · 列表/元组  → 各关节各自档数（须长度 = n_dof，q_table = ∏ ni）。
+    用于 link1..link6 分别给不同采样档数。每项须 ≥1。"""
+    if isinstance(n_per_dof, (list, tuple, np.ndarray)):
+        ns = [int(v) for v in n_per_dof]
+        if len(ns) != n_dof:
+            raise ValueError(f"n_per_dof 列表长度 {len(ns)} 与关节数 {n_dof} 不一致：{n_per_dof}")
+    else:
+        ns = [int(n_per_dof)] * n_dof
+    if any(v < 1 for v in ns):
+        raise ValueError(f"n_per_dof 每项须 ≥1：{ns}")
+    return ns
+
+
 # ---- 求解器（移植 ArmPoseSolver voxel 子集 + Lookup 子类） ----
 class InitPoseLookupSolver:
     """查表式初始位姿求解器（裸 cuRobo RobotWorld + 工件 ESDF voxel 碰撞）。
@@ -549,12 +565,12 @@ class InitPoseLookupSolver:
         n_dof = len(low)
         assert n_dof == 6, f"expected 6 DoF, got {n_dof}"
 
-        n = self.n_per_dof
-        N = n ** n_dof
+        ns = _as_n_per_dof_list(self.n_per_dof, n_dof)   # 每关节采样档数 [n0..n_{n_dof-1}]
+        N = int(np.prod(ns))
         self.N = N
-        print(f"[lookup] sampling {n}^{n_dof} = {N} joint configs in limits")
+        print(f"[lookup] sampling {'×'.join(str(v) for v in ns)} = {N} joint configs in limits")
         for i, (lo, hi) in enumerate(zip(low, high)):
-            print(f"  joint {i}: [{lo:.3f}, {hi:.3f}]")
+            print(f"  joint {i}: [{lo:.3f}, {hi:.3f}]  (n={ns[i]})")
 
         # —— 过滤范围（base_link 系焊枪末端约束）：从 cfg / default.yaml 读取 ——
         ee_xy_range = self.cfg.plan_init_ee_xy_range
@@ -568,9 +584,10 @@ class InitPoseLookupSolver:
 
         # 逐块生成关节角（按 flat 索引 unravel 取网格值，免物化全量 meshgrid）→ FK → 当场过滤，
         # 只把【满足约束】的幸存者堆到 GPU，避免 n_per_dof 大时 n^6 个 link_spheres OOM。
-        grids = [np.linspace(lo, hi, n).astype(np.float32) for lo, hi in zip(low, high)]
-        shape = (n,) * n_dof
-        chunk = 4096
+        grids = [np.linspace(lo, hi, ni).astype(np.float32)
+                 for (lo, hi), ni in zip(zip(low, high), ns)]
+        shape = tuple(int(v) for v in ns)
+        chunk = 128
         q_keep, ee_pos_keep, ee_x_keep, ee_rot_keep, link_keep = [], [], [], [], []
         n_before = N
         n_after = 0
@@ -662,7 +679,7 @@ class InitPoseLookupSolver:
             "retract_spheres_t": self.retract_spheres_t.cpu(),
             "K_link": int(self.K_link),
             "N": int(self.N),
-            "n_per_dof": int(self.n_per_dof),
+            "n_per_dof": _as_n_per_dof_list(self.n_per_dof),
             "joint_names": list(self.joint_names),
         }
         torch.save(payload, path)
@@ -684,10 +701,15 @@ class InitPoseLookupSolver:
             print(f"[lookup] joint_table 不存在，未加载：{path}")
             return False
         payload = torch.load(path, map_location=self.tensor_args.device)
-        saved_n = int(payload.get("n_per_dof", -1))
-        if saved_n != int(self.n_per_dof):
+        saved_raw = payload.get("n_per_dof", None)
+        if saved_raw is None:
             raise RuntimeError(
-                f"joint_table n_per_dof={saved_n} 与当前 solver n_per_dof={self.n_per_dof} 不一致："
+                f"joint_table 缺 n_per_dof 元信息，无法校验：{path}（请重新 precompute_joint_table+save_joint_table）")
+        saved_n = _as_n_per_dof_list(saved_raw)
+        cur_n = _as_n_per_dof_list(self.n_per_dof)
+        if saved_n != cur_n:
+            raise RuntimeError(
+                f"joint_table n_per_dof={saved_n} 与当前 solver n_per_dof={cur_n} 不一致："
                 f"{path}（请用一致的 n_per_dof，或重新 precompute_joint_table+save_joint_table）")
         dev, dt = self.tensor_args.device, self.tensor_args.dtype
         self.q_table_t = payload["q_table_t"].to(device=dev, dtype=dt)
@@ -775,28 +797,35 @@ class InitPoseLookupSolver:
                             return (xy >= xy_lo) & (xy <= xy_hi) & (z >= z_lo) & (z <= z_hi)
                         endpoints_ok = _in_ws(p0_base) & _in_ws(p1_base)   # (N,) 起+终都在范围内
 
-                        # 球反变到 mesh_world：p_world = R^T @ (p_base - t)
+                        # 球反变到 mesh_world：p_world = R^T @ (p_base - t)。
+                        # 整臂/retract 碰撞球世界坐标张量 (N,K,4) 单条就 ~1.7GB，幸存者一多即 OOM；
+                        # 故【按 chunk 逐块构造 + 查询】，峰值显存只与 chunk 相关、与幸存者总数 N 无关。
                         link_xyz_b = self.link_spheres_t[..., :3]
                         link_r = self.link_spheres_t[..., 3]
-                        deltas_link = link_xyz_b - t_arr[:, None, :]
-                        link_xyz_w = torch.einsum("nji,nkj->nki", R, deltas_link)
-                        link_spheres_w = torch.cat([link_xyz_w, link_r.unsqueeze(-1)], dim=-1)
-
                         ret_xyz_b = self.retract_spheres_t[:, :3]
                         ret_r = self.retract_spheres_t[:, 3]
-                        ret_xyz_b_n = ret_xyz_b[None, :, :].expand(N, -1, -1)
-                        deltas_ret = ret_xyz_b_n - t_arr[:, None, :]
-                        ret_xyz_w = torch.einsum("nji,nkj->nki", R, deltas_ret)
-                        ret_r_n = ret_r[None, :].expand(N, -1)
-                        ret_spheres_w = torch.cat([ret_xyz_w, ret_r_n.unsqueeze(-1)], dim=-1)
 
                         chunk = 8192
                         d_link_list, d_ret_list = [], []
                         for i in range(0, N, chunk):
+                            sl = slice(i, min(i + chunk, N))
+                            R_c = R[sl]                               # (c,3,3)
+                            t_c = t_arr[sl]                           # (c,3)
+                            m = R_c.shape[0]
+                            # 整臂连杆球（每条候选用各自 q 的 link_spheres + 该 R,t 反变到 mesh world）
+                            deltas_link_c = link_xyz_b[sl] - t_c[:, None, :]
+                            link_xyz_w_c = torch.einsum("nji,nkj->nki", R_c, deltas_link_c)
+                            link_spheres_w_c = torch.cat(
+                                [link_xyz_w_c, link_r[sl].unsqueeze(-1)], dim=-1)
+                            # retract 球（球本身与 q 无关，但每条候选用各自 R,t 反变）
+                            deltas_ret_c = ret_xyz_b[None, :, :].expand(m, -1, -1) - t_c[:, None, :]
+                            ret_xyz_w_c = torch.einsum("nji,nkj->nki", R_c, deltas_ret_c)
+                            ret_spheres_w_c = torch.cat(
+                                [ret_xyz_w_c, ret_r[None, :].expand(m, -1).unsqueeze(-1)], dim=-1)
                             d_link_list.append(
-                                self._voxel_collision_distance_batch(link_spheres_w[i:i + chunk]))
+                                self._voxel_collision_distance_batch(link_spheres_w_c))
                             d_ret_list.append(
-                                self._voxel_collision_distance_batch(ret_spheres_w[i:i + chunk]))
+                                self._voxel_collision_distance_batch(ret_spheres_w_c))
                         d_link = torch.cat(d_link_list)
                         d_ret = torch.cat(d_ret_list)
 
@@ -1467,6 +1496,94 @@ def _kejian2_snap(R_cand, R_valid_list, snap_deg):
     return None, None
 
 
+# —— 固定底座 vs 工件 在 base-xy 平面投影的相交过滤（机械臂不能压在工件下 / 工件不能盖在底座上）——
+_FIXED_BASE_LINK = "xiaoyu_base_link"   # 「固定底座」：不随关节运动，碰撞球 q 无关，可只算一次
+
+
+def _fixed_base_xy_circles(cfg) -> List[Tuple[np.ndarray, float]]:
+    """固定底座 (_FIXED_BASE_LINK) 的碰撞球在 base-xy 平面的投影圆列表 [(中心(2,), 半径), …]。
+    底座不随关节动，球位姿与 q 无关，用 retract_config 算一次即可。"""
+    from gt_gen.obstacle_placement import compute_link_sweep
+    per_wp, _ = compute_link_sweep(cfg, [cfg.retract_config], [_FIXED_BASE_LINK])
+    sph = per_wp.get(_FIXED_BASE_LINK)
+    circles: List[Tuple[np.ndarray, float]] = []
+    if sph is None:
+        return circles
+    for c in np.asarray(sph, float)[0]:                  # (S,4) 取唯一路点
+        cx, cy, _cz, r = (float(v) for v in c)
+        if r <= 1e-4:
+            continue
+        circles.append((np.array([cx, cy], dtype=np.float64), r))
+    return circles
+
+
+def _load_mesh_vertices(obj_fp: str) -> Optional[np.ndarray]:
+    """读工件 mesh 顶点 (N,3)（mesh 局部系，与 InitPoseLookupSolver 同一份 obj）。读不到返回 None。"""
+    try:
+        import open3d as o3d
+        m = o3d.io.read_triangle_mesh(obj_fp)
+        v = np.asarray(m.vertices, dtype=np.float64)
+        return v if v.size else None
+    except Exception:
+        return None
+
+
+def _xy_convex_hull(points_xy: np.ndarray) -> np.ndarray:
+    """2D 凸包顶点（按序）。点数 < 3 或退化时原样返回。"""
+    pts = np.asarray(points_xy, dtype=np.float64)
+    if pts.shape[0] < 3:
+        return pts
+    try:
+        from scipy.spatial import ConvexHull
+        return pts[ConvexHull(pts).vertices]
+    except Exception:
+        return pts
+
+
+def _point_in_poly(pt, poly) -> bool:
+    """射线法：点 pt(2,) 是否在多边形 poly(M,2) 内。"""
+    x, y = float(pt[0]), float(pt[1])
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(poly[i][0]), float(poly[i][1])
+        xj, yj = float(poly[j][0]), float(poly[j][1])
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-300) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _seg_point_dist(p, a, b) -> float:
+    """点 p 到线段 ab 的最短距离（2D）。"""
+    p = np.asarray(p, dtype=np.float64)
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    ab = b - a
+    denom = float(ab @ ab)
+    t = 0.0 if denom <= 1e-18 else max(0.0, min(1.0, float((p - a) @ ab) / denom))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
+def _circle_poly_intersect(c, r: float, poly) -> bool:
+    """圆(心 c(2,), 半径 r) 与多边形 poly(M,2) 是否相交（含互相包含）。"""
+    if _point_in_poly(c, poly):                          # 圆心在多边形内（或圆完全套住小多边形时其顶点也在圆内→下方边距判得到）
+        return True
+    n = len(poly)
+    for i in range(n):
+        if _seg_point_dist(c, poly[i], poly[(i + 1) % n]) <= r:
+            return True
+    return False
+
+
+def _base_overlaps_workpiece(base_circles, hull_poly) -> bool:
+    """固定底座任一投影圆 与 工件 XY 凸包 相交即判「机械臂压在工件下」。"""
+    if not base_circles or hull_poly is None or len(hull_poly) < 3:
+        return False
+    return any(_circle_poly_intersect(c, r, hull_poly) for c, r in base_circles)
+
+
 def _link_pose_in_base_batch(cfg, q_rows, link_name: str = "Link6"):
     """批量 FK：给定关节角 q_rows (N,dof)，返回 link_name 在 base_link 系的 (原点位置 (N,3), +z 轴 (N,3))。
 
@@ -1654,7 +1771,8 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     ② 从候选里挑「旋转 R 与 4 种允许朝向某一种 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、
        重算 t 让焊枪尖端（FK ee_pos）仍精确落在焊缝 standoff 点（snap 后不复检范围/碰撞）；
     ③ 过滤：焊缝中心点须在 base 系 x>0；焊缝须在「正面」——bisector（背离工件=焊枪 approach 方向）
-       在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃；
+       在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃；且【固定底座(xiaoyu_base_link)碰撞球 与 工件】在
+       base-xy 平面投影不能相交（相交=机械臂压在工件下/工件盖在底座上，丢弃；工件投影取顶点 2D 凸包）；
     ④ 正反手按【bisector】在 base-x 的分量定：与 base-x 反向(负 x)=正手，否则=反手（焊缝几何，
        与关节构型无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
     from gt_gen.config import load_config
@@ -1708,10 +1826,19 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         r = float(np.hypot(p[0], p[1]))
         return (xy_lo <= r <= xy_hi) and (z_lo <= float(p[2]) <= z_hi)
 
+    # —— ③' 固定底座 vs 工件 base-xy 投影相交过滤的预备：底座圆(q 无关，一次)+ 工件顶点(一次) ——
+    base_circles = _fixed_base_xy_circles(cfg2)
+    mesh_v = _load_mesh_vertices(obj_fp)
+    if not base_circles:
+        print("[kejian2] 警告：取不到固定底座碰撞球，跳过「底座-工件 XY 相交」过滤")
+    if mesh_v is None:
+        print("[kejian2] 警告：读不到工件顶点，跳过「底座-工件 XY 相交」过滤")
+
     results = []
     n_hit = 0          # 朝向 snap 命中数
     n_back = 0         # 因「焊缝在背面」(bisector base-z<0) 丢弃
     n_xneg = 0         # 因「焊缝中心点 base-x<=0」丢弃
+    n_overlap = 0      # 因「固定底座与工件在 base-xy 投影相交」丢弃
     seen = set()
     for i, sol in enumerate(cands):
         # （pre-snap）焊缝中点也须在径向/z 范围内（起/终已由 lookup 端点检查、尖端由 precompute 保证）
@@ -1735,6 +1862,14 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         if float(seam_center_base[0]) <= 0.0:
             n_xneg += 1
             continue
+
+        # （req）固定底座与工件在 base-xy 平面投影不能相交：相交 ⇒ 机械臂压在工件下/工件盖在底座上，丢弃
+        if base_circles and mesh_v is not None:
+            v_base_xy = (mesh_v @ Rv.T)[:, :2] + t_new[:2]   # 工件顶点变换到 base 系后取 xy
+            hull = _xy_convex_hull(v_base_xy)
+            if _base_overlaps_workpiece(base_circles, hull):
+                n_overlap += 1
+                continue
 
         key = (oid, round(float(t_new[0]), 2), round(float(t_new[1]), 2), round(float(t_new[2]), 2))
         if key in seen:                              # 轻去重：同朝向 + 同位置(2cm 粒度)只留一份
@@ -1765,7 +1900,8 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     fore = [r for r in results if r["hand"] == "forehand"]
     back = [r for r in results if r["hand"] == "backhand"]
     print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 背面丢 {n_back} / x<=0 丢 {n_xneg} "
-          f"→ 去重后合格 {len(results)}（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
+          f"/ 底座-工件XY相交丢 {n_overlap} → 去重后合格 {len(results)}"
+          f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
 
     if viz and results:
         _show_kejian2_results(cfg2, obj_fp, weld, {"forehand": fore, "backhand": back}, stride=5)

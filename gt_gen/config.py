@@ -266,9 +266,14 @@ class Config:
         return list(self._kejian2.get("ee_z_range_m", [-0.1, 0.1]))
 
     @property
-    def plan_init_kejian2_n_per_dof(self) -> int:
-        """lookup 每关节采样档数，q_table = n_per_dof^6。见 plan_init_pose_kejian2.n_per_dof。"""
-        return int(self._kejian2.get("n_per_dof", 12))
+    def plan_init_kejian2_n_per_dof(self):
+        """lookup 每关节采样档数。见 plan_init_pose_kejian2.n_per_dof。
+        · 标量 → 各关节同档（q_table = n^6，旧行为）；
+        · 列表 [n0..n5] → link1..link6 各自档数（q_table = ∏ ni），用于按关节调采样精度/显存。"""
+        v = self._kejian2.get("n_per_dof", 12)
+        if isinstance(v, (list, tuple)):
+            return [int(x) for x in v]
+        return int(v)
 
     @property
     def plan_init_kejian2_collision_tolerance(self) -> float:
