@@ -193,6 +193,124 @@ class Config:
         与 goal.standoff_cm 同义但作用于初始位姿求解。见 default.yaml plan_init_pose.standoff_cm。"""
         return float(self.raw.get("plan_init_pose", {}).get("standoff_cm", 0.0)) / 100.0
 
+    # ---- plan_init_pose_kejian（新逻辑：固定朝向 + 平移网格 + STOMP 可达，见 scripts/plan_init_pose_kejian.py） ----
+    @property
+    def _kejian(self) -> dict:
+        return self.raw.get("plan_init_pose_kejian", {})
+
+    @property
+    def plan_init_kejian_ee_xy_range(self) -> list:
+        """焊缝点在 base_link 系 xy 平面到原点距离的 [下限,上限]（米）。见 plan_init_pose_kejian.ee_xy_range_m。"""
+        return list(self._kejian.get("ee_xy_range_m", [0.4, 1.0]))
+
+    @property
+    def plan_init_kejian_ee_z_range(self) -> list:
+        """焊缝点在 base_link 系 z 的 [下限,上限]（米）。见 plan_init_pose_kejian.ee_z_range_m。"""
+        return list(self._kejian.get("ee_z_range_m", [-0.1, 0.1]))
+
+    @property
+    def plan_init_kejian_standoff(self) -> float:
+        """goal 落点沿 bisector（远离工件方向）外移的 standoff 距离（米）。见 plan_init_pose_kejian.standoff_cm。"""
+        return float(self._kejian.get("standoff_cm", 0.0)) / 100.0
+
+    @property
+    def plan_init_kejian_xyz_step(self) -> list:
+        """工件平移网格步长 [dx,dy,dz]（米，base 系）。见 plan_init_pose_kejian.xyz_step_m。"""
+        return list(self._kejian.get("xyz_step_m", [0.15, 0.15, 0.05]))
+
+    @property
+    def plan_init_kejian_rot_x_deg(self) -> list:
+        """goal 绕末端局部 +x 轴（焊枪自转 roll）采样 [min,max,step]（度）。见 plan_init_pose_kejian.rot_x_deg。"""
+        return list(self._kejian.get("rot_x_deg", [-180.0, 180.0, 30.0]))
+
+    @property
+    def plan_init_kejian_rot_y_deg(self) -> list:
+        """goal 绕末端局部 +y 轴（tilt）采样 [min,max,step]（度）。见 plan_init_pose_kejian.rot_y_deg。"""
+        return list(self._kejian.get("rot_y_deg", [-30.0, 30.0, 15.0]))
+
+    @property
+    def plan_init_kejian_rot_z_deg(self) -> list:
+        """goal 绕末端局部 +z 轴（tilt）采样 [min,max,step]（度）。见 plan_init_pose_kejian.rot_z_deg。"""
+        return list(self._kejian.get("rot_z_deg", [-30.0, 30.0, 15.0]))
+
+    @property
+    def plan_init_kejian_ik_return_seeds(self) -> int:
+        """预筛阶段每个 goal 朝向 IK 取回的候选解数。见 plan_init_pose_kejian.ik_return_seeds。"""
+        return int(self._kejian.get("ik_return_seeds", 30))
+
+    @property
+    def plan_init_kejian_ik_num_seeds(self) -> int:
+        """预筛专用 IK 的并行随机起点数（须 ≥ ik_return_seeds）。见 plan_init_pose_kejian.ik_num_seeds。
+        不复用 planner.ik_num_seeds(200)：批量 IK 峰值显存≈ik_batch×num_seeds，200 会 OOM。"""
+        return int(self._kejian.get("ik_num_seeds", 60))
+
+    @property
+    def plan_init_kejian_ik_batch(self) -> int:
+        """预筛批量 IK 的分块大小：每次送多少个 goal 朝向进 solve_batch（峰值显存≈ik_batch×ik_num_seeds）。
+        见 plan_init_pose_kejian.ik_batch。"""
+        return int(self._kejian.get("ik_batch", 24))
+
+    # ---- plan_init_pose_kejian2（lookup n^6 关节角采样 + 允许朝向 snap + 正反手分类，见 scripts/plan_init_pose_kejian2.py） ----
+    @property
+    def _kejian2(self) -> dict:
+        return self.raw.get("plan_init_pose_kejian2", {})
+
+    @property
+    def plan_init_kejian2_ee_xy_range(self) -> list:
+        """焊缝点在 base_link 系 xy 平面到原点距离的 [下限,上限]（米）。见 plan_init_pose_kejian2.ee_xy_range_m。"""
+        return list(self._kejian2.get("ee_xy_range_m", [0.4, 1.0]))
+
+    @property
+    def plan_init_kejian2_ee_z_range(self) -> list:
+        """焊缝点在 base_link 系 z 的 [下限,上限]（米）。见 plan_init_pose_kejian2.ee_z_range_m。"""
+        return list(self._kejian2.get("ee_z_range_m", [-0.1, 0.1]))
+
+    @property
+    def plan_init_kejian2_n_per_dof(self) -> int:
+        """lookup 每关节采样档数，q_table = n_per_dof^6。见 plan_init_pose_kejian2.n_per_dof。"""
+        return int(self._kejian2.get("n_per_dof", 12))
+
+    @property
+    def plan_init_kejian2_collision_tolerance(self) -> float:
+        """整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）。见 plan_init_pose_kejian2.collision_tolerance_m。"""
+        return float(self._kejian2.get("collision_tolerance_m", 0.0))
+
+    @property
+    def plan_init_kejian2_voxel_size(self) -> float:
+        """工件 ESDF 体素大小（米）。见 plan_init_pose_kejian2.voxel_size_m。"""
+        return float(self._kejian2.get("voxel_size_m", 0.01))
+
+    @property
+    def plan_init_kejian2_standoff(self) -> float:
+        """goal 落点沿 bisector（远离工件方向）外移的 standoff 距离（米）。见 plan_init_pose_kejian2.standoff_cm。"""
+        return float(self._kejian2.get("standoff_cm", 0.0)) / 100.0
+
+    @property
+    def plan_init_kejian2_rot_x_deg(self) -> list:
+        """lookup 绕末端局部 +x 轴（焊枪自转 roll）采样 [min,max,step]（度）。见 plan_init_pose_kejian2.rot_x_deg。"""
+        return list(self._kejian2.get("rot_x_deg", [-180.0, 180.0, 30.0]))
+
+    @property
+    def plan_init_kejian2_rot_y_deg(self) -> list:
+        """lookup 绕末端局部 +y 轴（tilt）采样 [min,max,step]（度）。见 plan_init_pose_kejian2.rot_y_deg。"""
+        return list(self._kejian2.get("rot_y_deg", [-30.0, 30.0, 15.0]))
+
+    @property
+    def plan_init_kejian2_rot_z_deg(self) -> list:
+        """lookup 绕末端局部 +z 轴（tilt）采样 [min,max,step]（度）。见 plan_init_pose_kejian2.rot_z_deg。"""
+        return list(self._kejian2.get("rot_z_deg", [-30.0, 30.0, 15.0]))
+
+    @property
+    def plan_init_kejian2_snap_deg(self) -> float:
+        """候选朝向 vs 4 种允许朝向：xyz 逐轴旋转误差上限（度），三轴全在内才保留并 snap。见 plan_init_pose_kejian2.snap_deg。"""
+        return float(self._kejian2.get("snap_deg", 10.0))
+
+    @property
+    def plan_init_kejian2_joint_table_path(self) -> str:
+        """lookup 关节表缓存路径（.pt）。相对路径按项目根解析。见 plan_init_pose_kejian2.joint_table_path。"""
+        p = self._kejian2.get("joint_table_path", "configs/plan_init_kejian2_joint_table.pt")
+        return p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
+
     # ---- cuRobo IK / 规划 ----
     @property
     def ik_num_seeds(self) -> int:

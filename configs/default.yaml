@@ -95,6 +95,49 @@ plan_init_pose:                         # lookup 式初始位姿求解（scripts
   rot_y_deg: [-30, 30, 15]              # 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
   rot_z_deg: [-30, 30, 15]                  # 绕末端局部 +z 轴（tilt）：[min,max,step]（度）
 
+plan_init_pose_kejian:                         # lookup 式初始位姿求解（scripts/plan_init_pose.py --solve）的关节角过滤
+  # precompute_joint_table 对 n^6 采样的关节角做 FK 后，只保留焊枪末端位姿（base_link 系）满足下列约束的：
+  #   ① xy 平面到原点距离 ∈ ee_xy_range_m；② z ∈ ee_z_range_m；③ 落在 init_free.box_min_m/box_max_m 盒内。
+  ee_xy_range_m: [0.4, 1.0]             # 焊枪末端 xy 平面到 base_link 原点距离 [下限,上限]（米）
+  ee_z_range_m: [-0.1, 0.1]             # 焊枪末端在 base_link 系 z [下限,上限]（米）
+  collision_tolerance_m: 0.00           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
+  voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
+  n_seg: 20                             # save_seam_pkl 的 seam_line 插值点数
+  standoff_cm: 2.0                     # 焊枪头落点沿焊缝角平分线(bisector，远离工件方向)外移的 standoff 距离(cm)；
+  rot_x_deg: [-180, 180, 60]              # 绕末端局部 +x 轴（=名义焊枪轴 -x，焊枪自转 roll）：[min,max,step]（度）
+  rot_y_deg: [-30, 30, 15]              # 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
+  rot_z_deg: [-30, 30, 15]                  # 绕末端局部 +z 轴（tilt）：[min,max,step]（度）
+  # —— 新逻辑（--solve-kejian）：固定朝向 + 平移网格 + STOMP 可达。不再 n^6 采样关节角。 ——
+  xyz_step_m: [0.3, 0.3, 0.2]        # 工件平移网格步长 [dx,dy,dz]（米，base 系）；撒点方框
+                                        # x,y∈[-ee_xy_hi,ee_xy_hi]、z∈ee_z_range_m，再丢弃「焊缝起/中/终
+                                        # 任一点 径向xy∉ee_xy_range 或 z∉ee_z_range」的候选。
+  ik_return_seeds: 30                   # 预筛阶段每个 goal 朝向 IK 取回的候选解数（逐个 check_state 过碰撞）
+  ik_num_seeds: 60                      # 预筛专用 IK 的并行随机起点数（须 ≥ ik_return_seeds）。不用 planner.ik_num_seeds(200)：
+                                        #   预筛是批量 IK，峰值显存≈chunk×num_seeds，200 会爆显存（见 docs 注）。60 够筛掉不可达。
+  ik_batch: 24                          # 预筛批量 IK 的分块大小：每次只送 ik_batch 个 goal 朝向进 solve_batch，
+                                        #   峰值显存≈ik_batch×ik_num_seeds。一个候选的全部 goal 分多块循环，避免一把 OOM。
+
+plan_init_pose_kejian2:                  # lookup(n^6 关节角采样, 复用 plan_init_pose.py:InitPoseLookupSolver) + 允许朝向 snap + 正反手分类
+  # 路线（scripts/plan_init_pose_kejian2.py --solve-kejian2）：
+  #   ① InitPoseLookupSolver 采 n_per_dof^6 关节角做 FK，按下列 ee_xy/ee_z 范围 + init_free 盒过滤可达构型，
+  #      每条焊缝 batch 反解出候选工件位姿 (R,t,q)，并用「整臂/retract 碰撞球 vs 工件 ESDF」过滤掉碰撞解；
+  #   ② 从候选里挑「旋转 R 与 4 种允许朝向（lay_flat / 沿最长轴翻180° / 沿垂直地面轴翻180° / 两者皆翻；
+  #      最长轴 ⊥ base-x）某一种的 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、重算 t 让焊枪尖端
+  #      仍落在焊缝 standoff 点（snap 后不复检）；③ 按 bisector 在 base-x 分量正负分「正手(负x)/反手(正x)」。
+  ee_xy_range_m: [0.4, 1.0]             # 焊缝点 xy 平面到 base_link 原点距离 [下限,上限]（米）
+  ee_z_range_m: [-0.1, 0.1]             # 焊缝点在 base_link 系 z [下限,上限]（米）
+  n_per_dof: 12                         # 每关节采样档数，q_table = n_per_dof^6
+  collision_tolerance_m: 0.00           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
+  voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
+  standoff_cm: 2.0                      # 焊枪头落点沿 bisector（远离工件方向）外移的 standoff 距离（cm）
+  rot_x_deg: [-180, 180, 30]            # lookup 绕末端局部 +x 轴（=名义焊枪轴 -x，焊枪自转 roll）：[min,max,step]（度）
+  rot_y_deg: [-30, 30, 15]              # lookup 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
+  rot_z_deg: [-30, 30, 15]              # lookup 绕末端局部 +z 轴（tilt）：[min,max,step]（度）
+  snap_deg: 10.0                        # 候选朝向 vs 4 种允许朝向：xyz 逐轴旋转误差上限（度）；三轴全在内才保留并 snap 到该朝向
+  joint_table_path: "configs/plan_init_kejian2_joint_table.pt"  # 独立的关节表缓存。注意：过滤范围与 plan_init_pose 不同，
+                                        #   而 load_joint_table 只校验 n_per_dof（不校验范围），共用会读到错的关节集，必须分开存。
+
+
 gt:                                     # 决策 G
   format: "custom"                      # 用本项目自定义格式（不沿用 traj.pkl），schema 在 Step 11 定
 

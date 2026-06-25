@@ -1215,19 +1215,20 @@ def main():
     ap.add_argument("--viz", action="store_true",
                     help="solve：每条成功焊缝开窗可视化（复用 show_init_space 的几何）")
     ap.add_argument("--diagnostic", action="store_true", help="solve：逐 (θ,φ) 诊断打印")
-    # ③ 新逻辑（固定朝向 + 平移网格 + STOMP 可达 + 正反手分类）
-    ap.add_argument("--solve-kejian", action="store_true",
-                    help="进入新逻辑求解（固定朝向×平移网格×STOMP 可达，分正反手返回）")
-    ap.add_argument("--seam-id", type=int, default=0, help="solve-kejian：用 weld_json 第几条焊缝")
+    # ③ 新逻辑（lookup 关节角采样 + 允许朝向 snap + 正反手分类）
+    ap.add_argument("--solve-kejian2", action="store_true",
+                    help="进入新逻辑求解（lookup n^6 关节角采样 + 允许朝向 snap，分正反手返回）")
+    ap.add_argument("--seam-id", type=int, default=0, help="solve-kejian2：用 weld_json 第几条焊缝")
     ap.add_argument("--lay-flat", action="store_true",
                     help="只跑 lay_flat 摆平工件并 open3d 可视化（用 --obj 或默认 BEAM）")
     args = ap.parse_args()
 
-    if args.solve_kejian:
+    if args.solve_kejian2:
         if not args.weld_json:
-            ap.error("--solve-kejian 需要 --weld-json（焊缝 _weld_angle3.json）")
-        plan_init_pose_kejian(args.obj or DEFAULT_LAY_FLAT_OBJ, args.weld_json,
-                              seam_id=args.seam_id, viz=args.viz)
+            ap.error("--solve-kejian2 需要 --weld-json（焊缝 _weld_angle3.json）")
+        res = plan_init_pose_kejian2(args.obj or DEFAULT_LAY_FLAT_OBJ, args.weld_json,
+                                     seam_id=args.seam_id, viz=args.viz)
+        print(f"[kejian2] 返回：正手 {len(res['forehand'])} 个 / 反手 {len(res['backhand'])} 个")
         return
 
     if args.lay_flat:
@@ -1373,14 +1374,16 @@ def _show_lay_flat(obj_fp: str, T: np.ndarray):
 
 
 # ============================================================================
-# ③ 新逻辑：固定朝向 + 平移网格 + STOMP 可达 + 正反手分类（--solve-kejian）
+# ③ 新逻辑：lookup 关节角采样 + 允许朝向 snap + 正反手分类（--solve-kejian2）
 # ----------------------------------------------------------------------------
-# 旧 InitPoseLookupSolver（n^6 关节角查表）不再使用，但保留不动。本块是另一条独立路线：
-#   · 工件朝向由 lay_flat 锁死，只剩 4 种翻面（沿最长轴 0/180° × 沿垂直地面轴 0/180°）；
-#   · 位置在工作空间按固定步长平移采样（焊缝中点锚到网格点）；
-#   · 焊缝起/中/终三点须落在 ee_xy_range_m(径向环)+ee_z_range_m(z) 内；
-#   · 逐候选用本项目 STOMP 判「retract → goal pose」能否规划出无碰撞轨迹（先 IK+check_state 预筛）；
+# 复用本文件已自带的 InitPoseLookupSolver（n^6 关节角采样，与 plan_init_pose.py 一致）当候选源：
+#   · solver 对本焊缝反解出候选工件位姿 (R,t,q)，并用「整臂/retract 碰撞球 vs 工件 ESDF」过滤碰撞解；
+#     焊缝起/终由 solver 端点检查、尖端由 precompute 保证在 ee_xy_range_m(径向环)+ee_z_range_m(z) 内；
+#   · 工件朝向由 lay_flat 锁死成 4 种允许朝向（沿最长轴 0/180° × 沿垂直地面轴 0/180°，长轴 ⊥ base-x）；
+#     从候选里挑「R 与某允许朝向 xyz 三方向逐轴误差 < snap_deg」者，snap 到该朝向、重算 t 让焊枪尖端
+#     仍落在焊缝 standoff 点（snap 后不复检）；
 #   · 合格者按 bisector 在 base-x 的分量正负分「正手(负x) / 反手(正x)」两类返回。
+# 过滤范围/缓存全部走 default.yaml 的 plan_init_pose_kejian2 段（经 _kejian2_cfg 注入 solver）。
 # ============================================================================
 def _rotmat_axis_angle(axis, angle: float) -> np.ndarray:
     """Rodrigues：绕单位轴 axis 转 angle(rad) 的 3×3 旋转矩阵（numpy 标量版）。"""
@@ -1429,209 +1432,197 @@ def _kejian_orientations(obj_fp: str) -> List[np.ndarray]:
     return [R_A, Ry180 @ R_A, Rz180 @ R_A, Ry180 @ Rz180 @ R_A]
 
 
-def _kejian_candidates(orientations, weld, cfg) -> list:
-    """平移网格 × 4 朝向 → 候选 (oid, R, t)，过滤「焊缝起/中/终三点落在 ee_xy_range(径向)+ee_z_range(z)」。
-
-    锚点：把焊缝中点放到网格点 g → t = g − R·mid_world（故 mid 落在 g；g 本身也受径向环过滤）。
-    撒点方框 x,y∈[−xy_hi,xy_hi]、z∈[z_lo,z_hi]，步长 cfg.plan_init_kejian_xyz_step。"""
-    xy_lo, xy_hi = (float(v) for v in cfg.plan_init_kejian_ee_xy_range)
-    z_lo, z_hi = (float(v) for v in cfg.plan_init_kejian_ee_z_range)
-    dx, dy, dz = (float(v) for v in cfg.plan_init_kejian_xyz_step)
-    mid = np.asarray(weld["mid_world"], float)
-    p0 = np.asarray(weld["p0_world"], float)
-    p1 = np.asarray(weld["p1_world"], float)
-    gx = np.arange(-xy_hi, xy_hi + 1e-9, dx)
-    gy = np.arange(-xy_hi, xy_hi + 1e-9, dy)
-    gz = np.arange(z_lo, z_hi + 1e-9, dz)
-
-    def _ok(p):
-        r = float(np.hypot(p[0], p[1]))
-        return (xy_lo <= r <= xy_hi) and (z_lo <= p[2] <= z_hi)
-
-    cands = []
-    for oid, R in enumerate(orientations):
-        Rmid = R @ mid; Rp0 = R @ p0; Rp1 = R @ p1
-        for x in gx:
-            for y in gy:
-                for z in gz:
-                    t = np.array([x, y, z]) - Rmid       # 焊缝中点锚到 (x,y,z)
-                    if _ok(Rp0 + t) and _ok(Rmid + t) and _ok(Rp1 + t):
-                        cands.append((oid, R, t))
-    return cands
+def _kejian2_cfg(cfg):
+    """派生一个 Config，让 InitPoseLookupSolver 内部读到的 plan_init_pose.* 改为走 kejian2 的值
+    （不改 solver 源码）。solver 读 cfg.plan_init_ee_xy_range / plan_init_ee_z_range / plan_init_standoff /
+    plan_init_joint_table_path（precompute 另读 init_free 盒，不覆盖）。深拷 raw 后覆盖 plan_init_pose 段对应键。"""
+    import copy
+    from gt_gen.config import Config
+    raw2 = copy.deepcopy(cfg.raw)
+    pip = raw2.setdefault("plan_init_pose", {})
+    k2 = raw2.get("plan_init_pose_kejian2", {})
+    pip["ee_xy_range_m"] = list(k2.get("ee_xy_range_m", cfg.plan_init_kejian2_ee_xy_range))
+    pip["ee_z_range_m"] = list(k2.get("ee_z_range_m", cfg.plan_init_kejian2_ee_z_range))
+    pip["standoff_cm"] = float(k2.get("standoff_cm", cfg.plan_init_kejian2_standoff * 100.0))
+    pip["joint_table_path"] = k2.get("joint_table_path",
+                                     "configs/plan_init_kejian2_joint_table.pt")
+    return Config(raw=raw2, robot_cfg=cfg.robot_cfg)
 
 
-def _kejian_goal_poses(R, t, weld, cfg):
-    """该工件 pose(R,t) 下的 goal pose 列表 + bisector_base。
-
-    位置 = 焊缝中点(base) 沿 bisector(远离工件)外移 standoff；朝向基准 R0 让末端局部 +x 对齐
-    bisector_base（名义焊枪轴 -x 朝 -bisector，指向工件），再绕 R0 局部 x/y/z 轴按 rot_x/y/z_deg 扰动。
-    返回 (goals, bisector_base)；goals = [((pos_list, quat_wxyz_list), (αx,βy,γz)), ...]。"""
-    bis = R @ np.asarray(weld["bisector_world"], float)
-    bis = bis / (np.linalg.norm(bis) + 1e-12)
-    mid_base = R @ np.asarray(weld["mid_world"], float) + t
-    pos = mid_base + cfg.plan_init_kejian_standoff * bis
-    R0 = _align_rotmat([1.0, 0.0, 0.0], bis)       # 末端局部 +x → bisector_base
-    rx = _deg_range(cfg.plan_init_kejian_rot_x_deg)
-    ry = _deg_range(cfg.plan_init_kejian_rot_y_deg)
-    rz = _deg_range(cfg.plan_init_kejian_rot_z_deg)
-    goals = []
-    for ax in rx:
-        for ay in ry:
-            for az in rz:
-                Rg = R0 @ _Rx(np.deg2rad(ax)) @ _Ry(np.deg2rad(ay)) @ _Rz(np.deg2rad(az))
-                q = rotmat_to_quat_wxyz(Rg)
-                goals.append(((pos.tolist(), q.tolist()), (float(ax), float(ay), float(az))))
-    return goals, bis
+def _kejian2_snap(R_cand, R_valid_list, snap_deg):
+    """候选工件旋转 R_cand 与 4 种允许朝向逐一比对：残差 R_rel=R_valid^T·R_cand 拆成 xyz 内旋欧拉角，
+    三轴误差均 < snap_deg(度) 则命中。返回首个命中的 (oid, R_valid)；全不中返回 (None, None)。"""
+    from scipy.spatial.transform import Rotation as sR
+    Rc = np.asarray(R_cand, dtype=np.float64)
+    for oid, Rv in enumerate(R_valid_list):
+        R_rel = np.asarray(Rv, dtype=np.float64).T @ Rc
+        e = sR.from_matrix(R_rel).as_euler("xyz", degrees=True)
+        if np.all(np.abs(e) < float(snap_deg)):
+            return oid, np.asarray(Rv, dtype=np.float64)
+    return None, None
 
 
-def _kejian_prefilter(handle, goals, cfg) -> list:
-    """预筛：每候选【分块批量 IK + 一次批量 check_state】，避免逐 goal 串行（325 个 goal 会极慢）。
+def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
+    """挨个可视化 kejian2 结果（正手→反手），每 stride 个抽 1 个（取每条手内第 1,1+stride,… 个）。
 
-    对所有 goal 朝向批量解 IK，每 goal 取误差最小的成功解，再把这些解一次性 check_constraints
-    （自碰 + 工件碰）。返回无碰撞可达的 [(err, pose7tuple, rottuple, q_list), ...]（按 IK 误差升序）。
+    同一个窗口里按【C 键】切到下一个，不关窗口（到最后一个再按 C 即关闭）；切换时窗口标题与控制台
+    都写清「正手/反手 第 i/N 个」。几何复用 plan_init_pose.py 风格的 _lookup_solution_geoms（整臂碰撞球
+    @ joint_angles + 工件 mesh @ T_workpiece_in_base + 绿色焊缝线 + standoff 落枪点）；sol 由 result 适配。"""
+    import open3d as o3d
+    step = max(1, int(stride))
+    items = []   # (hand_label, i_1based, N, sol_like)
+    for hand_label, lst in (("正手", res.get("forehand", [])), ("反手", res.get("backhand", []))):
+        for i in range(0, len(lst), step):
+            T = np.asarray(lst[i]["T_workpiece_in_base"], dtype=np.float64)
+            sol = {"R": T[:3, :3], "t": T[:3, 3],
+                   "q": np.asarray(lst[i]["joint_angles"], dtype=np.float64)}
+            items.append((hand_label, i + 1, len(lst), sol))
+    if not items:
+        print("[kejian2] 无可视化结果")
+        return
+    n = len(items)
+    print(f"[kejian2] 可视化 {n} 个（每 {step} 个抽 1；按 C 切下一个，最后一个再按 C 关闭）")
 
-    分块：solve_batch 峰值显存≈chunk×num_seeds，一把送全部 goal（×200 种子）会 OOM；故按
-    cfg.plan_init_kejian_ik_batch 切块循环，handle.ik 用低种子数（见 plan_init_pose_kejian 建 handle）。"""
-    import torch
-    from curobo.types.math import Pose
-    from curobo.types.state import JointState
-    dof = len(handle.joint_names)
-    G = len(goals)
-    ret_seeds = cfg.plan_init_kejian_ik_return_seeds
-    chunk = max(1, int(cfg.plan_init_kejian_ik_batch))
+    def _label(idx):
+        hand_label, i, N, _ = items[idx]
+        return f"{hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）"
 
-    cand_gi, cand_cfg, cand_err = [], [], []
-    for c0 in range(0, G, chunk):
-        sub = goals[c0:c0 + chunk]
-        cs = len(sub)
-        pos = handle.ta.to_device([list(g[0][0]) for g in sub])    # (cs,3)
-        quat = handle.ta.to_device([list(g[0][1]) for g in sub])   # (cs,4)
-        res = handle.ik.solve_batch(Pose(position=pos, quaternion=quat),
-                                    return_seeds=ret_seeds)
-        sol = res.solution.view(cs, -1, dof)
-        succ = res.success.view(cs, -1)
-        err = res.position_error.view(cs, -1)
-        for j in range(cs):
-            s = succ[j]
-            if not bool(s.any().item()):
-                continue
-            e = err[j].clone()
-            e[~s] = float("inf")
-            bi = int(torch.argmin(e).item())
-            cand_gi.append(c0 + j)
-            cand_cfg.append(sol[j, bi].detach().clone())
-            cand_err.append(float(e[bi].item()))
-        del res, sol, succ, err
-    if not cand_gi:
-        return []
+    state = {"i": 0}
 
-    qbatch = torch.stack(cand_cfg, dim=0)                          # (M,dof)
-    js = JointState.from_position(qbatch, joint_names=list(handle.joint_names))
-    feas = handle.mg.check_constraints(js).feasible.view(-1)
-    out = []
-    for k, gi in enumerate(cand_gi):
-        if bool(feas[k].item()):
-            pose7tuple, rottuple = goals[gi]
-            out.append((cand_err[k], pose7tuple, rottuple,
-                        qbatch[k].detach().cpu().numpy().tolist()))
-    out.sort(key=lambda x: x[0])
-    return out
+    def _load(vis, idx, reset):
+        vis.clear_geometries()
+        for g in _lookup_solution_geoms(cfg, obj_fp, weld, items[idx][3]):
+            vis.add_geometry(g, reset_bounding_box=reset)
+        try:
+            vis.update_window_title(f"kejian2: {_label(idx)}（按 C 切下一个）")
+        except Exception:
+            pass            # 老版 open3d 无 update_window_title 时仅靠控制台打印
+        print(f"[viz] {_label(idx)}（按 C 看下一个）")
+
+    def _next(vis):
+        state["i"] += 1
+        if state["i"] >= n:
+            print(f"[viz] 已是最后一个（{n}/{n}），关闭窗口")
+            vis.close()
+            return False
+        _load(vis, state["i"], reset=False)   # 切换不重置视角，保留用户当前相机
+        return False
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name=f"kejian2: {_label(0)}（按 C 切下一个）")
+    vis.register_key_callback(ord("C"), _next)
+    _load(vis, 0, reset=True)   # 第 1 个 fit 一次视角
+    vis.run()
+    vis.destroy_window()
 
 
-def plan_init_pose_kejian(obj_fp: str, weld_json: str, seam_id: int = 0,
-                          viz: bool = False, stomp_cap: int = 6) -> Dict[str, list]:
-    """新逻辑求解：返回 {"forehand":[...], "backhand":[...]}（正手=bisector 在 base-x 分量<0）。
+def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
+                           viz: bool = False) -> Dict[str, list]:
+    """新逻辑求解（lookup 关节角采样 + 允许朝向 snap + 正反手分类）：
+    返回 {"forehand":[...], "backhand":[...]}（正手=bisector 在 base-x 分量<0）。
 
-    分级：① 几何（4 朝向×平移网格，焊缝三点落在 ee_xy/ee_z 范围）；② 预筛（每候选 update_world，
-    对各 goal 朝向 IK+check_state 判无碰撞，含机械臂自碰 + 机械臂-工件碰）；③ STOMP 确认 retract→goal
-    可规划出无碰撞轨迹。任一 goal 朝向通过 ②③ 即保留该工件 pose。stomp_cap 限每候选最多试几个 goal。"""
+    ① InitPoseLookupSolver（n^6 关节角采样，复用本文件已自带的求解器）对本焊缝反解出候选工件位姿
+       (R,t,q)，并用「整臂/retract 碰撞球 vs 工件 ESDF」过滤掉碰撞解（= plan_init_pose 原逻辑碰撞）；
+    ② 从候选里挑「旋转 R 与 4 种允许朝向某一种 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、
+       重算 t 让焊枪尖端（FK ee_pos）仍精确落在焊缝 standoff 点（snap 后不复检范围/碰撞）；
+    ③ 按 bisector 在 base-x 分量正负分正手/反手。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
     from gt_gen.config import load_config
-    from gt_gen import curobo_iface as ci
-    from gt_gen import stomp_iface as si
-    import gt_gen.compat
-    gt_gen.compat.apply_trimesh_shim()
-    from curobo.geom.types import WorldConfig, Mesh
-    from curobo.geom.sdf.world import CollisionCheckerType
 
     cfg = load_config()
+    cfg2 = _kejian2_cfg(cfg)                     # 让 solver 读到 kejian2 的 ee 范围 / standoff / 缓存路径
     welds = load_welds(weld_json)
     weld = next((w for w in welds if int(w["idx"]) == int(seam_id)), None)
     if weld is None:
         raise IndexError(f"seam_id={seam_id} 不在 {weld_json}（共 {len(welds)} 条）")
-    retract = [float(v) for v in cfg.retract_config]
 
-    orientations = _kejian_orientations(obj_fp)
-    cands = _kejian_candidates(orientations, weld, cfg)
-    print(f"[kejian] 朝向 {len(orientations)} 种 × 平移网格 → 几何过滤后候选 {len(cands)} 个")
+    # —— ① lookup 求解器（与工件相关；joint table 与工件无关，优先复用 kejian2 独立缓存） ——
+    solver = InitPoseLookupSolver(
+        cfg2, obj_fp,
+        collision_tolerance=cfg.plan_init_kejian2_collision_tolerance,
+        voxel_size=cfg.plan_init_kejian2_voxel_size,
+        n_per_dof=cfg.plan_init_kejian2_n_per_dof)
+    if solver.load_joint_table():
+        print("[kejian2] 复用已存 joint table（跳过 n^6 预计算）")
+    else:
+        print("[kejian2] precomputing joint table（与工件无关，仅一次）…")
+        solver.precompute_joint_table()
+        solver.save_joint_table()
+
+    rot_x = _deg_range(cfg.plan_init_kejian2_rot_x_deg)
+    rot_y = _deg_range(cfg.plan_init_kejian2_rot_y_deg)
+    rot_z = _deg_range(cfg.plan_init_kejian2_rot_z_deg)
+    solver.solve_one_weld_lookup(weld, rot_x, rot_y, rot_z)
+    cands = list(getattr(solver, "last_all_solutions", []) or [])
+    print(f"[kejian2] lookup 候选 {len(cands)} 个（绕末端轴采样 "
+          f"{len(rot_x)}×{len(rot_y)}×{len(rot_z)}）")
     if not cands:
-        print("[kejian] 几何过滤后无候选：请放宽 ee_xy_range_m/ee_z_range_m 或减小 xyz_step_m")
+        print("[kejian2] lookup 无候选：请放宽 ee_xy_range_m/ee_z_range_m 或增大 n_per_dof")
         return {"forehand": [], "backhand": []}
+
+    # —— ② 允许朝向（4 种，长轴 ⊥ base-x）+ snap 阈值 + standoff 落枪点 ——
+    R_valid_list = _kejian_orientations(obj_fp)
+    snap_deg = cfg.plan_init_kejian2_snap_deg
+    standoff = cfg.plan_init_kejian2_standoff
+    xy_lo, xy_hi = (float(v) for v in cfg.plan_init_kejian2_ee_xy_range)
+    z_lo, z_hi = (float(v) for v in cfg.plan_init_kejian2_ee_z_range)
+    mid_world = np.asarray(weld["mid_world"], dtype=np.float64)
+    bis_world = np.asarray(weld["bisector_world"], dtype=np.float64)
+    target_world = mid_world + standoff * bis_world      # 焊枪尖端目标点（mesh world 系）
 
     def _T(R, t):
         T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
         return T
 
-    def _world_at(R, t):
-        p7 = mat44_to_pose7(_T(R, t))            # [x,y,z,qw,qx,qy,qz]
-        mesh = Mesh(name="workpiece", file_path=obj_fp, pose=[float(v) for v in p7])
-        return WorldConfig(mesh=[mesh])
+    def _in_ws(p):
+        r = float(np.hypot(p[0], p[1]))
+        return (xy_lo <= r <= xy_hi) and (z_lo <= float(p[2]) <= z_hi)
 
-    # 建一次 MESH MotionGen（工件放第一个候选位姿）；不 drop 任何 link（整臂含焊枪都对工件避障）。
-    # 预筛 IK 用低 num_seeds（不取 planner.ik_num_seeds=200）：批量 solve_batch 峰值显存≈ik_batch×num_seeds，
-    # 200 会 OOM；这里 handle.ik 仅用于预筛，低种子够筛掉不可达。
-    oid0, R0c, t0c = cands[0]
-    handle = ci.init_curobo(cfg, world_model=_world_at(R0c, t0c),
-                            collision_checker_type=CollisionCheckerType.MESH,
-                            num_seeds=cfg.plan_init_kejian_ik_num_seeds)
-
-    n_pass_b = 0
     results = []
-    t_start = time.time()
-    for idx, (oid, R, t) in enumerate(cands):
-        world = _world_at(R, t)
-        handle.mg.update_world(world)
-        goals, bis = _kejian_goal_poses(R, t, weld, cfg)
-
-        # ② 预筛：批量 IK + 批量 check_state（自碰 + 工件碰），得无碰撞可达 goal（按 IK 误差升序）
-        feasible = _kejian_prefilter(handle, goals, cfg)
-        if not feasible:
+    n_hit = 0
+    seen = set()
+    for sol in cands:
+        # （req#1, pre-snap）焊缝中点也须在范围内（起/终已由 lookup 端点检查、尖端由 precompute 保证）
+        if not _in_ws(np.asarray(sol["mid_in_base"], dtype=np.float64)):
             continue
-        n_pass_b += 1
-
-        # ③ STOMP 确认 retract → goal（取预筛通过者按 IK 质量前 stomp_cap 个，命中即停）
-        hit = None
-        for err, pose7tuple, rottuple, q in feasible[:stomp_cap]:
-            traj = si.plan_pose_single(cfg, world, retract, pose7tuple)
-            if traj is not None:
-                hit = (pose7tuple, rottuple, q)
-                break
-        if hit is None:
+        oid, Rv = _kejian2_snap(sol["R"], R_valid_list, snap_deg)
+        if Rv is None:
             continue
-        pose7tuple, rottuple, q_ik = hit
-        gp = np.asarray(list(pose7tuple[0]) + list(pose7tuple[1]), dtype=np.float64)
-        if abs(float(bis[0])) < 1e-9:
-            print(f"[kejian] 警告：候选 oid={oid} bisector base-x 分量≈0，归为正手")
-        hand = "forehand" if float(bis[0]) < 0.0 else "backhand"
+        n_hit += 1
+        ee_pos = np.asarray(sol["ee_pos_in_base"], dtype=np.float64)
+        t_new = ee_pos - Rv @ target_world           # 重算平移：焊枪尖端仍落在 standoff 点（snap 后不复检）
+        key = (oid, round(float(t_new[0]), 2), round(float(t_new[1]), 2), round(float(t_new[2]), 2))
+        if key in seen:                              # 轻去重：同朝向 + 同位置(2cm 粒度)只留一份
+            continue
+        seen.add(key)
+
+        bis_base = Rv @ bis_world
+        bis_base = bis_base / (np.linalg.norm(bis_base) + 1e-12)
+        R0_ee = _align_rotmat([1.0, 0.0, 0.0], bis_base)   # 末端局部 +x → bisector_base
+        goal_quat = rotmat_to_quat_wxyz(R0_ee)
+        goal_pose7 = np.concatenate([ee_pos, goal_quat])   # 位置= standoff 落枪点(=ee_pos)
+        if abs(float(bis_base[0])) < 1e-9:
+            print(f"[kejian2] 警告：候选 oid={oid} bisector base-x 分量≈0，归为正手")
+        hand = "forehand" if float(bis_base[0]) < 0.0 else "backhand"
         results.append({
-            "workpiece_pose7": mat44_to_pose7(_T(R, t)),
-            "T_workpiece_in_base": _T(R, t),
-            "goal_pose7": gp,
-            "joint_angles": np.asarray(q_ik, dtype=np.float64),
-            "rot_x_deg": rottuple[0], "rot_y_deg": rottuple[1], "rot_z_deg": rottuple[2],
-            "bisector_base": np.asarray(bis, dtype=np.float64),
+            "workpiece_pose7": mat44_to_pose7(_T(Rv, t_new)),
+            "T_workpiece_in_base": _T(Rv, t_new),
+            "goal_pose7": goal_pose7,
+            "joint_angles": np.asarray(sol["q"], dtype=np.float64),
+            "rot_x_deg": float(sol["rot_x_deg"]),
+            "rot_y_deg": float(sol["rot_y_deg"]),
+            "rot_z_deg": float(sol["rot_z_deg"]),
+            "bisector_base": np.asarray(bis_base, dtype=np.float64),
             "orientation_id": int(oid),
             "hand": hand,
         })
-        print(f"[kejian] 合格 #{len(results)}（候选 {idx + 1}/{len(cands)}）oid={oid} hand={hand} "
-              f"αx={rottuple[0]:+.0f}° βy={rottuple[1]:+.0f}° γz={rottuple[2]:+.0f}°")
 
     fore = [r for r in results if r["hand"] == "forehand"]
     back = [r for r in results if r["hand"] == "backhand"]
-    print(f"[kejian] 完成（{time.time() - t_start:.1f}s）：候选 {len(cands)} → 预筛通过 {n_pass_b} "
-          f"→ 合格 l={len(results)}（正手 {len(fore)} / 反手 {len(back)}）")
+    print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 去重后合格 {len(results)} "
+          f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
 
     if viz and results:
-        _show_lay_flat(obj_fp, results[0]["T_workpiece_in_base"])
+        _show_kejian2_results(cfg2, obj_fp, weld, {"forehand": fore, "backhand": back}, stride=5)
     return {"forehand": fore, "backhand": back}
 
 
