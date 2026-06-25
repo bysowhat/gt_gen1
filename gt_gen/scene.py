@@ -219,7 +219,10 @@ class Scene:
                 collision_tolerance=cfg.plan_init_collision_tolerance,
                 voxel_size=cfg.plan_init_voxel_size,
                 n_per_dof=n_per_dof)
-            self._solver.precompute_joint_table()
+            # 优先读 cfg.plan_init_joint_table_path 的缓存（与工件无关）；rebuild 或无缓存则现算并落盘。
+            if rebuild or not self._solver.load_joint_table():
+                self._solver.precompute_joint_table()
+                self._solver.save_joint_table()
             self._solver_key = key
 
         sol = self._solver.solve_one_weld_lookup(

@@ -638,6 +638,68 @@ class InitPoseLookupSolver:
               f"y=[{float(self.ee_pos_t[:,1].min()):.3f},{float(self.ee_pos_t[:,1].max()):.3f}] "
               f"z=[{float(self.ee_pos_t[:,2].min()):.3f},{float(self.ee_pos_t[:,2].max()):.3f}]")
 
+    # ---- 离线预计算结果落盘 ----
+    def save_joint_table(self, path: Optional[str] = None) -> str:
+        """把 precompute_joint_table 的结果（与工件无关的关节角查表）存成 .pt，供复用免去 n^6 重算。
+
+        存储地址：path 缺省时取 cfg.plan_init_joint_table_path（= default.yaml plan_init_pose.joint_table_path）。
+        保存内容为 precompute_joint_table 产出的全部张量 + 重建/校验所需元信息；ESDF/robot_world 与工件相关、
+        不在此保存（换工件时各自重建）。"""
+        import torch
+        if self.q_table_t is None:
+            raise RuntimeError("尚未 precompute_joint_table，无结果可存；请先调用 precompute_joint_table()")
+        if path is None:
+            path = self.cfg.plan_init_joint_table_path
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        payload = {
+            "q_table_t": self.q_table_t.cpu(),
+            "ee_pos_t": self.ee_pos_t.cpu(),
+            "ee_x_t": self.ee_x_t.cpu(),
+            "ee_rot_t": self.ee_rot_t.cpu(),
+            "link_spheres_t": self.link_spheres_t.cpu(),
+            "retract_spheres_t": self.retract_spheres_t.cpu(),
+            "K_link": int(self.K_link),
+            "N": int(self.N),
+            "n_per_dof": int(self.n_per_dof),
+            "joint_names": list(self.joint_names),
+        }
+        torch.save(payload, path)
+        print(f"[lookup] joint_table saved -> {path} "
+              f"(N={payload['N']}, n_per_dof={payload['n_per_dof']}, K_link={payload['K_link']})")
+        return path
+
+    def load_joint_table(self, path: Optional[str] = None) -> bool:
+        """从 .pt 读回 precompute_joint_table 的结果，填回查表张量（免去 n^6 重算）。
+
+        存储地址：path 缺省时取 cfg.plan_init_joint_table_path（= default.yaml plan_init_pose.joint_table_path）。
+        文件不存在返回 False（调用方可回退到 precompute_joint_table）；n_per_dof 与当前 solver 不一致则报错
+        （查表是按 n_per_dof 采样的，混用会算错）。张量按 tensor_args 搬到当前设备。
+        注意：只恢复与工件无关的关节表，ESDF/robot_world 仍由构造/ set_workpiece 各自重建。"""
+        import torch
+        if path is None:
+            path = self.cfg.plan_init_joint_table_path
+        if not os.path.isfile(path):
+            print(f"[lookup] joint_table 不存在，未加载：{path}")
+            return False
+        payload = torch.load(path, map_location=self.tensor_args.device)
+        saved_n = int(payload.get("n_per_dof", -1))
+        if saved_n != int(self.n_per_dof):
+            raise RuntimeError(
+                f"joint_table n_per_dof={saved_n} 与当前 solver n_per_dof={self.n_per_dof} 不一致："
+                f"{path}（请用一致的 n_per_dof，或重新 precompute_joint_table+save_joint_table）")
+        dev, dt = self.tensor_args.device, self.tensor_args.dtype
+        self.q_table_t = payload["q_table_t"].to(device=dev, dtype=dt)
+        self.ee_pos_t = payload["ee_pos_t"].to(device=dev, dtype=dt)
+        self.ee_x_t = payload["ee_x_t"].to(device=dev, dtype=dt)
+        self.ee_rot_t = payload["ee_rot_t"].to(device=dev, dtype=dt)
+        self.link_spheres_t = payload["link_spheres_t"].to(device=dev, dtype=dt)
+        self.retract_spheres_t = payload["retract_spheres_t"].to(device=dev, dtype=dt)
+        self.K_link = int(payload["K_link"])
+        self.N = int(payload["N"])
+        print(f"[lookup] joint_table loaded <- {path} "
+              f"(N={self.N}, n_per_dof={saved_n}, K_link={self.K_link})")
+        return True
+
     # ---- 在线求解 ----
     def solve_one_weld_lookup(self, weld: Dict,
                               rot_x_deg: Tuple[float, ...] = (0.0,),
@@ -1083,11 +1145,16 @@ def _run_solve(args):
     solver = InitPoseLookupSolver(
         cfg, args.obj, collision_tolerance=cfg.plan_init_collision_tolerance,
         voxel_size=cfg.plan_init_voxel_size, n_per_dof=n_per_dof)
-    print("[solve] precomputing joint table（与工件无关，仅一次）…")
-    solver.precompute_joint_table()
+    # 优先读 cfg.plan_init_joint_table_path 的缓存（与工件无关）；没有则现算一次并落盘复用。
+    if solver.load_joint_table():
+        print("[solve] 复用已存的 joint table（跳过 n^6 预计算）")
+    else:
+        print("[solve] precomputing joint table（与工件无关，仅一次）…")
+        solver.precompute_joint_table()
+        solver.save_joint_table()   # 落盘 → cfg.plan_init_joint_table_path（下次可复用免重算）
 
     # 可视化 precompute_joint_table 结果（ee xyz 范围 + 随机 3 个关节角）；注释此行即关闭可视化
-    # viz_joint_table(cfg, solver, n=10)
+    # viz_joint_table(cfg, solver, n=1)
 
     # 可视化焊枪碰撞球 + xiaoyu_tip_link 末端三轴（核实焊枪沿哪根局部轴=roll 轴）；注释此行即关闭可视化
     # viz_tip_frame(cfg, solver)

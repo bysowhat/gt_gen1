@@ -179,6 +179,14 @@ class Config:
         return int(self.raw.get("plan_init_pose", {}).get("n_seg", 20))
 
     @property
+    def plan_init_joint_table_path(self) -> str:
+        """precompute_joint_table 结果（q_table/ee_pos/ee_x/ee_rot/link_spheres/retract_spheres 等）
+        的存储路径（.pt）。相对路径按项目根解析。见 default.yaml plan_init_pose.joint_table_path。"""
+        p = self.raw.get("plan_init_pose", {}).get(
+            "joint_table_path", "configs/plan_init_joint_table.pt")
+        return p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
+
+    @property
     def plan_init_standoff(self) -> float:
         """初始位姿求解：焊枪头落点沿焊缝角平分线(bisector，远离工件方向)外移的 standoff 距离（米）。
         焊枪头不再落在焊缝中点，而是落在「中点 + standoff·bisector」处（中点退后 standoff 进入自由空间）。

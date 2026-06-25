@@ -38,11 +38,8 @@ def main():
                   weld_json=args.weld_json,
                   seam_id=args.seam_id)
 
-    # plan_init_pose 的相关参数（n_per_dof / 角度采样 / standoff 等）全部从 cfg 读取，
-    # 不在此处经方法参数传入。
     cands = scene.plan_init_pose()
 
-    print(f"[demo] 候选数={len(cands)}")
     if scene.init_pose is None:
         print("[demo] 求解失败：无候选初始位姿")
         return
