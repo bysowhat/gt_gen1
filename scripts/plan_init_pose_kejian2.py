@@ -1219,6 +1219,9 @@ def main():
     ap.add_argument("--solve-kejian2", action="store_true",
                     help="进入新逻辑求解（lookup n^6 关节角采样 + 允许朝向 snap，分正反手返回）")
     ap.add_argument("--seam-id", type=int, default=0, help="solve-kejian2：用 weld_json 第几条焊缝")
+    ap.add_argument("--out", default=None,
+                    help="solve-kejian2：结果保存路径(.npy)；存 hand/joint_angles/workpiece_pose7，"
+                         "每只手最多 15 个（超出按工件 pose 差距挑选：旋转差距优先、平移次之）")
     ap.add_argument("--lay-flat", action="store_true",
                     help="只跑 lay_flat 摆平工件并 open3d 可视化（用 --obj 或默认 BEAM）")
     args = ap.parse_args()
@@ -1229,6 +1232,8 @@ def main():
         res = plan_init_pose_kejian2(args.obj or DEFAULT_LAY_FLAT_OBJ, args.weld_json,
                                      seam_id=args.seam_id, viz=args.viz)
         print(f"[kejian2] 返回：正手 {len(res['forehand'])} 个 / 反手 {len(res['backhand'])} 个")
+        if args.out:
+            _save_kejian2_npy(res, args.out, k=15)
         return
 
     if args.lay_flat:
@@ -1382,7 +1387,7 @@ def _show_lay_flat(obj_fp: str, T: np.ndarray):
 #   · 工件朝向由 lay_flat 锁死成 4 种允许朝向（沿最长轴 0/180° × 沿垂直地面轴 0/180°，长轴 ⊥ base-x）；
 #     从候选里挑「R 与某允许朝向 xyz 三方向逐轴误差 < snap_deg」者，snap 到该朝向、重算 t 让焊枪尖端
 #     仍落在焊缝 standoff 点（snap 后不复检）；
-#   · 合格者按 bisector 在 base-x 的分量正负分「正手(负x) / 反手(正x)」两类返回。
+#   · 合格者按 bisector 在 base-x 的分量分「正手(与 base-x 反向=负x) / 反手(否则)」两类返回。
 # 过滤范围/缓存全部走 default.yaml 的 plan_init_pose_kejian2 段（经 _kejian2_cfg 注入 solver）。
 # ============================================================================
 def _rotmat_axis_angle(axis, angle: float) -> np.ndarray:
@@ -1462,8 +1467,8 @@ def _kejian2_snap(R_cand, R_valid_list, snap_deg):
     return None, None
 
 
-def _link_z_in_base_batch(cfg, q_rows, link_name: str = "Link6"):
-    """批量 FK：给定关节角 q_rows (N,dof)，返回 link_name 坐标系 +z 轴在 base_link 系的方向 (N,3)。
+def _link_pose_in_base_batch(cfg, q_rows, link_name: str = "Link6"):
+    """批量 FK：给定关节角 q_rows (N,dof)，返回 link_name 在 base_link 系的 (原点位置 (N,3), +z 轴 (N,3))。
 
     复用机器人 yml（cfg.robot_cfg_path）另建一个【仅做 FK】的 CudaRobotModel——把 link_name 注入
     kinematics.link_names（yml 默认 null，只跟踪 ee_link），get_link_poses 才能取到该 link 位姿；
@@ -1488,9 +1493,10 @@ def _link_z_in_base_batch(cfg, q_rows, link_name: str = "Link6"):
         q = q.unsqueeze(0)
     with torch.no_grad():
         pose = kin_model.get_link_poses(q, [link_name])
+    pos = pose.position.reshape(-1, 3).detach().cpu().numpy().astype(np.float64)
     R = quat_wxyz_to_rotmat_batch(pose.quaternion.reshape(-1, 4))   # (N,3,3) 列=各轴在 base
-    z = R[:, :, 2]                                                  # +z 轴在 base
-    return z.detach().cpu().numpy().astype(np.float64)
+    z = R[:, :, 2].detach().cpu().numpy().astype(np.float64)        # +z 轴在 base
+    return pos, z
 
 
 def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
@@ -1502,28 +1508,52 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
     @ joint_angles + 工件 mesh @ T_workpiece_in_base + 绿色焊缝线 + standoff 落枪点）；sol 由 result 适配。"""
     import open3d as o3d
     step = max(1, int(stride))
-    items = []   # (hand_label, i_1based, N, sol_like)
+    items = []   # (hand_label, i_1based, N, sol_like, r)
     for hand_label, lst in (("正手", res.get("forehand", [])), ("反手", res.get("backhand", []))):
         for i in range(0, len(lst), step):
-            T = np.asarray(lst[i]["T_workpiece_in_base"], dtype=np.float64)
+            r = lst[i]
+            T = np.asarray(r["T_workpiece_in_base"], dtype=np.float64)
             sol = {"R": T[:3, :3], "t": T[:3, 3],
-                   "q": np.asarray(lst[i]["joint_angles"], dtype=np.float64)}
-            items.append((hand_label, i + 1, len(lst), sol))
+                   "q": np.asarray(r["joint_angles"], dtype=np.float64)}
+            items.append((hand_label, i + 1, len(lst), sol, r))
     if not items:
         print("[kejian2] 无可视化结果")
         return
     n = len(items)
     print(f"[kejian2] 可视化 {n} 个（每 {step} 个抽 1；按 C 切下一个，直接关窗退出）")
 
+    def _bisector_axis_geoms(origin, direction, length: float = 0.30):
+        """正反手判据轴：从焊缝中心点沿 bisector（背离工件方向）画一根【带箭头的线段】（蓝色箭头）。
+        蓝箭头的 base-x 分量 <0（与 base-x 反向）⇒ 正手，否则 ⇒ 反手（与分类判据一致）。"""
+        import open3d as o3d
+        d = np.asarray(direction, float); d = d / (np.linalg.norm(d) + 1e-12)
+        p0 = np.asarray(origin, float)
+        col = [0.15, 0.35, 0.95]
+        cone_h = 0.30 * length
+        cyl_h = length - cone_h
+        arrow = o3d.geometry.TriangleMesh.create_arrow(
+            cylinder_radius=0.010, cone_radius=0.022,
+            cylinder_height=cyl_h, cone_height=cone_h)
+        arrow.rotate(_align_rotmat([0.0, 0.0, 1.0], d), center=(0.0, 0.0, 0.0))  # 默认 +Z → bisector
+        arrow.translate(p0.tolist())                                            # 箭尾在焊缝中心点
+        arrow.compute_vertex_normals()
+        arrow.paint_uniform_color(col)
+        return [arrow]
+
     cam = {"params": None}   # 跨窗口沿用相机视角，避免每次切换都重置
     idx = 0
     while idx < n:
-        hand_label, i, N, sol = items[idx]
+        hand_label, i, N, sol, r = items[idx]
         title = f"kejian2: {hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）— 按 C 下一个 / 关窗退出"
-        print(f"[viz] {hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）")
+        bis = np.asarray(r["bisector_base"], dtype=np.float64)
+        seam_c = np.asarray(r["seam_center_base"], dtype=np.float64)
+        print(f"[viz] {hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）"
+              f" bisector base-x={float(bis[0]):+.3f}")
         vis = o3d.visualization.VisualizerWithKeyCallback()
         vis.create_window(window_name=title)
         for g in _lookup_solution_geoms(cfg, obj_fp, weld, sol):
+            vis.add_geometry(g)
+        for g in _bisector_axis_geoms(seam_c, bis):   # 蓝色 bisector 轴（正反手判据）
             vis.add_geometry(g)
         if cam["params"] is not None:
             try:
@@ -1551,6 +1581,69 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
         idx += 1
 
 
+def _select_diverse_poses(items: list, k: int = 15) -> list:
+    """从同一只手的合格结果里挑最多 k 个「工件 pose 差距尽量大」的（farthest-point 贪心）。
+
+    距离优先级：先旋转差距（两工件姿态 R 的测地夹角，度），再平移差距（t 的欧氏距离，米）。
+    用 d = rot_deg*1000 + trans_m 把旋转设为主序、平移设为次序（旋转相同才比平移）。
+    ≤k 个时原样返回；否则 FPS：从第 0 个起，每次选「到已选集合最小距离最大」的那个。"""
+    if len(items) <= k:
+        return items
+    Rs = [np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, :3] for r in items]
+    ts = [np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, 3] for r in items]
+    n = len(items)
+
+    def _dist(i, j):
+        c = (np.trace(Rs[i].T @ Rs[j]) - 1.0) * 0.5
+        ang = float(np.degrees(np.arccos(max(-1.0, min(1.0, c)))))
+        tr = float(np.linalg.norm(ts[i] - ts[j]))
+        return ang * 1000.0 + tr
+
+    selected = [0]
+    mind = [_dist(0, j) for j in range(n)]
+    while len(selected) < k:
+        nxt = int(np.argmax(mind))
+        if nxt in selected:          # 退化：剩余全是重复 pose，提前停
+            break
+        selected.append(nxt)
+        for j in range(n):
+            dj = _dist(nxt, j)
+            if dj < mind[j]:
+                mind[j] = dj
+    return [items[i] for i in selected]
+
+
+def _save_kejian2_npy(res: Dict[str, list], path: str, k: int = 15) -> None:
+    """把正/反手结果存成单个 .npy（结构化数组，np.load 直接读，无需 allow_pickle）。
+
+    每条记录字段：hand（'forehand'/'backhand'）、joint_angles（各关节角，rad）、
+    workpiece_pose7（工件在 base_link 下的 pose [x,y,z,qw,qx,qy,qz]）。
+    每只手超过 k 个时用 _select_diverse_poses 挑 k 个（旋转差距优先、平移差距次之）。"""
+    fore = _select_diverse_poses(list(res.get("forehand", [])), k)
+    back = _select_diverse_poses(list(res.get("backhand", [])), k)
+    picked = fore + back
+    if not picked:
+        print("[kejian2] 无合格结果，跳过保存")
+        return
+    ndof = int(np.asarray(picked[0]["joint_angles"], dtype=np.float64).reshape(-1).size)
+    dtype = np.dtype([
+        ("hand", "U10"),
+        ("joint_angles", np.float64, (ndof,)),
+        ("workpiece_pose7", np.float64, (7,)),
+    ])
+    arr = np.empty(len(picked), dtype=dtype)
+    for idx, r in enumerate(picked):
+        arr[idx]["hand"] = r["hand"]
+        arr[idx]["joint_angles"] = np.asarray(r["joint_angles"], dtype=np.float64).reshape(-1)
+        arr[idx]["workpiece_pose7"] = np.asarray(r["workpiece_pose7"], dtype=np.float64).reshape(-1)
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    np.save(path, arr)
+    print(f"[kejian2] 已保存 {len(picked)} 条到 {path}"
+          f"（正手 {len(fore)} / 反手 {len(back)}；每只手最多 {k}，超出按 pose 差距挑选）")
+
+
 def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
                            viz: bool = False) -> Dict[str, list]:
     """新逻辑求解（lookup 关节角采样 + 允许朝向 snap + 正面过滤 + 正反手分类）：
@@ -1562,8 +1655,8 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
        重算 t 让焊枪尖端（FK ee_pos）仍精确落在焊缝 standoff 点（snap 后不复检范围/碰撞）；
     ③ 过滤：焊缝中心点须在 base 系 x>0；焊缝须在「正面」——bisector（背离工件=焊枪 approach 方向）
        在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃；
-    ④ 正反手按【Link6 坐标系 +z 轴】在 base-x 的分量定：负 x 方向=正手，正 x 方向=反手（只看关节构型，
-       与工件朝向无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
+    ④ 正反手按【bisector】在 base-x 的分量定：与 base-x 反向(负 x)=正手，否则=反手（焊缝几何，
+       与关节构型无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
     from gt_gen.config import load_config
 
     cfg = load_config()
@@ -1606,10 +1699,6 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     mid_world = np.asarray(weld["mid_world"], dtype=np.float64)
     bis_world = np.asarray(weld["bisector_world"], dtype=np.float64)
     target_world = mid_world + standoff * bis_world      # 焊枪尖端目标点（mesh world 系）
-
-    # 正反手判据所需：批量 FK 出每个候选 q 的 Link6 +z 轴在 base 的方向（与工件朝向无关，只看关节构型）
-    q_all = np.stack([np.asarray(s["q"], dtype=np.float64) for s in cands], axis=0)
-    link6_z_base = _link_z_in_base_batch(cfg2, q_all, "Link6")    # (N,3)
 
     def _T(R, t):
         T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
@@ -1655,11 +1744,10 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         R0_ee = _align_rotmat([1.0, 0.0, 0.0], bis_base)   # 末端局部 +x → bisector_base
         goal_quat = rotmat_to_quat_wxyz(R0_ee)
         goal_pose7 = np.concatenate([ee_pos, goal_quat])   # 位置= standoff 落枪点(=ee_pos)
-        # （req）正反手按 Link6 坐标系 +z 轴在 base-x 的分量定：负 x=正手 / 正 x=反手（只看关节构型）
-        z6 = link6_z_base[i]
-        if abs(float(z6[0])) < 1e-9:
-            print(f"[kejian2] 警告：候选 i={i} Link6 +z 轴 base-x 分量≈0，归为正手")
-        hand = "forehand" if float(z6[0]) < 0.0 else "backhand"
+        # （req）正反手按 bisector 在 base-x 的分量定：与 base-x 反向(负 x)=正手 / 否则=反手
+        if abs(float(bis_base[0])) < 1e-9:
+            print(f"[kejian2] 警告：候选 i={i} bisector base-x 分量≈0，归为反手")
+        hand = "forehand" if float(bis_base[0]) < 0.0 else "backhand"
         results.append({
             "workpiece_pose7": mat44_to_pose7(_T(Rv, t_new)),
             "T_workpiece_in_base": _T(Rv, t_new),
@@ -1669,7 +1757,6 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
             "rot_y_deg": float(sol["rot_y_deg"]),
             "rot_z_deg": float(sol["rot_z_deg"]),
             "bisector_base": np.asarray(bis_base, dtype=np.float64),
-            "link6_z_base": np.asarray(z6, dtype=np.float64),
             "seam_center_base": np.asarray(seam_center_base, dtype=np.float64),
             "orientation_id": int(oid),
             "hand": hand,

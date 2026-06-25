@@ -124,8 +124,8 @@ plan_init_pose_kejian2:                  # lookup(n^6 关节角采样, 复用 pl
   #   ② 从候选里挑「旋转 R 与 4 种允许朝向（lay_flat / 沿最长轴翻180° / 沿垂直地面轴翻180° / 两者皆翻；
   #      最长轴 ⊥ base-x）某一种的 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、重算 t 让焊枪尖端
   #      仍落在焊缝 standoff 点（snap 后不复检）；③ 过滤：焊缝中心点须在 base-x>0；且焊缝须在「正面」
-  #      （bisector 在 base-z 分量<0 ⇒ 焊缝朝下=背面，丢弃）；④ 按【Link6 坐标系 +z 轴】在 base-x 的
-  #      分量分「正手(负x) / 反手(正x)」（只看关节构型，与工件朝向无关）。
+  #      （bisector 在 base-z 分量<0 ⇒ 焊缝朝下=背面，丢弃）；④ 按【bisector】在 base-x 的
+  #      分量分「正手(与 base-x 反向=负x) / 反手(否则)」（焊缝几何，与关节构型无关）。
   ee_xy_range_m: [0.4, 1.0]             # 焊缝点 xy 平面到 base_link 原点距离 [下限,上限]（米）
   ee_z_range_m: [-0.1, 0.1]             # 焊缝点在 base_link 系 z [下限,上限]（米）
   n_per_dof: 12                         # 每关节采样档数，q_table = n_per_dof^6
