@@ -1986,12 +1986,17 @@ def _save_kejian2_npy(res: Dict[str, list], path: str, k: int = 15,
 def _write_kejian2_log(log_path: str, obj_fp: str, weld_json: str,
                        save_dir: Optional[str], save_k: int,
                        stats: List[dict], total_welds: int,
-                       filtered: Optional[List[dict]] = None) -> None:
+                       filtered: Optional[List[dict]] = None,
+                       setup_s: float = 0.0, elapsed_s: float = 0.0) -> None:
     """把逐焊缝求解情况写成一个 txt（每条焊缝解完就重写一次，中断也保住已完成的记录）。
 
-    stats 每项：{idx, n_fore, n_back, saved_fore, saved_back}（合格=求解给出数，已存=落盘数=min(合格,k)）。
+    stats 每项：{idx, n_fore, n_back, saved_fore, saved_back, t_solve}
+        （合格=求解给出数，已存=落盘数=min(合格,k)；t_solve=该焊缝 ④+⑤ 耗时秒，缺省 0）。
     filtered 每项：{idx, length_cm}——被 --filter-short 过滤掉的短焊缝（未求解）。
-    内容：逐焊缝成功/失败 + 合格/已存条数；被过滤短焊缝清单；末尾汇总成功率、失败 seam 列表、合格/已存总数。
+    setup_s：工件级一次性 ②③（solver/ESDF/joint 表）耗时秒，全焊缝共享、只算一次。
+    elapsed_s：逐焊缝求解循环到此刻的累计墙钟秒。
+    内容：逐焊缝成功/失败 + 合格/已存条数 + 耗时；被过滤短焊缝清单；末尾汇总成功率、失败 seam、
+    合格/已存总数，以及计时（setup / 求解累计 / 平均·最慢每条 / 总墙钟）。
     成功率按【实际求解的焊缝】(stats) 计，过滤掉的不计入分母。"""
     import datetime as _dt
     filtered = filtered or []
@@ -2005,6 +2010,8 @@ def _write_kejian2_log(log_path: str, obj_fp: str, weld_json: str,
     sum_qual_b = sum(s["n_back"] for s in stats)
     sum_save_f = sum(s["saved_fore"] for s in stats)
     sum_save_b = sum(s["saved_back"] for s in stats)
+    solve_times = [float(s.get("t_solve", 0.0)) for s in stats]
+    sum_solve = sum(solve_times)
     lines = []
     lines.append("# plan_init_pose_kejian2 初始位姿求解日志")
     lines.append(f"工件 obj      : {obj_fp}")
@@ -2019,11 +2026,14 @@ def _write_kejian2_log(log_path: str, obj_fp: str, weld_json: str,
     for s in stats:
         qual = s["n_fore"] + s["n_back"]
         saved = s["saved_fore"] + s["saved_back"]
+        ts = float(s.get("t_solve", 0.0))
         if qual > 0:
             lines.append(f"seam {s['idx']:>4}  成功   合格 {qual:>5} (正手 {s['n_fore']:>4} / 反手 {s['n_back']:>4})"
-                         f"   已存 {saved:>3} (正手 {s['saved_fore']:>3} / 反手 {s['saved_back']:>3})")
+                         f"   已存 {saved:>3} (正手 {s['saved_fore']:>3} / 反手 {s['saved_back']:>3})"
+                         f"   耗时 {ts:7.2f}s")
         else:
-            lines.append(f"seam {s['idx']:>4}  失败   合格     0   已存   0")
+            lines.append(f"seam {s['idx']:>4}  失败   合格     0   已存   0"
+                         f"   耗时 {ts:7.2f}s")
     if filtered:
         lines.append("")
         lines.append(f"===== 过滤掉的短焊缝 (<{SHORT_SEAM_LEN_M * 100:.0f}cm，未求解) =====")
@@ -2040,6 +2050,17 @@ def _write_kejian2_log(log_path: str, obj_fp: str, weld_json: str,
                      f"   seam: {[fz['idx'] for fz in filtered]}")
     lines.append(f"合格 pose 总数  : {sum_qual_f + sum_qual_b}  (正手 {sum_qual_f} / 反手 {sum_qual_b})")
     lines.append(f"已存 pose 总数  : {sum_save_f + sum_save_b}  (正手 {sum_save_f} / 反手 {sum_save_b})")
+    lines.append("")
+    lines.append("===== 计时 =====")
+    lines.append(f"工件级 ②③ setup : {setup_s:8.2f}s  (solver/ESDF/joint 表，全焊缝共享、只一次)")
+    lines.append(f"逐焊缝 ④⑤ 累计  : {sum_solve:8.2f}s  (已处理 {len(stats)} 条求解时间之和)")
+    if stats:
+        avg = sum_solve / len(stats)
+        i_max = max(range(len(stats)), key=lambda k: solve_times[k])
+        lines.append(f"  每条平均      : {avg:8.2f}s")
+        lines.append(f"  最慢一条      : {solve_times[i_max]:8.2f}s  (seam {stats[i_max]['idx']})")
+    lines.append(f"求解墙钟        : {elapsed_s:8.2f}s  (循环 wall-clock，含落盘/写日志开销)")
+    lines.append(f"合计(setup+墙钟): {setup_s + elapsed_s:8.2f}s")
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -2347,6 +2368,7 @@ def plan_init_pose_kejian2_all(obj_fp: str, weld_json: str,
 
     out: Dict[int, Dict[str, list]] = {}
     stats: List[dict] = []
+    setup_s = sum(ctx["prof_setup"].values())   # 工件级 ②③ 一次性耗时，写日志计时段共享
     t_all = _time.time()
     for wi, weld in enumerate(welds):
         sid = int(weld["idx"])
@@ -2361,15 +2383,16 @@ def plan_init_pose_kejian2_all(obj_fp: str, weld_json: str,
         out[sid] = res
         n_fore, n_back = len(res["forehand"]), len(res["backhand"])
         stats.append({"idx": sid, "n_fore": n_fore, "n_back": n_back,
-                      "saved_fore": min(n_fore, save_k), "saved_back": min(n_back, save_k)})
+                      "saved_fore": min(n_fore, save_k), "saved_back": min(n_back, save_k),
+                      "t_solve": _t4 + _t5})
         if log_path is not None:                  # 边算边写日志：中断也保住已完成焊缝的记录
             _write_kejian2_log(log_path, obj_fp, weld_json, save_dir, save_k, stats, len(welds),
-                               filtered=filtered)
+                               filtered=filtered, setup_s=setup_s, elapsed_s=_time.time() - t_all)
     # 全被过滤（没有任何焊缝可求解）时也写一次日志，把过滤清单落盘
     if log_path is not None and not welds:
         _write_kejian2_log(log_path, obj_fp, weld_json, save_dir, save_k, stats, len(welds),
-                           filtered=filtered)
-    _setup = sum(ctx["prof_setup"].values())
+                           filtered=filtered, setup_s=setup_s, elapsed_s=_time.time() - t_all)
+    _setup = setup_s
     print(f"\n[kejian2] 全部 {len(welds)} 条焊缝完成：工件级 ②③ 一次 {_setup:.3f}s "
           f"+ 逐焊缝 ④⑤ 共 {_time.time() - t_all:.3f}s")
     if log_path is not None:
