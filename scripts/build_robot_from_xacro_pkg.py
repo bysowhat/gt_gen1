@@ -313,18 +313,142 @@ def gen_urdf(joints, col):
     return "\n".join(out)
 
 
-# ---------- 拟合碰撞球 ----------
-N_SPHERES = {                       # 每锚 link 的球数（参照旧 yml 量级）
-    "xiaoyu_base_link": 36, "xiaoyu_arm_base_link": 7,
-    "Link1": 6, "Link2": 12, "Link3": 12, "Link4": 6, "Link5": 6, "Link6": 6,
+# ---------- 拟合碰撞球（中轴球心 + 到真实表面的内切半径 + 贪心覆盖）----------
+# 关键：球心取填实体素的中轴（EDT 深处），但【半径取该点到真实 mesh 表面的距离】
+#       （mesh.nearest.on_surface，无符号；候选点已在填实体素内部 → 该距离即内切半径）。
+#       不再用 edt*pitch —— 那是到【体素边界】的距离，粗 pitch 下比真实表面大半~一个体素，
+#       球会鼓出 mesh（旧版 base 半径 0.07，本法误成 0.19）。再乘 SHRINK 留安全余量，
+#       保证球⊆mesh、绝不溢出表面（代价：覆盖率略降，符合需求）。
+N_SPHERES = {                       # 每锚 link 的最大球数（够覆盖即停）
+    "xiaoyu_base_link": 150, "xiaoyu_arm_base_link": 12,
+    "Link1": 16, "Link2": 24, "Link3": 24, "Link4": 16, "Link5": 16, "Link6": 16,
     "xiaoyu_accessory_link": 40,
 }
-SURF_R = 0.01                       # surface_sphere_radius
+PITCH = {                           # 每锚 link 的体素边长（米）：越小越细、球越多
+    "xiaoyu_base_link": 0.020, "xiaoyu_accessory_link": 0.012,
+}
+DEFAULT_PITCH = 0.016               # 臂连杆默认体素边长（细一些，补偿球变小后的覆盖）
+SHRINK = 0.98                       # 半径安全收缩系数：半径=到最近表面距离时球恰好内切(相切不穿)，
+                                    #   0.98 仅留极小数值余量，绝不溢出又不至于到处留大空隙
+OVERLAP = 0.65                      # 贪心覆盖判据：候选落入已选球 OVERLAP*r 内即算覆盖（越小越密、重叠越多）
+
+# 细长杆补球：主拟合把整锚 mesh 合并后贪心选球，细长/突出杆件常被主体大球挤掉而盖不全。
+# 这里【单独】对指定子 mesh 用「轴向不重叠球链」拟合（rod_chain_spheres）：沿连杆主轴从一端码到
+# 另一端，球心取轴向薄片质心(跟随弯曲)，半径=质心到该子 mesh 表面距离(内切→不溢出)，相邻球相切不重叠。
+# 追加到所属锚 link，不改已有球。targets = (urdf_link, mesh_idx, anchor, min_r, max_n)。
+# mesh_idx 与 viz_robot_spheres_isaacsim.py 里 <link>_<idx> 命名一致（= URDF 内该 link 第 idx 个 visual）。
+EXTRA_THIN = [
+    ("welder_cover", 0, "xiaoyu_accessory_link", 0.005, 40),       # goose_neck 鹅颈（弯杆，30×199mm）
+    ("xiaoyu_accessory_link", 3, "xiaoyu_accessory_link", 0.005, 30),  # welder_jacket 喷嘴套（30×78mm）
+    ("xiaoyu_accessory_link", 1, "xiaoyu_accessory_link", 0.010, 20),  # welder_camera（48×123mm）
+    ("Link3", 1, "Link3", 0.010, 40),                              # link3_bracket 线缆支架（70×446mm）
+    ("Link2", 1, "Link2", 0.010, 40),                              # link2_bracket 线缆支架（70×334mm）
+    ("xiaoyu_base_link", 2, "xiaoyu_base_link", 0.012, 30),        # positioning_pen 定位笔（90×201mm）
+]
+
+
+def medial_spheres(mesh, n, pitch):
+    """中轴球拟合：球心=中轴体素，半径=到真实表面距离×SHRINK（保证⊆mesh）。
+    返回 (centers[K,3], radii[K])。"""
+    from scipy.ndimage import distance_transform_edt
+    vg = mesh.voxelized(pitch)
+    try:
+        vg = vg.fill()                          # 填实内部（mesh 须近似 watertight）
+    except Exception:
+        pass
+    mat = vg.matrix.astype(bool)
+    if not mat.any():
+        return np.zeros((0, 3)), np.zeros(0)
+    edt = distance_transform_edt(mat)           # 体素内部到外部距离（体素单位）
+    idx = np.argwhere(mat)
+    pts = vg.indices_to_points(idx.astype(float))
+    edt_r = edt[mat]
+    keep = edt_r >= 1.0                          # 至少离体素边界 1 层，去掉贴边碎球、省查询
+    if not keep.any():
+        keep = edt_r >= edt_r.max() * 0.5
+    pts = pts[keep]
+    # 半径 = 候选点到真实 mesh 表面的距离（点在内部 → 即内切半径），不依赖 watertight
+    try:
+        _, dist, _ = mesh.nearest.on_surface(pts)
+    except Exception:
+        dist = edt_r[keep] * pitch              # 退化：用体素半径
+    rad = np.asarray(dist) * SHRINK
+    good = rad > pitch * 0.4                      # 太小的球不要（防碎屑）
+    pts, rad = pts[good], rad[good]
+    if len(pts) == 0:
+        return np.zeros((0, 3)), np.zeros(0)
+    order = np.argsort(-rad)                      # 半径降序
+    covered = np.zeros(len(pts), bool)
+    cc, cr = [], []
+    for k in order:
+        if covered[k]:
+            continue
+        c, r = pts[k], rad[k]
+        cc.append(c); cr.append(r)
+        covered |= np.linalg.norm(pts - c, axis=1) <= r * OVERLAP
+        if len(cc) >= n:
+            break
+    return np.array(cc), np.array(cr)
+
+
+def rod_chain_spheres(mesh, min_r, max_n):
+    """沿连杆轴向码放【不重叠】内切球链（跟随弯曲）。返回 (centers[K,3], radii[K])。
+      ① 密集采样表面点(+顶点)，与顶点数/是否封闭无关，盒体/薄板/管件都密；
+      ② PCA 主轴；③ 沿主轴细步前进，每步取该【轴向薄片】采样点【质心】当球心
+         （= 截面中心，落在中轴；弯杆逐片质心也跟随弯曲）；
+      ④ 半径 = 球心到 mesh 表面距离 × SHRINK（真实内切，绝不上浮 → 必不溢出）；
+         若 mesh 封闭且球心落在体外(L 形拐角)则跳过；仅当与上一颗球【球心距 ≥ 两半径和】才落球
+         → 相邻必不重叠（不算覆盖率）。
+    min_r: 半径阈值（米，截面太细就跳过）；max_n: 最多球数。"""
+    np.random.seed(0)                                    # 采样确定化（可复现）
+    try:
+        S = np.asarray(mesh.sample(8000))
+    except Exception:
+        S = np.asarray(mesh.vertices)
+    Pts = np.vstack([S, np.asarray(mesh.vertices, float)])
+    c0 = Pts.mean(0)
+    _, vecs = np.linalg.eigh(np.cov((Pts - c0).T))
+    axis = vecs[:, -1]
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    proj = (Pts - c0) @ axis
+    smin, smax = float(proj.min()), float(proj.max())
+    span = smax - smin
+    watertight = bool(mesh.is_watertight)
+    step = max(min_r * 0.4, span * 0.01)                 # 细步搜索增量（不是球间距）
+    cc, cr = [], []
+    prev_c, prev_r = None, None
+    s = smin
+    guard = 0
+    while s <= smax and len(cc) < max_n and guard < 20000:
+        guard += 1
+        s += step
+        half = max(prev_r or min_r, span * 0.015)        # 薄片半宽
+        sel = np.abs(proj - s) <= half
+        if int(sel.sum()) < 5:
+            continue
+        center = Pts[sel].mean(0)                         # 截面质心 → 中轴点（跟随弯曲）
+        if watertight and not bool(mesh.contains(center[None])[0]):
+            continue                                     # 球心落在体外（L 形拐角）→ 跳过
+        r = float(mesh.nearest.on_surface(center[None])[1][0]) * SHRINK
+        if r < min_r:
+            continue                                     # 截面太细处不放球（不撑大 → 不溢出）
+        if prev_c is not None and np.linalg.norm(center - prev_c) < prev_r + r:
+            continue                                     # 会与上一颗重叠 → 再往前找
+        cc.append(center); cr.append(r)
+        prev_c, prev_r = center, r
+    return np.array(cc), np.array(cr)
+
+
+def _coverage(mesh, c, r, tol=0.005):
+    if len(c) == 0:
+        return 0.0
+    pts = mesh.sample(4000)
+    d = np.linalg.norm(pts[:, None, :] - np.array(c)[None, :, :], axis=2) - np.array(r)[None, :]
+    return float((d.min(axis=1) <= tol).mean())
 
 
 def fit_all_spheres(joints, col):
     import trimesh
-    from curobo.geom.sphere_fit import fit_spheres_to_mesh, SphereFitType
 
     # 把每个有 mesh 的 link 折叠到最近锚
     groups = {a: [] for a in ANCHORS}
@@ -343,15 +467,40 @@ def fit_all_spheres(joints, col):
             m.apply_transform(t)
             meshes.append(m)
         merged = trimesh.util.concatenate(meshes)
-        n = N_SPHERES.get(a, 12)
-        pts, rad = fit_spheres_to_mesh(merged, n, surface_sphere_radius=SURF_R,
-                                       fit_type=SphereFitType.VOXEL_VOLUME_SAMPLE_SURFACE)
+        pts, rad = medial_spheres(merged, N_SPHERES.get(a, 16), PITCH.get(a, DEFAULT_PITCH))
         lst = [{"center": [round(float(c), 6) for c in pts[i]], "radius": round(float(rad[i]), 6)}
-               for i in range(len(pts)) if rad[i] > 1e-4]
+               for i in range(len(pts))]
         spheres[a] = lst
-        print("  %-22s mesh=%d  -> %d 球 (r %.3f~%.3f)"
+        cov = _coverage(merged, pts, rad)
+        print("  %-22s mesh=%d -> %3d 球 (r %.3f~%.3f) 覆盖率=%.1f%%"
               % (a, len(meshes), len(lst),
-                 min(s["radius"] for s in lst), max(s["radius"] for s in lst)))
+                 min(s["radius"] for s in lst), max(s["radius"] for s in lst), cov * 100))
+    return spheres
+
+
+def fit_extra_thin(joints, col, spheres):
+    """对 EXTRA_THIN 指定的细长杆子 mesh 用「轴向不重叠球链」拟合，【追加】到所属锚 link。
+    不改动 spheres 里已有的球（只在末尾 append）。"""
+    import trimesh
+    for urdf_link, idx, anchor, min_r, max_n in EXTRA_THIN:
+        path, t_in_link = col[urdf_link][idx]
+        a, T_a_ln = nearest_anchor(urdf_link, joints)     # 子 mesh 所在 link 折叠到锚的变换
+        if a != anchor:
+            print("  [extra][warn] %s 的锚是 %s，与配置 %s 不符，跳过" % (urdf_link, a, anchor))
+            continue
+        m = trimesh.load(os.path.join(PKG, path), force="mesh")
+        m.apply_transform(T_a_ln @ t_in_link)             # 变到锚局部系（与已有球同系）
+        pts, rad = rod_chain_spheres(m, min_r, max_n)     # 轴向相切球链，内切→不溢出
+        add = [{"center": [round(float(c), 6) for c in pts[i]], "radius": round(float(rad[i]), 6)}
+               for i in range(len(pts))]
+        spheres[anchor] = spheres.get(anchor, []) + add
+        tag = "%s_%d" % (urdf_link, idx)
+        if add:
+            print("  [extra] %-26s +%2d 球链 (r %.3f~%.3f) -> %s"
+                  % (tag, len(add), min(s["radius"] for s in add),
+                     max(s["radius"] for s in add), anchor))
+        else:
+            print("  [extra] %-26s +0 球（mesh 太薄/顶点过少）" % tag)
     return spheres
 
 
@@ -377,6 +526,8 @@ def weld_wire_tip_spheres(tcp_mode):
 
 # ---------- 写 ur12e_full.yml ----------
 SELF_COLL_IGNORE = {
+    # 仅忽略运动链【相邻】link 对（与旧 ur12e_full.yml 一致）。球已内切不再假自碰
+    # （retract 实测 0 重叠），故不再额外忽略非相邻对，以免掩盖其它构型的真实自碰。
     "xiaoyu_arm_base_link": ["xiaoyu_base_link", "Link1"],
     "Link1": ["Link2"], "Link2": ["Link3"], "Link3": ["Link4"],
     "Link4": ["Link5"], "Link5": ["Link6"], "Link6": ["xiaoyu_accessory_link"],
@@ -437,6 +588,8 @@ def main():
 
     print("[spheres] 拟合中（CPU）...")
     spheres = fit_all_spheres(joints, col)
+    print("[spheres] 细长杆补球（追加，不改已有）...")
+    spheres = fit_extra_thin(joints, col, spheres)
     tip_centers = weld_wire_tip_spheres(args.tcp)
     print("[tip] 焊丝尖端球(accessory 系) =", tip_centers)
 
