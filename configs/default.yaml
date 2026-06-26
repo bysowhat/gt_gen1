@@ -134,8 +134,25 @@ plan_init_pose_kejian2:                  # lookup(n^6 关节角采样, 复用 pl
                                         #   也可填标量(如 12)=各关节同档(=n^6，旧行为)。本表：基座 joint0/1/2 取 16(定位更细)，
                                         #   腕部 joint3/4 取 10/12，joint5(腕滚 ±6.2rad，与 rot_x roll 冗余) 取 6。
                                         #   想加精度就调大对应关节；显存≈幸存者数×碰撞球，先小步加。改了此值须重算关节表缓存。
-  collision_tolerance_m: -0.02           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
+  collision_tolerance_m: 0.0             # 整臂/retract 碰撞球对工件 的允许穿透阈值（米，d<=tol 判 safe）。
+                                        #   d=get_collision_distance 是【碰撞代价，clamp≥0】：不碰撞恒=0、穿透才>0，
+                                        #   不返回负的「间隙」。故 tol 只能 >=0：0=不许碰(贴着算过)，正值=允许穿透 tol 米。
+                                        #   ⚠ 负值永远无解（d 最小就是 0，<=负数恒 False）。想让手臂离工件留 g 间隙，
+                                        #     不能设负 tol，要把碰撞球半径膨胀 g 再判（见 _voxel_collision_distance_batch）。
   voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
+  clearance_inflate_m: 0.01              # 间隙膨胀量（米）：把【手臂本体】碰撞球半径 +此值再判碰，
+                                        #   等效要求手臂离工件至少留此间隙（0=关闭）。因 get_collision_distance
+                                        #   是 clamp≥0 的碰撞代价、不返回负间隙，故「留间隙」靠膨胀半径实现，
+                                        #   不能用负 collision_tolerance。焊枪尖端球(下方 tip_spheres)不膨胀。
+  tip_spheres:                          # 焊枪尖端球（间隙膨胀时排除，不膨胀，保证尖端能贴焊缝 standoff）。
+    link: xiaoyu_accessory_link         #   球所在 link；center 为该 link 局部系坐标，与 robot cfg collision_spheres 一致
+    match_tol_m: 0.0005                 #   center 匹配容差（米）；匹配数须等于 centers 数，否则报错
+    centers:                            #   weld_wire 沿 +X 的 5 个尖端球（r=0.003）
+      - [0.0405, 0.0, 0.0]
+      - [0.0355, 0.0, 0.0]
+      - [0.0305, 0.0, 0.0]
+      - [0.0255, 0.0, 0.0]
+      - [0.0205, 0.0, 0.0]
   standoff_cm: 2.0                      # 焊枪头落点沿 bisector（远离工件方向）外移的 standoff 距离（cm）
   rot_x_deg: [-180, 180, 30]            # lookup 绕末端局部 +x 轴（=名义焊枪轴 -x，焊枪自转 roll）：[min,max,step]（度）
   rot_y_deg: [-30, 30, 15]              # lookup 绕末端局部 +y 轴（tilt）：[min,max,step]（度）

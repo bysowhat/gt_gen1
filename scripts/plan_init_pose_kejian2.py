@@ -387,7 +387,8 @@ class InitPoseLookupSolver:
 
     def __init__(self, cfg, obj_fp: Optional[str],
                  collision_tolerance: float = 0.03, voxel_size: float = 0.02,
-                 n_per_dof: int = 7):
+                 n_per_dof: int = 7, clearance_inflate: float = 0.0,
+                 tip_spheres: Optional[dict] = None):
         import gt_gen.compat  # noqa: F401  warp shim，须在 import curobo 前
         from curobo.types.base import TensorDeviceType
 
@@ -397,6 +398,11 @@ class InitPoseLookupSolver:
         self.collision_tolerance = collision_tolerance
         self.voxel_size = voxel_size
         self.n_per_dof = n_per_dof
+        # 间隙膨胀：手臂本体球半径 +clearance_inflate 再判碰（焊枪尖端 tip_spheres 排除），
+        # 等效要求手臂离工件留间隙。inflate_mask 在首次 solve 时按 tip_spheres 懒构造。
+        self.clearance_inflate = float(clearance_inflate)
+        self.tip_spheres_cfg = dict(tip_spheres or {})
+        self.inflate_mask = None
 
         self._load_robot()
         self.robot_world = None
@@ -725,6 +731,57 @@ class InitPoseLookupSolver:
         return True
 
     # ---- 在线求解 ----
+    def _build_inflate_mask(self):
+        """构造碰撞球半径膨胀 mask (K,)：焊枪尖端球（tip_spheres_cfg）置 0（不膨胀），其余置 1。
+
+        间隙膨胀（clearance_inflate>0）时，手臂本体球半径 +clearance、尖端球保持原半径——
+        既让整臂离工件留间隙，又不妨碍焊枪尖端贴到焊缝 standoff 点。
+        尖端球靠【link 局部系 center】匹配 robot cfg collision_spheres 定义来定位（不写死球索引）：
+          get_sphere_index_from_link_name(link) 给出该 link 全部球的全局索引（顺序=定义顺序），
+          再用 yaml centers 在该 link 的 collision_spheres 定义里按 center 匹配出局部序号 → 全局索引。
+        匹配数必须等于 centers 数，否则报错（避免静默排错球）。"""
+        import torch
+        K = int(self.K_link)
+        mask = torch.ones(K, device=self.tensor_args.device, dtype=self.tensor_args.dtype)
+        cfg_tip = self.tip_spheres_cfg or {}
+        centers = cfg_tip.get("centers") or []
+        if self.clearance_inflate <= 0.0 or not centers:
+            self.inflate_mask = mask
+            self.n_tip_excluded = 0
+            return
+
+        link = cfg_tip.get("link")
+        tol = float(cfg_tip.get("match_tol_m", 0.0005))
+        kc = self.robot_cfg.kinematics.kinematics_config
+        gidx = kc.get_sphere_index_from_link_name(link)
+        gidx = gidx.tolist() if hasattr(gidx, "tolist") else list(gidx)
+        defs = self.robot_cfg_dict["kinematics"]["collision_spheres"][link]
+        if len(gidx) != len(defs):
+            raise ValueError(
+                f"[间隙膨胀] {link} 全局球数 {len(gidx)} != collision_spheres 定义数 {len(defs)}，"
+                f"无法用定义顺序定位尖端球")
+        excluded = []
+        for c in centers:
+            cc = np.asarray(c, dtype=np.float64)
+            hit = None
+            for j, sph in enumerate(defs):
+                if np.linalg.norm(np.asarray(sph["center"], dtype=np.float64) - cc) <= tol:
+                    hit = j
+                    break
+            if hit is None:
+                raise ValueError(
+                    f"[间隙膨胀] tip_spheres center {cc.tolist()} 在 {link} 的 collision_spheres "
+                    f"里没匹配到（match_tol_m={tol}）")
+            excluded.append(int(gidx[hit]))
+        if len(set(excluded)) != len(centers):
+            raise ValueError(f"[间隙膨胀] tip_spheres 匹配到重复球：{excluded}")
+        for gi in excluded:
+            mask[gi] = 0.0
+        self.inflate_mask = mask
+        self.n_tip_excluded = len(excluded)
+        print(f"[kejian2] 间隙膨胀 clearance={self.clearance_inflate * 100:.1f}cm："
+              f"排除焊枪尖端球 {len(excluded)}/{K}（{link}），其余 {K - len(excluded)} 球半径 +clearance")
+
     def solve_one_weld_lookup(self, weld: Dict,
                               rot_x_deg: Tuple[float, ...] = (0.0,),
                               rot_y_deg: Tuple[float, ...] = (0.0,),
@@ -738,6 +795,10 @@ class InitPoseLookupSolver:
         import torch
         device = self.tensor_args.device
         dtype = self.tensor_args.dtype
+
+        # 间隙膨胀 mask（焊枪尖端球排除）懒构造一次；clearance<=0 时为全 1（不改变行为）。
+        if self.inflate_mask is None:
+            self._build_inflate_mask()
 
         mid = torch.tensor(weld["mid_world"], device=device, dtype=dtype)
         bisector = torch.tensor(weld["bisector_world"], device=device, dtype=dtype)
@@ -804,6 +865,12 @@ class InitPoseLookupSolver:
                         link_r = self.link_spheres_t[..., 3]
                         ret_xyz_b = self.retract_spheres_t[:, :3]
                         ret_r = self.retract_spheres_t[:, 3]
+                        # 间隙膨胀：手臂本体球半径 +clearance（inflate_mask 已把焊枪尖端球置 0 → 不膨胀）。
+                        # clearance<=0 时 inflate_mask 全 1 但加 0，等价不改；下方按 sl/广播取用。
+                        if self.clearance_inflate > 0.0:
+                            add_r = self.clearance_inflate * self.inflate_mask   # (K,)
+                            link_r = link_r + add_r[None, :]                     # (N,K)
+                            ret_r = ret_r + add_r                                # (K,)
 
                         chunk = 2048
                         d_link_list, d_ret_list = [], []
@@ -1795,7 +1862,9 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         cfg2, obj_fp,
         collision_tolerance=cfg.plan_init_kejian2_collision_tolerance,
         voxel_size=cfg.plan_init_kejian2_voxel_size,
-        n_per_dof=cfg.plan_init_kejian2_n_per_dof)
+        n_per_dof=cfg.plan_init_kejian2_n_per_dof,
+        clearance_inflate=cfg.plan_init_kejian2_clearance_inflate,
+        tip_spheres=cfg.plan_init_kejian2_tip_spheres)
     if solver.load_joint_table():
         print("[kejian2] 复用已存 joint table（跳过 n^6 预计算）")
     else:

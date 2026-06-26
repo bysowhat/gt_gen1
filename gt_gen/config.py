@@ -286,6 +286,20 @@ class Config:
         return float(self._kejian2.get("voxel_size_m", 0.01))
 
     @property
+    def plan_init_kejian2_clearance_inflate(self) -> float:
+        """间隙膨胀量（米）：把【手臂本体】碰撞球半径膨胀，让整臂离工件留间隙；0=关闭。
+        碰撞代价 get_collision_distance 是 clamp≥0（不返回负间隙），故「留间隙」靠膨胀球半径实现，
+        不能用负 collision_tolerance。焊枪尖端球由 plan_init_kejian2_tip_spheres 排除（不膨胀，保证贴焊缝）。
+        见 plan_init_pose_kejian2.clearance_inflate_m。"""
+        return float(self._kejian2.get("clearance_inflate_m", 0.0))
+
+    @property
+    def plan_init_kejian2_tip_spheres(self) -> dict:
+        """焊枪尖端球（间隙膨胀时排除，不膨胀）：{link, centers:[[x,y,z]...], match_tol_m}，
+        center 为该 link 局部系坐标，与 robot cfg collision_spheres 定义一致。见 plan_init_pose_kejian2.tip_spheres。"""
+        return dict(self._kejian2.get("tip_spheres", {}) or {})
+
+    @property
     def plan_init_kejian2_standoff(self) -> float:
         """goal 落点沿 bisector（远离工件方向）外移的 standoff 距离（米）。见 plan_init_pose_kejian2.standoff_cm。"""
         return float(self._kejian2.get("standoff_cm", 0.0)) / 100.0
