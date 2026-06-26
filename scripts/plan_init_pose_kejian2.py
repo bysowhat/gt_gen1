@@ -961,23 +961,35 @@ class InitPoseLookupSolver:
 
                     top_per = min(50, safe_idx.shape[0])
                     top_local = torch.argsort(scores, descending=True)[:top_per]
-                    for li in top_local:
-                        gi = int(safe_idx[li].item())
+                    # 批量 GPU→CPU：原先逐解 .cpu()/.item()（每条 9 次微传输 → 上万条共 ~14 万次 kernel
+                    # 启动延迟）改成每张量整批传一次，再在 numpy 里按行取。索引/取值完全一致，只是省掉微传输。
+                    sel = safe_idx[top_local]                       # (top_per,) 全局索引
+                    sel_np = sel.cpu().numpy()
+                    q_np = self.q_table_t[sel].cpu().numpy()        # (top_per, dof)
+                    R_np = R[sel].cpu().numpy()                     # (top_per,3,3)
+                    t_np = t_arr[sel].cpu().numpy()
+                    ee_np = self.ee_pos_t[sel].cpu().numpy()
+                    mid_np = mid_base_arr[sel].cpu().numpy()
+                    eex_np = self.ee_x_t[sel].cpu().numpy()
+                    dl_np = d_link[sel].cpu().numpy()
+                    dr_np = d_ret[sel].cpu().numpy()
+                    sc_np = scores[top_local].cpu().numpy()
+                    for k in range(sel_np.shape[0]):
                         all_solutions.append({
-                            "q_idx": gi,
-                            "q": self.q_table_t[gi].cpu().numpy(),
-                            "R": R[gi].cpu().numpy(),
-                            "t": t_arr[gi].cpu().numpy(),
+                            "q_idx": int(sel_np[k]),
+                            "q": q_np[k],
+                            "R": R_np[k],
+                            "t": t_np[k],
                             "rot_x_deg": ax_deg,
                             "rot_y_deg": ay_deg,
                             "rot_z_deg": az_deg,
-                            "ee_pos_in_base": self.ee_pos_t[gi].cpu().numpy(),
-                            "mid_in_base": mid_base_arr[gi].cpu().numpy(),
-                            "ee_x_in_base": self.ee_x_t[gi].cpu().numpy(),
-                            "d_link": float(d_link[gi].item()),
-                            "d_retract": float(d_ret[gi].item()),
-                            "align_score": float(scores[li].item()),
-                            "combined_score": float(scores[li].item()),
+                            "ee_pos_in_base": ee_np[k],
+                            "mid_in_base": mid_np[k],
+                            "ee_x_in_base": eex_np[k],
+                            "d_link": float(dl_np[k]),
+                            "d_retract": float(dr_np[k]),
+                            "align_score": float(sc_np[k]),
+                            "combined_score": float(sc_np[k]),
                         })
                     if profile:
                         _pf["评分+取解.cpu"] += _pnow() - _mark
@@ -1778,7 +1790,7 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
         cyl_h = length - cone_h
         arrow = o3d.geometry.TriangleMesh.create_arrow(
             cylinder_radius=0.010, cone_radius=0.022,
-            cylinder_height=cyl_h, cone_height=cone_h)
+            cylinder_hceight=cyl_h, cone_height=cone_h)
         arrow.rotate(_align_rotmat([0.0, 0.0, 1.0], d), center=(0.0, 0.0, 0.0))  # 默认 +Z → bisector
         arrow.translate(p0.tolist())                                            # 箭尾在焊缝中心点
         arrow.compute_vertex_normals()
