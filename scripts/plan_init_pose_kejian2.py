@@ -786,7 +786,10 @@ class InitPoseLookupSolver:
                               rot_x_deg: Tuple[float, ...] = (0.0,),
                               rot_y_deg: Tuple[float, ...] = (0.0,),
                               rot_z_deg: Tuple[float, ...] = (0.0,),
-                              diagnostic: bool = False) -> Optional[Dict]:
+                              diagnostic: bool = False,
+                              profile: bool = False,
+                              orient_valid: Optional[list] = None,
+                              orient_snap_deg: Optional[float] = None) -> Optional[Dict]:
         """每条焊缝 batch GPU 求解。先 align(bisector→名义焊枪轴 -ee_x) 得基准姿态 R0，再【绕
         xiaoyu_tip_link 末端局部 x/y/z 轴】分别转 (αx,βy,γz) 组成扰动 R_delta：R=R_delta@R0；
         t=ee_pos−R@mid → 球反变到 mesh world → ESDF batch 碰撞 → safe → 三轴 90° 偏差和评分取 best。
@@ -831,9 +834,30 @@ class InitPoseLookupSolver:
 
         all_solutions = []
         diag_stats = []
+        # solve 内部分段计时（profile=True 时启用；GPU 异步，分段边界需 synchronize 才准）
+        _pf = {"pose+端点": 0.0, "碰撞查询(link+ret)": 0.0, "safe_mask+min": 0.0, "评分+取解.cpu": 0.0}
+        import time as _time
+
+        def _pnow():
+            if profile and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return _time.time()
+
+        # 朝向粗筛（可选）：把「snap 到 4 种允许朝向」这个最强约束提到碰撞之前。
+        # 判据用【列向量夹角】——snap(euler 三轴<θ) 的宽松超集：euler 各<θ ⇒ R_rel 总转角<3θ ⇒
+        # 各列偏移<3θ，故阈值取 3θ+15° 必涵盖所有 snap 命中（召回安全，绝不漏），精确判定仍由 CPU 做。
+        orient_Rv_t = None
+        orient_cos_thr = None
+        if orient_valid is not None and orient_snap_deg is not None and len(orient_valid) > 0:
+            orient_Rv_t = torch.tensor(np.stack([np.asarray(R, dtype=np.float64) for R in orient_valid]),
+                                       device=device, dtype=dtype)            # (V,3,3)
+            _coarse_deg = 3.0 * float(orient_snap_deg) + 15.0
+            orient_cos_thr = float(np.cos(np.deg2rad(_coarse_deg)))
+
         for ax_deg in rot_x_deg:
             for ay_deg in rot_y_deg:
                 for az_deg in rot_z_deg:
+                    _mark = _pnow()
                     ax_r = torch.tensor(np.deg2rad(ax_deg), device=device, dtype=dtype)
                     ay_r = torch.tensor(np.deg2rad(ay_deg), device=device, dtype=dtype)
                     az_r = torch.tensor(np.deg2rad(az_deg), device=device, dtype=dtype)
@@ -857,56 +881,78 @@ class InitPoseLookupSolver:
                             z = p[:, 2]
                             return (xy >= xy_lo) & (xy <= xy_hi) & (z >= z_lo) & (z <= z_hi)
                         endpoints_ok = _in_ws(p0_base) & _in_ws(p1_base)   # (N,) 起+终都在范围内
+                        # 朝向粗筛：R 各列与某允许朝向各列夹角均 < 阈值（snap 超集）→ 与端点 AND 成预筛掩码。
+                        # 只缩小碰撞查询规模；safe_mask 仍只含 endpoints_ok（朝向精筛在 CPU），结果不变。
+                        if orient_Rv_t is not None:
+                            cos_nvk = torch.einsum("nik,vik->nvk", R, orient_Rv_t)   # (N,V,3) 各列点积
+                            orient_ok = (cos_nvk > orient_cos_thr).all(dim=2).any(dim=1)  # (N,)
+                            prefilter = endpoints_ok & orient_ok
+                        else:
+                            prefilter = endpoints_ok
+                        if profile:
+                            _n = _pnow(); _pf["pose+端点"] += _n - _mark; _mark = _n
 
                         # 球反变到 mesh_world：p_world = R^T @ (p_base - t)。
                         # 整臂/retract 碰撞球世界坐标张量 (N,K,4) 单条就 ~1.7GB，幸存者一多即 OOM；
                         # 故【按 chunk 逐块构造 + 查询】，峰值显存只与 chunk 相关、与幸存者总数 N 无关。
+                        # 【端点预筛】碰撞是本步最贵的操作，只对「焊缝端点在工作空间内」的候选查；非端点候选
+                        # 的 d 填大值（必然不 safe），d_link/d_ret 保持全 N 形状供 diag/索引；结果与全量查询一致。
                         link_xyz_b = self.link_spheres_t[..., :3]
-                        link_r = self.link_spheres_t[..., 3]
+                        link_r_b = self.link_spheres_t[..., 3]
                         ret_xyz_b = self.retract_spheres_t[:, :3]
                         ret_r = self.retract_spheres_t[:, 3]
                         # 间隙膨胀：手臂本体球半径 +clearance（inflate_mask 已把焊枪尖端球置 0 → 不膨胀）。
-                        # clearance<=0 时 inflate_mask 全 1 但加 0，等价不改；下方按 sl/广播取用。
+                        # retract 球半径与候选无关、循环外加一次；link 球半径在 chunk 内对子集加（省显存）。
+                        add_r = None
                         if self.clearance_inflate > 0.0:
                             add_r = self.clearance_inflate * self.inflate_mask   # (K,)
-                            link_r = link_r + add_r[None, :]                     # (N,K)
-                            ret_r = ret_r + add_r                                # (K,)
+                            ret_r = ret_r + add_r
 
+                        BIG = 1.0e6
+                        d_link = torch.full((N,), BIG, device=device, dtype=dtype)
+                        d_ret = torch.full((N,), BIG, device=device, dtype=dtype)
+                        ep_idx = prefilter.nonzero(as_tuple=True)[0]   # (M,) 预筛(端点∩朝向粗筛)幸存者全局索引
+                        M = int(ep_idx.numel())
                         chunk = 2048
-                        d_link_list, d_ret_list = [], []
-                        for i in range(0, N, chunk):
-                            sl = slice(i, min(i + chunk, N))
-                            R_c = R[sl]                               # (c,3,3)
-                            t_c = t_arr[sl]                           # (c,3)
+                        for i in range(0, M, chunk):
+                            sub = ep_idx[i:i + chunk]                 # (c,) 全局索引
+                            R_c = R[sub]                              # (c,3,3)
+                            t_c = t_arr[sub]                          # (c,3)
                             m = R_c.shape[0]
                             # 整臂连杆球（每条候选用各自 q 的 link_spheres + 该 R,t 反变到 mesh world）
-                            deltas_link_c = link_xyz_b[sl] - t_c[:, None, :]
+                            link_r_c = link_r_b[sub]                  # (c,K)
+                            if add_r is not None:
+                                link_r_c = link_r_c + add_r[None, :]
+                            deltas_link_c = link_xyz_b[sub] - t_c[:, None, :]
                             link_xyz_w_c = torch.einsum("nji,nkj->nki", R_c, deltas_link_c)
                             link_spheres_w_c = torch.cat(
-                                [link_xyz_w_c, link_r[sl].unsqueeze(-1)], dim=-1)
+                                [link_xyz_w_c, link_r_c.unsqueeze(-1)], dim=-1)
                             # retract 球（球本身与 q 无关，但每条候选用各自 R,t 反变）
                             deltas_ret_c = ret_xyz_b[None, :, :].expand(m, -1, -1) - t_c[:, None, :]
                             ret_xyz_w_c = torch.einsum("nji,nkj->nki", R_c, deltas_ret_c)
                             ret_spheres_w_c = torch.cat(
                                 [ret_xyz_w_c, ret_r[None, :].expand(m, -1).unsqueeze(-1)], dim=-1)
-                            d_link_list.append(
-                                self._voxel_collision_distance_batch(link_spheres_w_c))
-                            d_ret_list.append(
-                                self._voxel_collision_distance_batch(ret_spheres_w_c))
-                        d_link = torch.cat(d_link_list)
-                        d_ret = torch.cat(d_ret_list)
+                            d_link[sub] = self._voxel_collision_distance_batch(link_spheres_w_c)
+                            d_ret[sub] = self._voxel_collision_distance_batch(ret_spheres_w_c)
+                        if profile:
+                            _n = _pnow(); _pf["碰撞查询(link+ret)"] += _n - _mark; _mark = _n
 
                         safe_mask = (d_link <= self.collision_tolerance) & \
                                     (d_ret <= self.collision_tolerance) & \
                                     endpoints_ok
                         n_safe = int(safe_mask.sum().item())
-                        n_ep = int(endpoints_ok.sum().item())   # 起+终都在范围内的候选数
+                        n_ep = M   # 起+终都在范围内的候选数（= 端点预筛幸存者数）
+                        # min 只对端点幸存者有意义（非幸存者 d 是占位大值）；M=0 时填 0
+                        dl_min = float(d_link[ep_idx].min()) if M > 0 else 0.0
+                        dr_min = float(d_ret[ep_idx].min()) if M > 0 else 0.0
                         diag_stats.append((ax_deg, ay_deg, az_deg, n_safe,
-                                           float(d_link.min()), float(d_ret.min()), n_ep))
+                                           dl_min, dr_min, n_ep))
+                        if profile:
+                            _n = _pnow(); _pf["safe_mask+min"] += _n - _mark; _mark = _n
                         if diagnostic:
                             print(f"      [αx={ax_deg:+.0f}° βy={ay_deg:+.0f}° γz={az_deg:+.0f}°] "
-                                  f"N={N} safe={n_safe} min_d_link={float(d_link.min()):.4f} "
-                                  f"min_d_ret={float(d_ret.min()):.4f}")
+                                  f"N={N} safe={n_safe} min_d_link={dl_min:.4f} "
+                                  f"min_d_ret={dr_min:.4f}")
                         if not safe_mask.any():
                             continue
                         safe_idx = safe_mask.nonzero(as_tuple=True)[0]
@@ -933,6 +979,16 @@ class InitPoseLookupSolver:
                             "align_score": float(scores[li].item()),
                             "combined_score": float(scores[li].item()),
                         })
+                    if profile:
+                        _pf["评分+取解.cpu"] += _pnow() - _mark
+
+        if profile:
+            _tot = sum(_pf.values())
+            n_ang = len(rot_x_deg) * len(rot_y_deg) * len(rot_z_deg)
+            print(f"      [solve profile] {n_ang} 个角度采样，N={N} 候选/采样，内部分段累计：")
+            for _k, _v in _pf.items():
+                print(f"      [solve profile]   {_k:22s} {_v:8.3f}s  ({100.0 * _v / max(_tot, 1e-9):5.1f}%)")
+            print(f"      [solve profile]   {'内部合计':22s} {_tot:8.3f}s")
 
         if not all_solutions:
             print(f"      [FAIL diag] weld {weld['idx']}: 所有 {len(diag_stats)} 个 (αx,βy,γz) 采样 stats:")
@@ -1849,15 +1905,25 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     ④ 正反手按【bisector】在 base-x 的分量定：与 base-x 反向(负 x)=正手，否则=反手（焊缝几何，
        与关节构型无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
     from gt_gen.config import load_config
+    import time as _time
+    import torch as _torch
 
+    def _sync():
+        if _torch.cuda.is_available():
+            _torch.cuda.synchronize()
+
+    prof = {}                                    # 各阶段耗时（秒），末尾汇总打印瓶颈
+    _t = _time.time()
     cfg = load_config()
     cfg2 = _kejian2_cfg(cfg)                     # 让 solver 读到 kejian2 的 ee 范围 / standoff / 缓存路径
     welds = load_welds(weld_json)
     weld = next((w for w in welds if int(w["idx"]) == int(seam_id)), None)
     if weld is None:
         raise IndexError(f"seam_id={seam_id} 不在 {weld_json}（共 {len(welds)} 条）")
+    prof["①setup(cfg+welds)"] = _time.time() - _t
 
     # —— ① lookup 求解器（与工件相关；joint table 与工件无关，优先复用 kejian2 独立缓存） ——
+    _t = _time.time()
     solver = InitPoseLookupSolver(
         cfg2, obj_fp,
         collision_tolerance=cfg.plan_init_kejian2_collision_tolerance,
@@ -1865,17 +1931,33 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         n_per_dof=cfg.plan_init_kejian2_n_per_dof,
         clearance_inflate=cfg.plan_init_kejian2_clearance_inflate,
         tip_spheres=cfg.plan_init_kejian2_tip_spheres)
+    _sync()
+    prof["②solver初始化(含工件ESDF体素化)"] = _time.time() - _t
+
+    _t = _time.time()
     if solver.load_joint_table():
         print("[kejian2] 复用已存 joint table（跳过 n^6 预计算）")
     else:
         print("[kejian2] precomputing joint table（与工件无关，仅一次）…")
         solver.precompute_joint_table()
         solver.save_joint_table()
+    _sync()
+    prof["③joint表(load或precompute+save)"] = _time.time() - _t
+
+    # 朝向集合（4 种允许朝向）：solve 的朝向粗筛 + CPU 精筛 _kejian2_snap 共用，snap_deg 同源
+    _t = _time.time()
+    R_valid_list = _kejian_orientations(obj_fp)
+    snap_deg = cfg.plan_init_kejian2_snap_deg
+    prof["②b朝向集合(lay_flat)"] = _time.time() - _t
 
     rot_x = _deg_range(cfg.plan_init_kejian2_rot_x_deg)
     rot_y = _deg_range(cfg.plan_init_kejian2_rot_y_deg)
     rot_z = _deg_range(cfg.plan_init_kejian2_rot_z_deg)
-    solver.solve_one_weld_lookup(weld, rot_x, rot_y, rot_z)
+    _t = _time.time()
+    solver.solve_one_weld_lookup(weld, rot_x, rot_y, rot_z, profile=True,
+                                 orient_valid=R_valid_list, orient_snap_deg=snap_deg)
+    _sync()
+    prof["④solve_one_weld_lookup(碰撞过滤)"] = _time.time() - _t
     cands = list(getattr(solver, "last_all_solutions", []) or [])
     print(f"[kejian2] lookup 候选 {len(cands)} 个（绕末端轴采样 "
           f"{len(rot_x)}×{len(rot_y)}×{len(rot_z)}）")
@@ -1883,9 +1965,8 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         print("[kejian2] lookup 无候选：请放宽 ee_xy_range_m/ee_z_range_m 或增大 n_per_dof")
         return {"forehand": [], "backhand": []}
 
-    # —— ② 允许朝向（4 种，长轴 ⊥ base-x）+ snap 阈值 + standoff 落枪点 ——
-    R_valid_list = _kejian_orientations(obj_fp)
-    snap_deg = cfg.plan_init_kejian2_snap_deg
+    # —— ② 允许朝向已在上方算好；这里取 standoff 落枪点等 ——
+    _t = _time.time()
     standoff = cfg.plan_init_kejian2_standoff
     xy_lo, xy_hi = (float(v) for v in cfg.plan_init_kejian2_ee_xy_range)
     z_lo, z_hi = (float(v) for v in cfg.plan_init_kejian2_ee_z_range)
@@ -1975,9 +2056,17 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
 
     fore = [r for r in results if r["hand"] == "forehand"]
     back = [r for r in results if r["hand"] == "backhand"]
+    prof["⑤snap+正反手分类(CPU遍历候选)"] = _time.time() - _t
     print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 背面丢 {n_back} / x<=0 丢 {n_xneg} "
           f"/ 底座-工件XY相交丢 {n_overlap} → 去重后合格 {len(results)}"
           f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
+
+    # —— 耗时汇总（定位瓶颈）——
+    _total = sum(prof.values())
+    print("[kejian2] === 各阶段耗时 ===")
+    for _k, _v in prof.items():
+        print(f"[kejian2]   {_k:32s} {_v:8.3f}s  ({100.0 * _v / max(_total, 1e-9):5.1f}%)")
+    print(f"[kejian2]   {'合计':32s} {_total:8.3f}s")
 
     if viz and results:
         _show_kejian2_results(cfg2, obj_fp, weld, {"forehand": fore, "backhand": back}, stride=5)
