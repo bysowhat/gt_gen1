@@ -863,44 +863,66 @@ class InitPoseLookupSolver:
             _coarse_deg = 3.0 * float(orient_snap_deg) + 15.0
             orient_cos_thr = float(np.cos(np.deg2rad(_coarse_deg)))
 
-        for ax_deg in rot_x_deg:
-            for ay_deg in rot_y_deg:
-                for az_deg in rot_z_deg:
-                    _mark = _pnow()
-                    ax_r = torch.tensor(np.deg2rad(ax_deg), device=device, dtype=dtype)
-                    ay_r = torch.tensor(np.deg2rad(ay_deg), device=device, dtype=dtype)
-                    az_r = torch.tensor(np.deg2rad(az_deg), device=device, dtype=dtype)
+        # 工作空间端点判据：对 (...,3) 通用（用 ... 索引），(N,3) 与批量 (Gz,N,3) 共用同一套代码、逐位一致。
+        def _in_ws(p):
+            xy = torch.norm(p[..., :2], dim=-1)
+            z = p[..., 2]
+            return (xy >= xy_lo) & (xy <= xy_hi) & (z >= z_lo) & (z <= z_hi)
+
+        # 【优化 A】Rx/Ry/Rz 仅随各自角度档变化（eax/eay/eaz 循环不变）→ 循环外各算一次再复用，
+        #   消除原先 325 采样里 975 次 batch_axis_angle_rotmat（实际只 13+5+5 个不同结果）的冗余重算。
+        #   Rz 堆成 (Gz,N,3,3) 供【优化 B】把内层 az 一次性批处理。
+        with torch.no_grad():
+            Rx_list = [batch_axis_angle_rotmat(
+                eax, torch.tensor(np.deg2rad(a), device=device, dtype=dtype).expand(N))
+                for a in rot_x_deg]                                 # 各 (N,3,3)
+            Ry_list = [batch_axis_angle_rotmat(
+                eay, torch.tensor(np.deg2rad(a), device=device, dtype=dtype).expand(N))
+                for a in rot_y_deg]
+            Rz_stack = torch.stack([batch_axis_angle_rotmat(
+                eaz, torch.tensor(np.deg2rad(a), device=device, dtype=dtype).expand(N))
+                for a in rot_z_deg], dim=0)                         # (Gz,N,3,3)
+        n_az = len(rot_z_deg)
+
+        for ix, ax_deg in enumerate(rot_x_deg):
+            Rx = Rx_list[ix]
+            for iy, ay_deg in enumerate(rot_y_deg):
+                Ry = Ry_list[iy]
+                _mark = _pnow()
+                with torch.no_grad():
+                    # 【优化 B】内层 az（Gz 档）一次性批处理 pose+端点+朝向预筛：Python 循环 325→13×5、
+                    #   kernel 启动随之减少。矩阵乘分组严格保持原版 ((Rz@Ry)@Rx)@R0——批量 matmul 对每个
+                    #   [g,n] 切片即逐采样的 (N,3,3) 乘法、逐位一致；端点/朝向预筛对 Gz 档并行算。
+                    T1 = torch.matmul(Rz_stack, Ry)                # (Gz,N,3,3) = Rz_g@Ry
+                    T2 = torch.matmul(T1, Rx)                       # = (Rz@Ry)@Rx
+                    R_g = torch.matmul(T2, R0)                      # = ((Rz@Ry)@Rx)@R0
+                    R_target_g = torch.einsum("gnij,j->gni", R_g, target)
+                    t_g = self.ee_pos_t.unsqueeze(0) - R_target_g          # (Gz,N,3) tip 落在 standoff 落枪点
+                    R_mid_g = torch.einsum("gnij,j->gni", R_g, mid)
+                    mid_base_g = R_mid_g + t_g                             # (Gz,N,3) 真实焊缝中点在 base
+                    # 焊缝起/终点变到 base：p_base = R@p_world + t；须落在 ee_xy_range(xy 环)+ee_z_range(z) 内
+                    p0_base_g = torch.einsum("gnij,j->gni", R_g, p0_world) + t_g   # (Gz,N,3)
+                    p1_base_g = torch.einsum("gnij,j->gni", R_g, p1_world) + t_g
+                    endpoints_g = _in_ws(p0_base_g) & _in_ws(p1_base_g)    # (Gz,N) 起+终都在范围内
+                    # 朝向粗筛：R 各列与某允许朝向各列夹角均 < 阈值（snap 超集）→ 与端点 AND 成预筛掩码。
+                    # 只缩小碰撞查询规模；safe_mask 仍只含 endpoints（朝向精筛在 CPU），结果不变。
+                    if orient_Rv_t is not None:
+                        cos_g = torch.einsum("gnik,vik->gnvk", R_g, orient_Rv_t)   # (Gz,N,V,3) 各列点积
+                        orient_ok_g = (cos_g > orient_cos_thr).all(dim=-1).any(dim=-1)  # (Gz,N)
+                        prefilter_g = endpoints_g & orient_ok_g
+                    else:
+                        prefilter_g = endpoints_g
+                if profile:
+                    _n = _pnow(); _pf["pose+端点"] += _n - _mark; _mark = _n
+
+                for iz in range(n_az):
+                    az_deg = rot_z_deg[iz]
                     with torch.no_grad():
-                        # 绕 base 系下的末端局部 x/y/z 轴各转一点，组成姿态扰动（绕尖端支点）
-                        Rx = batch_axis_angle_rotmat(eax, ax_r.expand(N))
-                        Ry = batch_axis_angle_rotmat(eay, ay_r.expand(N))
-                        Rz = batch_axis_angle_rotmat(eaz, az_r.expand(N))
-                        R_delta = Rz @ Ry @ Rx                       # (N,3,3)
-                        R = R_delta @ R0                             # (N,3,3) R=R_delta@R0
-                        R_target = torch.einsum("nij,j->ni", R, target)
-                        t_arr = self.ee_pos_t - R_target  # (N,3) tip 落在 standoff 落枪点
-                        R_mid = torch.einsum("nij,j->ni", R, mid)
-                        mid_base_arr = R_mid + t_arr  # (N,3) 真实焊缝中点在 base（standoff>0 时 ≠ ee_pos，供排序/sanity）
-
-                        # 焊缝起/终点变到 base：p_base = R@p_world + t；须落在 ee_xy_range(xy 环)+ee_z_range(z) 内
-                        p0_base = torch.einsum("nij,j->ni", R, p0_world) + t_arr   # (N,3)
-                        p1_base = torch.einsum("nij,j->ni", R, p1_world) + t_arr
-                        def _in_ws(p):
-                            xy = torch.norm(p[:, :2], dim=-1)
-                            z = p[:, 2]
-                            return (xy >= xy_lo) & (xy <= xy_hi) & (z >= z_lo) & (z <= z_hi)
-                        endpoints_ok = _in_ws(p0_base) & _in_ws(p1_base)   # (N,) 起+终都在范围内
-                        # 朝向粗筛：R 各列与某允许朝向各列夹角均 < 阈值（snap 超集）→ 与端点 AND 成预筛掩码。
-                        # 只缩小碰撞查询规模；safe_mask 仍只含 endpoints_ok（朝向精筛在 CPU），结果不变。
-                        if orient_Rv_t is not None:
-                            cos_nvk = torch.einsum("nik,vik->nvk", R, orient_Rv_t)   # (N,V,3) 各列点积
-                            orient_ok = (cos_nvk > orient_cos_thr).all(dim=2).any(dim=1)  # (N,)
-                            prefilter = endpoints_ok & orient_ok
-                        else:
-                            prefilter = endpoints_ok
-                        if profile:
-                            _n = _pnow(); _pf["pose+端点"] += _n - _mark; _mark = _n
-
+                        R = R_g[iz]                                  # (N,3,3) 该 az 档切片，与逐采样等价
+                        t_arr = t_g[iz]
+                        mid_base_arr = mid_base_g[iz]
+                        endpoints_ok = endpoints_g[iz]               # (N,)
+                        prefilter = prefilter_g[iz]
                         # 球反变到 mesh_world：p_world = R^T @ (p_base - t)。
                         # 整臂/retract 碰撞球世界坐标张量 (N,K,4) 单条就 ~1.7GB，幸存者一多即 OOM；
                         # 故【按 chunk 逐块构造 + 查询】，峰值显存只与 chunk 相关、与幸存者总数 N 无关。
@@ -943,9 +965,10 @@ class InitPoseLookupSolver:
                                 [ret_xyz_w_c, ret_r[None, :].expand(m, -1).unsqueeze(-1)], dim=-1)
                             d_link[sub] = self._voxel_collision_distance_batch(link_spheres_w_c)
                             d_ret[sub] = self._voxel_collision_distance_batch(ret_spheres_w_c)
-                        if profile:
-                            _n = _pnow(); _pf["碰撞查询(link+ret)"] += _n - _mark; _mark = _n
+                    if profile:
+                        _n = _pnow(); _pf["碰撞查询(link+ret)"] += _n - _mark; _mark = _n
 
+                    with torch.no_grad():
                         safe_mask = (d_link <= self.collision_tolerance) & \
                                     (d_ret <= self.collision_tolerance) & \
                                     endpoints_ok
@@ -956,14 +979,17 @@ class InitPoseLookupSolver:
                         dr_min = float(d_ret[ep_idx].min()) if M > 0 else 0.0
                         diag_stats.append((ax_deg, ay_deg, az_deg, n_safe,
                                            dl_min, dr_min, n_ep))
+                    if profile:
+                        _n = _pnow(); _pf["safe_mask+min"] += _n - _mark; _mark = _n
+                    if diagnostic:
+                        print(f"      [αx={ax_deg:+.0f}° βy={ay_deg:+.0f}° γz={az_deg:+.0f}°] "
+                              f"N={N} safe={n_safe} min_d_link={dl_min:.4f} "
+                              f"min_d_ret={dr_min:.4f}")
+                    if not safe_mask.any():
                         if profile:
-                            _n = _pnow(); _pf["safe_mask+min"] += _n - _mark; _mark = _n
-                        if diagnostic:
-                            print(f"      [αx={ax_deg:+.0f}° βy={ay_deg:+.0f}° γz={az_deg:+.0f}°] "
-                                  f"N={N} safe={n_safe} min_d_link={dl_min:.4f} "
-                                  f"min_d_ret={dr_min:.4f}")
-                        if not safe_mask.any():
-                            continue
+                            _mark = _pnow()   # 丢弃本档诊断打印耗时（同原版 continue→下轮重置）
+                        continue
+                    with torch.no_grad():
                         safe_idx = safe_mask.nonzero(as_tuple=True)[0]
                         R_safe = R[safe_idx]
                         scores = axis_align_score_batch(R_safe)   # 三轴 90° 偏差和(取负)，越大越对齐
@@ -1001,7 +1027,7 @@ class InitPoseLookupSolver:
                             "combined_score": float(sc_np[k]),
                         })
                     if profile:
-                        _pf["评分+取解.cpu"] += _pnow() - _mark
+                        _pf["评分+取解.cpu"] += _pnow() - _mark; _mark = _pnow()
 
         if profile:
             _tot = sum(_pf.values())
