@@ -249,6 +249,15 @@ def mat44_to_pose7(M):
 
 
 # ---- 焊缝 I/O（父 solve_arm_pose_parallel.py L191–304 移植） ----
+SHORT_SEAM_LEN_M = 0.03   # 短焊缝阈值（米）：焊缝端点距 < 此值视为过短（=3cm），--filter-short 时丢弃不求解
+
+
+def _seam_len_m(weld: Dict) -> float:
+    """焊缝长度（米）= ‖p1 - p0‖（mesh/世界坐标，与 standoff 同单位=米）。"""
+    return float(np.linalg.norm(np.asarray(weld["p1_world"], dtype=np.float64)
+                                - np.asarray(weld["p0_world"], dtype=np.float64)))
+
+
 def load_welds(json_fp: str) -> List[Dict]:
     """读 _weld_angle3.json；corrected_p0/p1 + bisector 直接当世界坐标（工件 mesh 系）。"""
     import json
@@ -1003,17 +1012,17 @@ class InitPoseLookupSolver:
             print(f"      [solve profile]   {'内部合计':22s} {_tot:8.3f}s")
 
         if not all_solutions:
-            print(f"      [FAIL diag] weld {weld['idx']}: 所有 {len(diag_stats)} 个 (αx,βy,γz) 采样 stats:")
-            for axd, ayd, azd, sn, dl, dr, nep in sorted(diag_stats, key=lambda x: (x[0], x[1], x[2])):
-                reason = "OK" if sn else ("端点超范围" if nep == 0
-                                          else "RETRACT撞" if dr > self.collision_tolerance
-                                          else "LINK撞" if dl > self.collision_tolerance else "其他")
-                print(f"        αx={axd:+4.0f}° βy={ayd:+4.0f}° γz={azd:+4.0f}°: safe={sn:6d}/{N}  "
-                      f"端点OK={nep:6d}/{N}  min_d_link={dl:.4f}  min_d_ret={dr:.4f}  [{reason}]")
             n_zero = sum(1 for s in diag_stats if s[3] == 0)
-            print(f"      [FAIL diag] 共 {n_zero}/{len(diag_stats)} 个采样完全无解 (safe=0)，"
-                  f"全局 min_d_link={min(s[4] for s in diag_stats):.4f}, "
-                  f"min_d_ret={min(s[5] for s in diag_stats):.4f} (tol={self.collision_tolerance:.4f})")
+            if diagnostic:                       # 详细逐角度 stats 只在 --diagnostic 时打印（批处理时太吵）
+                print(f"      [FAIL diag] weld {weld['idx']}: 所有 {len(diag_stats)} 个 (αx,βy,γz) 采样 stats:")
+                for axd, ayd, azd, sn, dl, dr, nep in sorted(diag_stats, key=lambda x: (x[0], x[1], x[2])):
+                    reason = "OK" if sn else ("端点超范围" if nep == 0
+                                              else "RETRACT撞" if dr > self.collision_tolerance
+                                              else "LINK撞" if dl > self.collision_tolerance else "其他")
+                    print(f"        αx={axd:+4.0f}° βy={ayd:+4.0f}° γz={azd:+4.0f}°: safe={sn:6d}/{N}  "
+                          f"端点OK={nep:6d}/{N}  min_d_link={dl:.4f}  min_d_ret={dr:.4f}  [{reason}]")
+            print(f"      [FAIL diag] weld {weld['idx']}: 0 解（{n_zero}/{len(diag_stats)} 个采样 safe=0；"
+                  f"加 --diagnostic 看逐角度明细）")
             self.last_all_solutions = []
             return None
 
@@ -1382,22 +1391,64 @@ def main():
     # ③ 新逻辑（lookup 关节角采样 + 允许朝向 snap + 正反手分类）
     ap.add_argument("--solve-kejian2", action="store_true",
                     help="进入新逻辑求解（lookup n^6 关节角采样 + 允许朝向 snap，分正反手返回）")
-    ap.add_argument("--seam-id", type=int, default=0, help="solve-kejian2：用 weld_json 第几条焊缝")
+    ap.add_argument("--seam-id", type=int, default=0, help="solve-kejian2：用 weld_json 第几条焊缝（单条）")
+    ap.add_argument("--all-seams", action="store_true",
+                    help="solve-kejian2：一次处理 weld_json 全部焊缝（工件级 solver/ESDF/joint 表只建一次）")
+    ap.add_argument("--seam-ids", nargs="+", type=int, default=None,
+                    help="solve-kejian2：只处理这些焊缝 idx（多条，如 --seam-ids 0 1 3）；隐含全焊缝模式")
     ap.add_argument("--out", default=None,
-                    help="solve-kejian2：结果保存路径(.npy)；存 hand/joint_angles/workpiece_pose7，"
-                         "每只手最多 15 个（超出按工件 pose 差距挑选：旋转差距优先、平移次之）")
+                    help="solve-kejian2：输出【目录】（单焊缝/全焊缝都一样）；每条焊缝存 <out>/seam_<idx>.npy。"
+                         "存 hand/joint_angles/workpiece_pose7，每只手最多 15 个"
+                         "（超出按工件 pose 差距挑选：旋转差距优先、平移次之）")
     ap.add_argument("--lay-flat", action="store_true",
                     help="只跑 lay_flat 摆平工件并 open3d 可视化（用 --obj 或默认 BEAM）")
+    ap.add_argument("--log", default=None,
+                    help="solve-kejian2：把逐焊缝求解情况写到此 txt（成功率/失败 seam/各 seam 合格与已存条数/合计）；"
+                         "每条焊缝解完就重写一次，中断也保住已完成的记录")
+    ap.add_argument("--filter-short", action="store_true",
+                    help=f"solve-kejian2：过滤掉长度 <{SHORT_SEAM_LEN_M * 100:.0f}cm 的短焊缝（不求解、不落盘）；"
+                         "被过滤的 seam 会记入 --log 的 txt")
     args = ap.parse_args()
 
     if args.solve_kejian2:
         if not args.weld_json:
             ap.error("--solve-kejian2 需要 --weld-json（焊缝 _weld_angle3.json）")
-        res = plan_init_pose_kejian2(args.obj or DEFAULT_LAY_FLAT_OBJ, args.weld_json,
-                                     seam_id=args.seam_id, viz=args.viz)
+        obj = args.obj or DEFAULT_LAY_FLAT_OBJ
+        # —— 全焊缝模式：--all-seams 或给了 --seam-ids（工件级 ②③ 只建一次，边算边存） ——
+        if args.all_seams or args.seam_ids is not None:
+            # --out 是输出【目录】；每条焊缝解完立刻存 <out>/seam_<idx>.npy。（--out-dir 是旧 --solve 的参数，这里不借用）
+            if not args.out:
+                ap.error("--all-seams/--seam-ids 需要 --out <输出目录>（每条焊缝存 seam_<idx>.npy）")
+            results = plan_init_pose_kejian2_all(obj, args.weld_json, seam_ids=args.seam_ids,
+                                                 viz=args.viz, save_dir=args.out, save_k=15,
+                                                 log_path=args.log, filter_short=args.filter_short)
+            print(f"[kejian2] 全焊缝完成（{len(results)} 条）；输出目录 {args.out}")
+            for sid, res in results.items():
+                print(f"[kejian2]   seam {sid}: 正手 {len(res['forehand'])} / 反手 {len(res['backhand'])}")
+            return
+        # —— 单焊缝 ——
+        _weld = next((w for w in load_welds(args.weld_json)
+                      if int(w["idx"]) == int(args.seam_id)), None)
+        if args.filter_short and _weld is not None and _seam_len_m(_weld) < SHORT_SEAM_LEN_M:
+            _L = _seam_len_m(_weld)
+            print(f"[kejian2] 焊缝 {args.seam_id} 长度 {_L * 100:.2f}cm < {SHORT_SEAM_LEN_M * 100:.0f}cm，"
+                  "已过滤，跳过求解")
+            if args.log:
+                _write_kejian2_log(args.log, obj, args.weld_json, args.out, 15, [], 0,
+                                   filtered=[{"idx": int(args.seam_id), "length_cm": _L * 100.0}])
+                print(f"[kejian2] 求解日志已写入 {args.log}")
+            return
+        res = plan_init_pose_kejian2(obj, args.weld_json, seam_id=args.seam_id, viz=args.viz)
         print(f"[kejian2] 返回：正手 {len(res['forehand'])} 个 / 反手 {len(res['backhand'])} 个")
-        if args.out:
-            _save_kejian2_npy(res, args.out, k=15)
+        if args.out:                                  # --out 当目录，存 <out>/seam_<seam_id>.npy
+            os.makedirs(args.out, exist_ok=True)      # --out 目录不存在则创建
+            _save_kejian2_npy(res, os.path.join(args.out, f"seam_{args.seam_id}.npy"), k=15, weld=_weld)
+        if args.log:                                  # 单焊缝也可写日志（一行记录）
+            n_f, n_b = len(res["forehand"]), len(res["backhand"])
+            _write_kejian2_log(args.log, obj, args.weld_json, args.out, 15,
+                               [{"idx": args.seam_id, "n_fore": n_f, "n_back": n_b,
+                                 "saved_fore": min(n_f, 15), "saved_back": min(n_b, 15)}], 1)
+            print(f"[kejian2] 求解日志已写入 {args.log}")
         return
 
     if args.lay_flat:
@@ -1870,11 +1921,16 @@ def _select_diverse_poses(items: list, k: int = 15) -> list:
     return [items[i] for i in selected]
 
 
-def _save_kejian2_npy(res: Dict[str, list], path: str, k: int = 15) -> None:
-    """把正/反手结果存成单个 .npy（结构化数组，np.load 直接读，无需 allow_pickle）。
+def _save_kejian2_npy(res: Dict[str, list], path: str, k: int = 15,
+                      weld: Optional[dict] = None) -> None:
+    """把正/反手结果存成单个 .npy（dict 对象数组；读取用 np.load(path, allow_pickle=True).item()）。
 
-    每条记录字段：hand（'forehand'/'backhand'）、joint_angles（各关节角，rad）、
-    workpiece_pose7（工件在 base_link 下的 pose [x,y,z,qw,qx,qy,qz]）。
+    保存的 dict：
+      · 求解结果（每条 pose 各自不同，按 picked 顺序对齐的并列数组）：
+        hand (N,) 字符串、joint_angles (N, ndof)、workpiece_pose7 (N, 7)；
+      · seam_idx：该焊缝在 weld_json 里的下标（=文件名 seam_<idx>）；
+      · weld：_weld_angle3.json 里【这条焊缝的原始 dict，原样照搬】——mesh 坐标系不转、bisector
+        不归一化、内容一字不改；json 里有什么字段就存什么，缺的字段就【不存】（不补兜底）。
     每只手超过 k 个时用 _select_diverse_poses 挑 k 个（旋转差距优先、平移差距次之）。"""
     fore = _select_diverse_poses(list(res.get("forehand", [])), k)
     back = _select_diverse_poses(list(res.get("backhand", [])), k)
@@ -1882,40 +1938,91 @@ def _save_kejian2_npy(res: Dict[str, list], path: str, k: int = 15) -> None:
     if not picked:
         print("[kejian2] 无合格结果，跳过保存")
         return
-    ndof = int(np.asarray(picked[0]["joint_angles"], dtype=np.float64).reshape(-1).size)
-    dtype = np.dtype([
-        ("hand", "U10"),
-        ("joint_angles", np.float64, (ndof,)),
-        ("workpiece_pose7", np.float64, (7,)),
-    ])
-    arr = np.empty(len(picked), dtype=dtype)
-    for idx, r in enumerate(picked):
-        arr[idx]["hand"] = r["hand"]
-        arr[idx]["joint_angles"] = np.asarray(r["joint_angles"], dtype=np.float64).reshape(-1)
-        arr[idx]["workpiece_pose7"] = np.asarray(r["workpiece_pose7"], dtype=np.float64).reshape(-1)
+    weld_raw = dict(weld["raw"]) if (isinstance(weld, dict) and weld.get("raw")) else {}
+    data = {
+        "hand": np.array([r["hand"] for r in picked]),
+        "joint_angles": np.stack([np.asarray(r["joint_angles"], dtype=np.float64).reshape(-1)
+                                  for r in picked]),
+        "workpiece_pose7": np.stack([np.asarray(r["workpiece_pose7"], dtype=np.float64).reshape(-1)
+                                     for r in picked]),
+        "seam_idx": int(weld["idx"]) if (isinstance(weld, dict) and "idx" in weld) else -1,
+        "weld": weld_raw,                         # json 原始字段，缺啥就没啥（不补兜底）
+    }
     d = os.path.dirname(os.path.abspath(path))
     if d:
         os.makedirs(d, exist_ok=True)
-    np.save(path, arr)
+    np.save(path, np.array(data, dtype=object))   # 对象数组：np.load(..., allow_pickle=True).item() 读回
     print(f"[kejian2] 已保存 {len(picked)} 条到 {path}"
-          f"（正手 {len(fore)} / 反手 {len(back)}；每只手最多 {k}，超出按 pose 差距挑选）")
+          f"（正手 {len(fore)} / 反手 {len(back)}；每只手最多 {k}，超出按 pose 差距挑选；"
+          f"含焊缝 json 原始字段 {sorted(weld_raw)}）")
 
 
-def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
-                           viz: bool = False) -> Dict[str, list]:
-    """新逻辑求解（lookup 关节角采样 + 允许朝向 snap + 正面过滤 + 正反手分类）：
-    返回 {"forehand":[...], "backhand":[...]}。
+def _write_kejian2_log(log_path: str, obj_fp: str, weld_json: str,
+                       save_dir: Optional[str], save_k: int,
+                       stats: List[dict], total_welds: int,
+                       filtered: Optional[List[dict]] = None) -> None:
+    """把逐焊缝求解情况写成一个 txt（每条焊缝解完就重写一次，中断也保住已完成的记录）。
 
-    ① InitPoseLookupSolver（n^6 关节角采样，复用本文件已自带的求解器）对本焊缝反解出候选工件位姿
-       (R,t,q)，并用「整臂/retract 碰撞球 vs 工件 ESDF」过滤掉碰撞解（= plan_init_pose 原逻辑碰撞）；
-    ② 从候选里挑「旋转 R 与 4 种允许朝向某一种 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、
-       重算 t 让焊枪尖端（FK ee_pos）仍精确落在焊缝 standoff 点（snap 后不复检范围/碰撞）；
-    ③ 过滤：焊缝中心点须在 base 系 x>0；焊缝须在「正面」——bisector（背离工件=焊枪 approach 方向）
-       在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃；且【固定底座(xiaoyu_base_link)碰撞球 与 工件】在
-       base-xy 平面投影不能相交（相交=机械臂压在工件下/工件盖在底座上，丢弃；工件投影取【三角形投影并集】
-       精确判定，非凸包近似，凹形工件也准确）；
-    ④ 正反手按【bisector】在 base-x 的分量定：与 base-x 反向(负 x)=正手，否则=反手（焊缝几何，
-       与关节构型无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
+    stats 每项：{idx, n_fore, n_back, saved_fore, saved_back}（合格=求解给出数，已存=落盘数=min(合格,k)）。
+    filtered 每项：{idx, length_cm}——被 --filter-short 过滤掉的短焊缝（未求解）。
+    内容：逐焊缝成功/失败 + 合格/已存条数；被过滤短焊缝清单；末尾汇总成功率、失败 seam 列表、合格/已存总数。
+    成功率按【实际求解的焊缝】(stats) 计，过滤掉的不计入分母。"""
+    import datetime as _dt
+    filtered = filtered or []
+    d = os.path.dirname(os.path.abspath(log_path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    n_ok = sum(1 for s in stats if (s["n_fore"] + s["n_back"]) > 0)
+    n_fail = len(stats) - n_ok
+    fail_ids = [s["idx"] for s in stats if (s["n_fore"] + s["n_back"]) == 0]
+    sum_qual_f = sum(s["n_fore"] for s in stats)
+    sum_qual_b = sum(s["n_back"] for s in stats)
+    sum_save_f = sum(s["saved_fore"] for s in stats)
+    sum_save_b = sum(s["saved_back"] for s in stats)
+    lines = []
+    lines.append("# plan_init_pose_kejian2 初始位姿求解日志")
+    lines.append(f"工件 obj      : {obj_fp}")
+    lines.append(f"焊缝 json     : {weld_json}")
+    lines.append(f"输出目录      : {save_dir}")
+    lines.append(f"每只手上限 k  : {save_k}")
+    lines.append(f"更新时间      : {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"进度          : 已处理 {len(stats)} / 计划 {total_welds} 条"
+                 + (f"（另过滤短焊缝 {len(filtered)} 条）" if filtered else ""))
+    lines.append("")
+    lines.append("===== 逐焊缝 =====")
+    for s in stats:
+        qual = s["n_fore"] + s["n_back"]
+        saved = s["saved_fore"] + s["saved_back"]
+        if qual > 0:
+            lines.append(f"seam {s['idx']:>4}  成功   合格 {qual:>5} (正手 {s['n_fore']:>4} / 反手 {s['n_back']:>4})"
+                         f"   已存 {saved:>3} (正手 {s['saved_fore']:>3} / 反手 {s['saved_back']:>3})")
+        else:
+            lines.append(f"seam {s['idx']:>4}  失败   合格     0   已存   0")
+    if filtered:
+        lines.append("")
+        lines.append(f"===== 过滤掉的短焊缝 (<{SHORT_SEAM_LEN_M * 100:.0f}cm，未求解) =====")
+        for fz in filtered:
+            lines.append(f"seam {fz['idx']:>4}  已过滤   长度 {fz['length_cm']:.2f} cm")
+    lines.append("")
+    lines.append("===== 汇总 =====")
+    lines.append(f"焊缝总数        : {len(stats)}" + (f" / 计划 {total_welds}" if len(stats) != total_welds else ""))
+    rate = (100.0 * n_ok / len(stats)) if stats else 0.0
+    lines.append(f"成功            : {n_ok} 条  ({rate:.1f}%)")
+    lines.append(f"失败            : {n_fail} 条" + (f"   失败 seam: {fail_ids}" if fail_ids else ""))
+    if filtered:
+        lines.append(f"过滤短焊缝      : {len(filtered)} 条  (<{SHORT_SEAM_LEN_M * 100:.0f}cm，未求解)"
+                     f"   seam: {[fz['idx'] for fz in filtered]}")
+    lines.append(f"合格 pose 总数  : {sum_qual_f + sum_qual_b}  (正手 {sum_qual_f} / 反手 {sum_qual_b})")
+    lines.append(f"已存 pose 总数  : {sum_save_f + sum_save_b}  (正手 {sum_save_f} / 反手 {sum_save_b})")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _kejian2_build_ctx(obj_fp: str) -> dict:
+    """构建与【工件相关、与焊缝无关】的求解上下文（只需一次，可被同一工件的所有焊缝复用）：
+    cfg/cfg2、InitPoseLookupSolver（含工件 ESDF 体素化 ②）、joint 表（③，已存盘则复用）、
+    4 种允许朝向 R_valid_list、snap_deg、绕轴采样、ee 范围/standoff、固定底座圆 + 工件顶点/三角形。
+    返回 ctx dict；ctx["prof_setup"] 记录 ①②③②b 的耗时（供单焊缝入口打印完整耗时表）。"""
     from gt_gen.config import load_config
     import time as _time
     import torch as _torch
@@ -1924,17 +2031,13 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         if _torch.cuda.is_available():
             _torch.cuda.synchronize()
 
-    prof = {}                                    # 各阶段耗时（秒），末尾汇总打印瓶颈
+    prof_setup = {}
     _t = _time.time()
     cfg = load_config()
-    cfg2 = _kejian2_cfg(cfg)                     # 让 solver 读到 kejian2 的 ee 范围 / standoff / 缓存路径
-    welds = load_welds(weld_json)
-    weld = next((w for w in welds if int(w["idx"]) == int(seam_id)), None)
-    if weld is None:
-        raise IndexError(f"seam_id={seam_id} 不在 {weld_json}（共 {len(welds)} 条）")
-    prof["①setup(cfg+welds)"] = _time.time() - _t
+    cfg2 = _kejian2_cfg(cfg)                      # 让 solver 读到 kejian2 的 ee 范围 / standoff / 缓存路径
+    prof_setup["①setup(cfg)"] = _time.time() - _t
 
-    # —— ① lookup 求解器（与工件相关；joint table 与工件无关，优先复用 kejian2 独立缓存） ——
+    # —— ② lookup 求解器（与工件相关：含工件 ESDF 体素化） ——
     _t = _time.time()
     solver = InitPoseLookupSolver(
         cfg2, obj_fp,
@@ -1944,8 +2047,9 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         clearance_inflate=cfg.plan_init_kejian2_clearance_inflate,
         tip_spheres=cfg.plan_init_kejian2_tip_spheres)
     _sync()
-    prof["②solver初始化(含工件ESDF体素化)"] = _time.time() - _t
+    prof_setup["②solver初始化(含工件ESDF体素化)"] = _time.time() - _t
 
+    # —— ③ joint 表（与工件无关，已存盘则复用） ——
     _t = _time.time()
     if solver.load_joint_table():
         print("[kejian2] 复用已存 joint table（跳过 n^6 预计算）")
@@ -1954,17 +2058,63 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         solver.precompute_joint_table()
         solver.save_joint_table()
     _sync()
-    prof["③joint表(load或precompute+save)"] = _time.time() - _t
+    prof_setup["③joint表(load或precompute+save)"] = _time.time() - _t
 
     # 朝向集合（4 种允许朝向）：solve 的朝向粗筛 + CPU 精筛 _kejian2_snap 共用，snap_deg 同源
     _t = _time.time()
     R_valid_list = _kejian_orientations(obj_fp)
-    snap_deg = cfg.plan_init_kejian2_snap_deg
-    prof["②b朝向集合(lay_flat)"] = _time.time() - _t
+    prof_setup["②b朝向集合(lay_flat)"] = _time.time() - _t
 
-    rot_x = _deg_range(cfg.plan_init_kejian2_rot_x_deg)
-    rot_y = _deg_range(cfg.plan_init_kejian2_rot_y_deg)
-    rot_z = _deg_range(cfg.plan_init_kejian2_rot_z_deg)
+    # —— ③' 固定底座 vs 工件 base-xy 投影相交过滤的预备（底座圆 q 无关 + 工件顶点/三角形，均一次） ——
+    base_circles = _fixed_base_xy_circles(cfg2)
+    bc_cc, bc_rr, bc_umin, bc_umax = _base_circles_to_arrays(base_circles)
+    mesh_v, mesh_f = _load_mesh_vf(obj_fp)
+    if not base_circles:
+        print("[kejian2] 警告：取不到固定底座碰撞球，跳过「底座-工件 XY 相交」过滤")
+    if mesh_v is None or mesh_f is None:
+        print("[kejian2] 警告：读不到工件顶点/三角形，跳过「底座-工件 XY 相交」过滤")
+
+    return {
+        "obj_fp": obj_fp,
+        "cfg": cfg, "cfg2": cfg2, "solver": solver,
+        "R_valid_list": R_valid_list,
+        "snap_deg": cfg.plan_init_kejian2_snap_deg,
+        "rot_x": _deg_range(cfg.plan_init_kejian2_rot_x_deg),
+        "rot_y": _deg_range(cfg.plan_init_kejian2_rot_y_deg),
+        "rot_z": _deg_range(cfg.plan_init_kejian2_rot_z_deg),
+        "standoff": cfg.plan_init_kejian2_standoff,
+        "ee_xy_range": [float(v) for v in cfg.plan_init_kejian2_ee_xy_range],
+        "ee_z_range": [float(v) for v in cfg.plan_init_kejian2_ee_z_range],
+        "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
+        "mesh_v": mesh_v, "mesh_f": mesh_f,
+        "prof_setup": prof_setup,
+    }
+
+
+def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
+    """对单条焊缝求解（④ lookup 碰撞过滤 + ⑤ 朝向 snap/正面过滤/正反手分类），复用 ctx 里工件级的
+    solver/朝向/底座/mesh（不重建 ②③）。返回 ({"forehand":[...],"backhand":[...]}, prof_weld)，
+    prof_weld 记录 ④⑤ 耗时。per-weld 结果与原 plan_init_pose_kejian2 单焊缝逐位一致。"""
+    import time as _time
+    import torch as _torch
+    from scipy.spatial.transform import Rotation as _sR
+
+    def _sync():
+        if _torch.cuda.is_available():
+            _torch.cuda.synchronize()
+
+    solver = ctx["solver"]
+    R_valid_list = ctx["R_valid_list"]
+    snap_deg = ctx["snap_deg"]
+    rot_x, rot_y, rot_z = ctx["rot_x"], ctx["rot_y"], ctx["rot_z"]
+    standoff = ctx["standoff"]
+    xy_lo, xy_hi = ctx["ee_xy_range"]
+    z_lo, z_hi = ctx["ee_z_range"]
+    bc_cc, bc_rr, bc_umin, bc_umax = ctx["bc_cc"], ctx["bc_rr"], ctx["bc_umin"], ctx["bc_umax"]
+    mesh_v, mesh_f = ctx["mesh_v"], ctx["mesh_f"]
+
+    prof = {}
+    # —— ④ lookup（碰撞过滤 + 朝向粗筛） ——
     _t = _time.time()
     solver.solve_one_weld_lookup(weld, rot_x, rot_y, rot_z, profile=True,
                                  orient_valid=R_valid_list, orient_snap_deg=snap_deg)
@@ -1975,13 +2125,10 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
           f"{len(rot_x)}×{len(rot_y)}×{len(rot_z)}）")
     if not cands:
         print("[kejian2] lookup 无候选：请放宽 ee_xy_range_m/ee_z_range_m 或增大 n_per_dof")
-        return {"forehand": [], "backhand": []}
+        prof["⑤snap+正反手分类(CPU遍历候选)"] = 0.0
+        return {"forehand": [], "backhand": []}, prof
 
-    # —— ② 允许朝向已在上方算好；这里取 standoff 落枪点等 ——
     _t = _time.time()
-    standoff = cfg.plan_init_kejian2_standoff
-    xy_lo, xy_hi = (float(v) for v in cfg.plan_init_kejian2_ee_xy_range)
-    z_lo, z_hi = (float(v) for v in cfg.plan_init_kejian2_ee_z_range)
     mid_world = np.asarray(weld["mid_world"], dtype=np.float64)
     bis_world = np.asarray(weld["bisector_world"], dtype=np.float64)
     target_world = mid_world + standoff * bis_world      # 焊枪尖端目标点（mesh world 系）
@@ -1989,19 +2136,6 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     def _T(R, t):
         T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
         return T
-
-    def _in_ws(p):
-        r = float(np.hypot(p[0], p[1]))
-        return (xy_lo <= r <= xy_hi) and (z_lo <= float(p[2]) <= z_hi)
-
-    # —— ③' 固定底座 vs 工件 base-xy 投影相交过滤的预备：底座圆+并集AABB(q 无关，一次)+ 工件顶点/三角形(一次) ——
-    base_circles = _fixed_base_xy_circles(cfg2)
-    bc_cc, bc_rr, bc_umin, bc_umax = _base_circles_to_arrays(base_circles)
-    mesh_v, mesh_f = _load_mesh_vf(obj_fp)
-    if not base_circles:
-        print("[kejian2] 警告：取不到固定底座碰撞球，跳过「底座-工件 XY 相交」过滤")
-    if mesh_v is None or mesh_f is None:
-        print("[kejian2] 警告：读不到工件顶点/三角形，跳过「底座-工件 XY 相交」过滤")
 
     results = []
     n_hit = 0          # 朝向 snap 命中数
@@ -2011,7 +2145,6 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     seen = set()
 
     # —— 向量化预筛（批量替代逐候选 scipy/几何；与逐个版逐位等价，仅 overlap+去重+组装仍按原始顺序循环）——
-    from scipy.spatial.transform import Rotation as _sR
     Ncand = len(cands)
     R_all = np.stack([np.asarray(s["R"], dtype=np.float64) for s in cands])              # (N,3,3)
     mid_all = np.stack([np.asarray(s["mid_in_base"], dtype=np.float64) for s in cands])  # (N,3)
@@ -2097,17 +2230,131 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 背面丢 {n_back} / x<=0 丢 {n_xneg} "
           f"/ 底座-工件XY相交丢 {n_overlap} → 去重后合格 {len(results)}"
           f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
+    return {"forehand": fore, "backhand": back}, prof
 
-    # —— 耗时汇总（定位瓶颈）——
+
+def _print_prof_table(prof: dict) -> None:
+    """打印 === 各阶段耗时 === 表（含百分比与合计）。"""
     _total = sum(prof.values())
     print("[kejian2] === 各阶段耗时 ===")
     for _k, _v in prof.items():
         print(f"[kejian2]   {_k:32s} {_v:8.3f}s  ({100.0 * _v / max(_total, 1e-9):5.1f}%)")
     print(f"[kejian2]   {'合计':32s} {_total:8.3f}s")
 
-    if viz and results:
-        _show_kejian2_results(cfg2, obj_fp, weld, {"forehand": fore, "backhand": back}, stride=5)
-    return {"forehand": fore, "backhand": back}
+
+def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
+                           viz: bool = False) -> Dict[str, list]:
+    """新逻辑求解（lookup 关节角采样 + 允许朝向 snap + 正面过滤 + 正反手分类），单条焊缝：
+    返回 {"forehand":[...], "backhand":[...]}。
+
+    ① InitPoseLookupSolver（n^6 关节角采样，复用本文件已自带的求解器）对本焊缝反解出候选工件位姿
+       (R,t,q)，并用「整臂/retract 碰撞球 vs 工件 ESDF」过滤掉碰撞解（= plan_init_pose 原逻辑碰撞）；
+    ② 从候选里挑「旋转 R 与 4 种允许朝向某一种 xyz 三方向逐轴误差 < snap_deg」者，把 R snap 到该朝向、
+       重算 t 让焊枪尖端（FK ee_pos）仍精确落在焊缝 standoff 点（snap 后不复检范围/碰撞）；
+    ③ 过滤：焊缝中心点须在 base 系 x>0；焊缝须在「正面」——bisector（背离工件=焊枪 approach 方向）
+       在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃；且【固定底座(xiaoyu_base_link)碰撞球 与 工件】在
+       base-xy 平面投影不能相交（相交=机械臂压在工件下/工件盖在底座上，丢弃；工件投影取【三角形投影并集】
+       精确判定，非凸包近似，凹形工件也准确）；
+    ④ 正反手按【bisector】在 base-x 的分量定：与 base-x 反向(负 x)=正手，否则=反手（焊缝几何，
+       与关节构型无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。
+
+    注：工件级 ②③（solver/ESDF/joint 表）只构建一次；要一次跑同工件多条焊缝、摊薄这次开销，
+    用 plan_init_pose_kejian2_all。"""
+    ctx = _kejian2_build_ctx(obj_fp)
+    welds = load_welds(weld_json)
+    weld = next((w for w in welds if int(w["idx"]) == int(seam_id)), None)
+    if weld is None:
+        raise IndexError(f"seam_id={seam_id} 不在 {weld_json}（共 {len(welds)} 条）")
+
+    res, prof_weld = _kejian2_solve_weld(ctx, weld)
+    _print_prof_table({**ctx["prof_setup"], **prof_weld})
+    if viz and (res["forehand"] or res["backhand"]):
+        _show_kejian2_results(ctx["cfg2"], obj_fp, weld, res, stride=5)
+    return res
+
+
+def plan_init_pose_kejian2_all(obj_fp: str, weld_json: str,
+                               seam_ids: Optional[List[int]] = None,
+                               viz: bool = False,
+                               save_dir: Optional[str] = None,
+                               save_k: int = 15,
+                               log_path: Optional[str] = None,
+                               filter_short: bool = False) -> Dict[int, Dict[str, list]]:
+    """一次运行处理同一工件的【多条/全部】焊缝：工件级 ②③（solver/ESDF/joint 表）只构建一次，
+    再逐条焊缝跑 ④⑤。返回 {seam_id: {"forehand":[...], "backhand":[...]}}。
+
+    seam_ids=None → weld_json 里全部焊缝；否则只处理给定 idx（缺失的报错列出）。
+    filter_short=True → 先丢弃长度 < SHORT_SEAM_LEN_M(3cm) 的短焊缝（不求解、不落盘），并记入日志。
+    save_dir 给定时：每条焊缝【解完立刻】存 <save_dir>/seam_<idx>.npy（边算边存，不等全部跑完）。
+    log_path 给定时：每条焊缝解完就重写一次该 txt（记录成功率/失败 seam/合格与已存条数；中断也保住已完成的）。
+    per-weld 结果与单焊缝 plan_init_pose_kejian2 逐位一致，区别仅在 ②③ 不再每条重复。"""
+    import time as _time
+    ctx = _kejian2_build_ctx(obj_fp)          # ②③：只一次
+    print("[kejian2] === 工件级一次性耗时（②③，全焊缝共享）===")
+    _print_prof_table(ctx["prof_setup"])
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)  # 输出目录不存在则创建（在开跑前建好）
+
+    welds = load_welds(weld_json)
+    if seam_ids is not None:
+        want = [int(s) for s in seam_ids]
+        by_idx = {int(w["idx"]): w for w in welds}
+        miss = [s for s in want if s not in by_idx]
+        if miss:
+            raise IndexError(f"seam_id {miss} 不在 {weld_json}（共 {len(welds)} 条："
+                             f"{sorted(by_idx)}）")
+        welds = [by_idx[s] for s in want]
+
+    filtered: List[dict] = []
+    if filter_short:
+        kept = []
+        for w in welds:
+            L = _seam_len_m(w)
+            if L < SHORT_SEAM_LEN_M:
+                filtered.append({"idx": int(w["idx"]), "length_cm": L * 100.0})
+            else:
+                kept.append(w)
+        if filtered:
+            print(f"[kejian2] 过滤掉 {len(filtered)} 条短焊缝(<{SHORT_SEAM_LEN_M * 100:.0f}cm)："
+                  f"{[fz['idx'] for fz in filtered]}")
+        welds = kept
+
+    out: Dict[int, Dict[str, list]] = {}
+    stats: List[dict] = []
+    t_all = _time.time()
+    for wi, weld in enumerate(welds):
+        sid = int(weld["idx"])
+        print(f"\n[kejian2] ===== 焊缝 seam_id={sid}（{wi + 1}/{len(welds)}）=====")
+        res, prof_weld = _kejian2_solve_weld(ctx, weld)
+        _t4 = prof_weld.get("④solve_one_weld_lookup(碰撞过滤)", 0.0)
+        _t5 = prof_weld.get("⑤snap+正反手分类(CPU遍历候选)", 0.0)
+        print(f"[kejian2]   seam {sid}: ④={_t4:.3f}s ⑤={_t5:.3f}s "
+              f"（正手 {len(res['forehand'])} / 反手 {len(res['backhand'])}）")
+        if save_dir is not None:                  # 边算边存：本条解完立刻落盘
+            _save_kejian2_npy(res, os.path.join(save_dir, f"seam_{sid}.npy"), k=save_k, weld=weld)
+        out[sid] = res
+        n_fore, n_back = len(res["forehand"]), len(res["backhand"])
+        stats.append({"idx": sid, "n_fore": n_fore, "n_back": n_back,
+                      "saved_fore": min(n_fore, save_k), "saved_back": min(n_back, save_k)})
+        if log_path is not None:                  # 边算边写日志：中断也保住已完成焊缝的记录
+            _write_kejian2_log(log_path, obj_fp, weld_json, save_dir, save_k, stats, len(welds),
+                               filtered=filtered)
+    # 全被过滤（没有任何焊缝可求解）时也写一次日志，把过滤清单落盘
+    if log_path is not None and not welds:
+        _write_kejian2_log(log_path, obj_fp, weld_json, save_dir, save_k, stats, len(welds),
+                           filtered=filtered)
+    _setup = sum(ctx["prof_setup"].values())
+    print(f"\n[kejian2] 全部 {len(welds)} 条焊缝完成：工件级 ②③ 一次 {_setup:.3f}s "
+          f"+ 逐焊缝 ④⑤ 共 {_time.time() - t_all:.3f}s")
+    if log_path is not None:
+        print(f"[kejian2] 求解日志已写入 {log_path}")
+    if viz and welds:
+        w0 = welds[0]
+        if out[int(w0['idx'])]["forehand"] or out[int(w0['idx'])]["backhand"]:
+            _show_kejian2_results(ctx["cfg2"], obj_fp, w0, out[int(w0['idx'])], stride=5)
+    return out
+
+
 
 
 if __name__ == "__main__":
