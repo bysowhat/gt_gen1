@@ -1997,28 +1997,53 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     n_xneg = 0         # 因「焊缝中心点 base-x<=0」丢弃
     n_overlap = 0      # 因「固定底座与工件在 base-xy 投影相交」丢弃
     seen = set()
-    for i, sol in enumerate(cands):
-        # （pre-snap）焊缝中点也须在径向/z 范围内（起/终已由 lookup 端点检查、尖端由 precompute 保证）
-        if not _in_ws(np.asarray(sol["mid_in_base"], dtype=np.float64)):
-            continue
-        oid, Rv = _kejian2_snap(sol["R"], R_valid_list, snap_deg)
-        if Rv is None:
-            continue
-        n_hit += 1
-        ee_pos = np.asarray(sol["ee_pos_in_base"], dtype=np.float64)
-        t_new = ee_pos - Rv @ target_world           # 重算平移：焊枪尖端仍落在 standoff 点（snap 后不复检）
 
-        bis_base = Rv @ bis_world
-        bis_base = bis_base / (np.linalg.norm(bis_base) + 1e-12)
-        # （req）焊缝须在正面——bisector(背离工件=焊枪 approach 方向)在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃
-        if float(bis_base[2]) < 0.0:
-            n_back += 1
-            continue
-        # （req）焊缝中心点在 base 必须 x>0（snap 后真实焊缝中点 = ee_pos − standoff·bisector_base）
-        seam_center_base = ee_pos - standoff * bis_base
-        if float(seam_center_base[0]) <= 0.0:
-            n_xneg += 1
-            continue
+    # —— 向量化预筛（批量替代逐候选 scipy/几何；与逐个版逐位等价，仅 overlap+去重+组装仍按原始顺序循环）——
+    from scipy.spatial.transform import Rotation as _sR
+    Ncand = len(cands)
+    R_all = np.stack([np.asarray(s["R"], dtype=np.float64) for s in cands])              # (N,3,3)
+    mid_all = np.stack([np.asarray(s["mid_in_base"], dtype=np.float64) for s in cands])  # (N,3)
+    ee_all = np.stack([np.asarray(s["ee_pos_in_base"], dtype=np.float64) for s in cands])# (N,3)
+
+    # (pre-snap) _in_ws(mid_in_base)：焊缝中点径向/z 在范围内（起/终已由 lookup 端点检查、尖端由 precompute 保证）
+    r_xy = np.hypot(mid_all[:, 0], mid_all[:, 1])
+    mask_ws = (r_xy >= xy_lo) & (r_xy <= xy_hi) & (mid_all[:, 2] >= z_lo) & (mid_all[:, 2] <= z_hi)
+
+    # 朝向 snap（批量 scipy：每个允许朝向一次 from_matrix）；取【首个】命中 oid，与 _kejian2_snap 逐个版完全一致
+    Rv_arr = np.stack([np.asarray(R, dtype=np.float64) for R in R_valid_list])           # (V,3,3)
+    oid_best = np.full(Ncand, -1, dtype=np.int64)
+    for _oid in range(Rv_arr.shape[0]):
+        R_rel = np.einsum("ij,njk->nik", Rv_arr[_oid].T, R_all)                          # (N,3,3)
+        e = _sR.from_matrix(R_rel).as_euler("xyz", degrees=True)                         # (N,3) 一次
+        hit = (np.abs(e) < float(snap_deg)).all(axis=1) & mask_ws & (oid_best < 0)
+        oid_best[hit] = _oid
+    mask_hit = mask_ws & (oid_best >= 0)
+    n_hit = int(mask_hit.sum())
+
+    # 命中者：snap 到对应 Rv，批量重算 t_new（尖端仍落 standoff 点，snap 后不复检）/ bis_base
+    Rv_sel = Rv_arr[np.where(oid_best >= 0, oid_best, 0)]                                # (N,3,3) 非命中处用 oid0(后续不读)
+    t_new_all = ee_all - np.einsum("nij,j->ni", Rv_sel, target_world)                    # (N,3)
+    bis_all = np.einsum("nij,j->ni", Rv_sel, bis_world)                                  # (N,3)
+    bis_all = bis_all / (np.linalg.norm(bis_all, axis=1, keepdims=True) + 1e-12)
+    seam_center_all = ee_all - standoff * bis_all                                        # (N,3)
+
+    # （req）正面过滤：bisector(背离工件=approach 方向) base-z<0 ⇒ 焊缝朝下=背面，丢弃
+    mask_back_drop = mask_hit & (bis_all[:, 2] < 0.0)
+    n_back = int(mask_back_drop.sum())
+    mask_front = mask_hit & ~mask_back_drop
+    # （req）焊缝中心点在 base 必须 x>0
+    mask_xneg_drop = mask_front & (seam_center_all[:, 0] <= 0.0)
+    n_xneg = int(mask_xneg_drop.sum())
+    mask_survive = mask_front & ~mask_xneg_drop          # 进入 overlap/去重/组装的候选
+
+    # 仅对幸存者按【原始候选顺序】循环：底座-工件相交 + 轻去重 + 组装（去重需保序，与逐个版一致）
+    for i in np.nonzero(mask_survive)[0].tolist():
+        oid = int(oid_best[i]); Rv = Rv_arr[oid]
+        sol = cands[i]
+        ee_pos = ee_all[i]
+        t_new = t_new_all[i]
+        bis_base = bis_all[i]
+        seam_center_base = seam_center_all[i]
 
         # （req）固定底座与工件在 base-xy 平面投影不能相交：相交 ⇒ 机械臂压在工件下/工件盖在底座上，丢弃。
         # 用工件【三角形投影并集】精确判定（不再用凸包近似，凹形工件也准确）；底座 AABB 粗筛保证速度。
