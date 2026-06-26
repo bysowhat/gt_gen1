@@ -805,7 +805,7 @@ class InitPoseLookupSolver:
                         ret_xyz_b = self.retract_spheres_t[:, :3]
                         ret_r = self.retract_spheres_t[:, 3]
 
-                        chunk = 8192
+                        chunk = 2048
                         d_link_list, d_ret_list = [], []
                         for i in range(0, N, chunk):
                             sl = slice(i, min(i + chunk, N))
@@ -1517,71 +1517,76 @@ def _fixed_base_xy_circles(cfg) -> List[Tuple[np.ndarray, float]]:
     return circles
 
 
-def _load_mesh_vertices(obj_fp: str) -> Optional[np.ndarray]:
-    """读工件 mesh 顶点 (N,3)（mesh 局部系，与 InitPoseLookupSolver 同一份 obj）。读不到返回 None。"""
+def _load_mesh_vf(obj_fp: str):
+    """读工件 mesh 的顶点 V(N,3) 与三角形索引 F(M,3) int（mesh 局部系，与 InitPoseLookupSolver
+    同一份 obj）。读不到顶点返回 (None, None)；有顶点但无三角形返回 (V, None)。"""
     try:
         import open3d as o3d
         m = o3d.io.read_triangle_mesh(obj_fp)
         v = np.asarray(m.vertices, dtype=np.float64)
-        return v if v.size else None
+        f = np.asarray(m.triangles, dtype=np.int64)
+        if v.size == 0:
+            return None, None
+        return v, (f if f.size else None)
     except Exception:
-        return None
+        return None, None
 
 
-def _xy_convex_hull(points_xy: np.ndarray) -> np.ndarray:
-    """2D 凸包顶点（按序）。点数 < 3 或退化时原样返回。"""
-    pts = np.asarray(points_xy, dtype=np.float64)
-    if pts.shape[0] < 3:
-        return pts
-    try:
-        from scipy.spatial import ConvexHull
-        return pts[ConvexHull(pts).vertices]
-    except Exception:
-        return pts
+def _base_circles_to_arrays(base_circles):
+    """把 [(中心(2,),半径),…] 转成 (cc(C,2), rr(C,), 并集AABB下界 umin(2,), 并集AABB上界 umax(2,))。
+    底座圆 q 无关，转一次即可复用；空则返回 (None,None,None,None)。"""
+    if not base_circles:
+        return None, None, None, None
+    cc = np.array([c for c, _ in base_circles], dtype=np.float64)   # (C,2)
+    rr = np.array([r for _, r in base_circles], dtype=np.float64)   # (C,)
+    umin = (cc - rr[:, None]).min(axis=0)                           # (2,) 所有圆并集 AABB 下界
+    umax = (cc + rr[:, None]).max(axis=0)                           # (2,) 上界
+    return cc, rr, umin, umax
 
 
-def _point_in_poly(pt, poly) -> bool:
-    """射线法：点 pt(2,) 是否在多边形 poly(M,2) 内。"""
-    x, y = float(pt[0]), float(pt[1])
-    n = len(poly)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        xi, yi = float(poly[i][0]), float(poly[i][1])
-        xj, yj = float(poly[j][0]), float(poly[j][1])
-        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-300) + xi):
-            inside = not inside
-        j = i
-    return inside
-
-
-def _seg_point_dist(p, a, b) -> float:
-    """点 p 到线段 ab 的最短距离（2D）。"""
-    p = np.asarray(p, dtype=np.float64)
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    ab = b - a
-    denom = float(ab @ ab)
-    t = 0.0 if denom <= 1e-18 else max(0.0, min(1.0, float((p - a) @ ab) / denom))
-    return float(np.linalg.norm(p - (a + t * ab)))
-
-
-def _circle_poly_intersect(c, r: float, poly) -> bool:
-    """圆(心 c(2,), 半径 r) 与多边形 poly(M,2) 是否相交（含互相包含）。"""
-    if _point_in_poly(c, poly):                          # 圆心在多边形内（或圆完全套住小多边形时其顶点也在圆内→下方边距判得到）
-        return True
-    n = len(poly)
-    for i in range(n):
-        if _seg_point_dist(c, poly[i], poly[(i + 1) % n]) <= r:
-            return True
-    return False
-
-
-def _base_overlaps_workpiece(base_circles, hull_poly) -> bool:
-    """固定底座任一投影圆 与 工件 XY 凸包 相交即判「机械臂压在工件下」。"""
-    if not base_circles or hull_poly is None or len(hull_poly) < 3:
+def _circle_tri_intersect_any(cc, rr, tris) -> bool:
+    """任一底座圆 (cc(C,2), rr(C,)) 与任一 2D 三角形 (tris(M,3,2)) 相交则 True（全向量化）。
+    相交 = 三条件之一：①三角形某顶点落在圆内；②圆心落在三角形内；③圆心到某条边的距离 ≤ r。
+    （①②③合起来覆盖所有「圆∩三角形≠∅」情形：含工件套住底座、底座套住小三角、部分交叠）。"""
+    M, C = tris.shape[0], cc.shape[0]
+    if M == 0 or C == 0:
         return False
-    return any(_circle_poly_intersect(c, r, hull_poly) for c, r in base_circles)
+    cen = cc[:, None, :]                          # (C,1,2)
+    r2 = (rr * rr)[:, None]                        # (C,1)
+    A, B, D = tris[:, 0, :], tris[:, 1, :], tris[:, 2, :]   # 各 (M,2)
+    # ① 三角形顶点在圆内
+    for vtx in (A, B, D):
+        if np.any(((cen - vtx[None, :, :]) ** 2).sum(-1) <= r2):    # (C,M)
+            return True
+    # ②③ 遍历三条边：叉积符号（判圆心是否在三角形内）+ 圆心到线段距离
+    cross = []
+    for P, Q in ((A, B), (B, D), (D, A)):
+        e = (Q - P)[None, :, :]                    # (1,M,2) 边向量
+        w = cen - P[None, :, :]                    # (C,M,2) 圆心相对边起点
+        cross.append(e[..., 0] * w[..., 1] - e[..., 1] * w[..., 0])  # (C,M) 叉积
+        ee = (e ** 2).sum(-1)                       # (1,M)
+        t = np.clip((w * e).sum(-1) / (ee + 1e-18), 0.0, 1.0)        # (C,M) 投影参数夹到 [0,1]
+        proj = P[None, :, :] + t[..., None] * e     # (C,M,2) 边上最近点
+        if np.any(((cen - proj) ** 2).sum(-1) <= r2):                # ③ 圆心到边距离 ≤ r
+            return True
+    c0, c1, c2 = cross                              # ② 三叉积同号 ⇒ 圆心在三角形内（兼容两种绕向）
+    inside = ((c0 >= 0) & (c1 >= 0) & (c2 >= 0)) | ((c0 <= 0) & (c1 <= 0) & (c2 <= 0))
+    return bool(np.any(inside))
+
+
+def _base_overlaps_workpiece_tris(cc, rr, umin, umax, v_base_xy, faces) -> bool:
+    """固定底座圆 vs 工件【三角形投影并集】是否相交（精确，替代凸包近似）：
+    先用底座并集 AABB 粗筛三角形（底座固定在 base 原点附近小区域，绝大多数三角形被剔除→快），
+    再对邻近三角形做精确圆-三角形相交。faces 为 None（无三角形）时退化为「不过滤」。"""
+    if cc is None or faces is None or v_base_xy.shape[0] == 0:
+        return False
+    tris = v_base_xy[faces]                         # (M,3,2) 各三角形 3 个 base-xy 顶点
+    tmin = tris.min(axis=1)                         # (M,2) 三角形 AABB 下界
+    tmax = tris.max(axis=1)                         # (M,2) 上界
+    near = (tmax >= umin).all(axis=1) & (tmin <= umax).all(axis=1)   # 与底座并集 AABB 相叠才精算
+    if not np.any(near):
+        return False
+    return _circle_tri_intersect_any(cc, rr, tris[near])
 
 
 def _link_pose_in_base_batch(cfg, q_rows, link_name: str = "Link6"):
@@ -1772,7 +1777,8 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
        重算 t 让焊枪尖端（FK ee_pos）仍精确落在焊缝 standoff 点（snap 后不复检范围/碰撞）；
     ③ 过滤：焊缝中心点须在 base 系 x>0；焊缝须在「正面」——bisector（背离工件=焊枪 approach 方向）
        在 base z 分量为负 ⇒ 焊缝朝下=背面，丢弃；且【固定底座(xiaoyu_base_link)碰撞球 与 工件】在
-       base-xy 平面投影不能相交（相交=机械臂压在工件下/工件盖在底座上，丢弃；工件投影取顶点 2D 凸包）；
+       base-xy 平面投影不能相交（相交=机械臂压在工件下/工件盖在底座上，丢弃；工件投影取【三角形投影并集】
+       精确判定，非凸包近似，凹形工件也准确）；
     ④ 正反手按【bisector】在 base-x 的分量定：与 base-x 反向(负 x)=正手，否则=反手（焊缝几何，
        与关节构型无关）。lookup 过滤范围/缓存全部走 plan_init_pose_kejian2 段。"""
     from gt_gen.config import load_config
@@ -1826,13 +1832,14 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
         r = float(np.hypot(p[0], p[1]))
         return (xy_lo <= r <= xy_hi) and (z_lo <= float(p[2]) <= z_hi)
 
-    # —— ③' 固定底座 vs 工件 base-xy 投影相交过滤的预备：底座圆(q 无关，一次)+ 工件顶点(一次) ——
+    # —— ③' 固定底座 vs 工件 base-xy 投影相交过滤的预备：底座圆+并集AABB(q 无关，一次)+ 工件顶点/三角形(一次) ——
     base_circles = _fixed_base_xy_circles(cfg2)
-    mesh_v = _load_mesh_vertices(obj_fp)
+    bc_cc, bc_rr, bc_umin, bc_umax = _base_circles_to_arrays(base_circles)
+    mesh_v, mesh_f = _load_mesh_vf(obj_fp)
     if not base_circles:
         print("[kejian2] 警告：取不到固定底座碰撞球，跳过「底座-工件 XY 相交」过滤")
-    if mesh_v is None:
-        print("[kejian2] 警告：读不到工件顶点，跳过「底座-工件 XY 相交」过滤")
+    if mesh_v is None or mesh_f is None:
+        print("[kejian2] 警告：读不到工件顶点/三角形，跳过「底座-工件 XY 相交」过滤")
 
     results = []
     n_hit = 0          # 朝向 snap 命中数
@@ -1863,11 +1870,11 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
             n_xneg += 1
             continue
 
-        # （req）固定底座与工件在 base-xy 平面投影不能相交：相交 ⇒ 机械臂压在工件下/工件盖在底座上，丢弃
-        if base_circles and mesh_v is not None:
+        # （req）固定底座与工件在 base-xy 平面投影不能相交：相交 ⇒ 机械臂压在工件下/工件盖在底座上，丢弃。
+        # 用工件【三角形投影并集】精确判定（不再用凸包近似，凹形工件也准确）；底座 AABB 粗筛保证速度。
+        if bc_cc is not None and mesh_v is not None and mesh_f is not None:
             v_base_xy = (mesh_v @ Rv.T)[:, :2] + t_new[:2]   # 工件顶点变换到 base 系后取 xy
-            hull = _xy_convex_hull(v_base_xy)
-            if _base_overlaps_workpiece(base_circles, hull):
+            if _base_overlaps_workpiece_tris(bc_cc, bc_rr, bc_umin, bc_umax, v_base_xy, mesh_f):
                 n_overlap += 1
                 continue
 
