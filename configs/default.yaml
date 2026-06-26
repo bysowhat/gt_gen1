@@ -1,8 +1,10 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
 robot:                                  # 决策 B
-  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e/ur12e_full.yml"
-  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_remote/ur12e_full.yml"
+  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
+  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_remote/ur12e_full.yml"
+  # 新版机械臂(2026-06-26)：base=a1_ground_rail_platform, accessory=No012_TRM651, cable=No001_12ebarket。
+  # 由 scripts/build_robot_from_xacro_pkg.py 从 urdf_12e_260626/xiaoyu_description 离线生成(碰撞球 CPU 拟合)。
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
 
 # constraint:                             # 决策 A
@@ -31,12 +33,12 @@ sensor:                                 # 决策 D + E
     # 推导像素内参 fx = focal_length * width / horizontal_aperture
     intrinsics: {fx: 477.4, fy: 477.4, cx: 480.0, cy: 270.0}
     # 安装：相对 Link6（注意不是 ee_link xiaoyu_tip_link）
-    # 【已可视化确认 2026-06-02】相机帧 = T_base_Link6 @ T(extrinsic_pos, extrinsic_quat_wxyz)
+    # 【新版机械臂 2026-06-26 标定】相机帧 = T_base_Link6 @ T(extrinsic_pos, extrinsic_quat_wxyz)
     # 光学约定 OpenCV：+Z=视线朝前、+X 右、+Y 下；不套 USD 的 diag(1,-1,-1) 翻转
     mount_link: "Link6"
-    extrinsic_pos: [-0.08318594, -0.01074588, 0.20808960]
-    # 参考 ik_cam.py(L17) + gt_math.py：此 quat 按 (w,x,y,z) 解释（= cuRobo 约定，无需转换）
-    extrinsic_quat_wxyz: [0.67914898, -0.11969930, -0.21945439, -0.69012209]
+    extrinsic_pos: [0.05018328, 0.09963676, 0.14782703]
+    # 此 quat 按 (w,x,y,z) 解释（= cuRobo 约定，无需转换）
+    extrinsic_quat_wxyz: [0.02269110, 0.03172106, 0.00070220, -0.99923861]
     reference: "/home/a/Projects/Github/kejian_benchmark/gt_benchmark_pose_fast"  # env/ik_cam.py, gt_math.py
 
 roi:                                    # 决策 H —— ROI 盒（单一来源；init_curobo 与 build_roi_voxmap 都读这里）
@@ -130,7 +132,7 @@ plan_init_pose_kejian2:                  # lookup(n^6 关节角采样, 复用 pl
   ee_xy_range_m: [0.4, 1.0]             # 焊缝点 xy 平面到 base_link 原点距离 [下限,上限]（米）
   ee_z_range_m: [-0.1, 0.1]             # 焊缝点在 base_link 系 z [下限,上限]（米）
   # n_per_dof: [15, 15, 15, 24, 24, 24]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,949,120（≈ 旧 12^6=2.99M，不易 OOM）。
-  n_per_dof: [12, 12, 12, 15, 24, 24]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,949,120（≈ 旧 12^6=2.99M，不易 OOM）。
+  n_per_dof: [12, 12, 12, 12, 12, 12]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,949,120（≈ 旧 12^6=2.99M，不易 OOM）。
                                         #   也可填标量(如 12)=各关节同档(=n^6，旧行为)。本表：基座 joint0/1/2 取 16(定位更细)，
                                         #   腕部 joint3/4 取 10/12，joint5(腕滚 ±6.2rad，与 rot_x roll 冗余) 取 6。
                                         #   想加精度就调大对应关节；显存≈幸存者数×碰撞球，先小步加。改了此值须重算关节表缓存。
@@ -147,12 +149,13 @@ plan_init_pose_kejian2:                  # lookup(n^6 关节角采样, 复用 pl
   tip_spheres:                          # 焊枪尖端球（间隙膨胀时排除，不膨胀，保证尖端能贴焊缝 standoff）。
     link: xiaoyu_accessory_link         #   球所在 link；center 为该 link 局部系坐标，与 robot cfg collision_spheres 一致
     match_tol_m: 0.0005                 #   center 匹配容差（米）；匹配数须等于 centers 数，否则报错
-    centers:                            #   weld_wire 沿 +X 的 5 个尖端球（r=0.003）
-      - [0.0405, 0.0, 0.0]
-      - [0.0355, 0.0, 0.0]
-      - [0.0305, 0.0, 0.0]
-      - [0.0255, 0.0, 0.0]
-      - [0.0205, 0.0, 0.0]
+    centers:                            #   weld_wire 5 个尖端球（r=0.003，xiaoyu_accessory_link 局部系）
+                                        #   新版机械臂(No012_TRM651/shield605_2033)由 build_robot_from_xacro_pkg.py 算出
+      - [0.076256, 0.0, 0.573073]
+      - [0.073905, 0.0, 0.569837]
+      - [0.071554, 0.0, 0.566601]
+      - [0.069203, 0.0, 0.563365]
+      - [0.066852, 0.0, 0.560129]
   standoff_cm: 2.0                      # 焊枪头落点沿 bisector（远离工件方向）外移的 standoff 距离（cm）
   rot_x_deg: [-180, 180, 30]            # lookup 绕末端局部 +x 轴（=名义焊枪轴 -x，焊枪自转 roll）：[min,max,step]（度）
   rot_y_deg: [-30, 30, 15]              # lookup 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
