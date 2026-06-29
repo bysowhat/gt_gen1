@@ -29,9 +29,9 @@
 set -uo pipefail   # 故意不加 -e：单个工件失败要继续跑下一个，不中断整批
 
 # ---- 路径/参数（环境变量可覆盖）----
-SUB_DIR="${SUB_DIR:-/kpfs_dataset/dataset/baiyu/dataset_v2/debug/segment_output_sub_debug}"
-DATA_DIR="${DATA_DIR:-/kpfs_dataset/dataset/baiyu/dataset_v2/debug/kejian/initpose/data}"
-LOGS_DIR="${LOGS_DIR:-/kpfs_dataset/dataset/baiyu/dataset_v2/debug/kejian/initpose/logs}"
+SUB_DIR="${SUB_DIR:-/kpfs_dataset_ssd/dataset/render_kejian/segment_output_subs/part_3}"
+DATA_DIR="${DATA_DIR:-/kpfs_dataset_ssd/dataset/render_kejian/initpose_full/data}"
+LOGS_DIR="${LOGS_DIR:-/kpfs_dataset_ssd/dataset/render_kejian/initpose_full/logs}"
 PY="${PY:-/workspace/isaaclab/_isaac_sim/python.sh}"                          # 远程 isaac python（含 torch+cuda）
 CUROBO_SRC="${CUROBO_SRC:-/kpfs_dataset/dataset/baiyu/code/render/curobo/src}" # curobo 源码（加进 PYTHONPATH）
 FILTER_SHORT="${FILTER_SHORT:-1}"     # 1=加 --filter-short（丢弃 <3cm 短焊缝，不求解、记入 summary）；默认开，设 0 关闭
@@ -44,7 +44,8 @@ if [[ -z "${GPUS:-}" ]]; then
     [[ -z "$GPUS" ]] && GPUS="0"
 fi
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
-N=${#GPU_ARR[@]}
+# N=${#GPU_ARR[@]}
+N=1
 
 # 仓库根：本脚本在 scripts/bash/ 下
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
