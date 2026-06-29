@@ -389,9 +389,17 @@ def render_batch(sim, scene, batch_poses, offsets, robots, joint_names,
     right_depth = right.output[DEPTH_KEY]
     left_K = left.intrinsic_matrices.detach().cpu().numpy()
     right_K = right.intrinsic_matrices.detach().cpu().numpy()
+    # 相机/底座的实际世界位姿（pos_w 为 ROS 约定原点；quat_w_ros 为 ROS 约定姿态，wxyz）。
+    # 注意：机械臂未真正抬升（用 warehouse 下移等价实现），故这些世界 z 是底座立于 z≈0
+    # 的真实渲染坐标；要换算到「相对地板」需再加 z_lift。
+    left_pos_w = left.pos_w.detach().cpu().numpy()
+    left_quat_w = left.quat_w_ros.detach().cpu().numpy()
+    right_pos_w = right.pos_w.detach().cpu().numpy()
+    right_quat_w = right.quat_w_ros.detach().cpu().numpy()
 
     out = {}
     for env_idx, _ in batch_poses:
+        rb = robots[env_idx].data
         out[env_idx] = {
             "left_rgb": left_rgb[env_idx].detach().cpu().numpy(),
             "left_depth": left_depth[env_idx, :, :, 0].detach().cpu().numpy(),
@@ -399,6 +407,12 @@ def render_batch(sim, scene, batch_poses, offsets, robots, joint_names,
             "right_depth": right_depth[env_idx, :, :, 0].detach().cpu().numpy(),
             "left_K": left_K[env_idx],
             "right_K": right_K[env_idx],
+            "left_pos_w": left_pos_w[env_idx],
+            "left_quat_w": left_quat_w[env_idx],
+            "right_pos_w": right_pos_w[env_idx],
+            "right_quat_w": right_quat_w[env_idx],
+            "base_pos_w": rb.root_link_pos_w[0].detach().cpu().numpy(),
+            "base_quat_w": rb.root_link_quat_w[0].detach().cpu().numpy(),
             "z_lift": lifts.get(env_idx, 0.0),
         }
     torch.cuda.empty_cache()
@@ -426,6 +440,14 @@ def save_pose(out_dir, rendered, pose7, joint_names, retract_config):
         "extrinsic_ref_link": "Link6",
         "depth_type": DEPTH_KEY,
         "z_lift": float(rendered.get("z_lift", 0.0)),  # 整组相对地板抬升量(米)，warehouse 下移同量
+        # 渲染时的实际世界位姿（机械臂底座立于 z≈0；相对地板需 +z_lift）。wxyz。
+        "left_pose_w_pos": np.asarray(rendered["left_pos_w"], dtype=np.float64),
+        "left_pose_w_quat_wxyz": np.asarray(rendered["left_quat_w"], dtype=np.float64),
+        "right_pose_w_pos": np.asarray(rendered["right_pos_w"], dtype=np.float64),
+        "right_pose_w_quat_wxyz": np.asarray(rendered["right_quat_w"], dtype=np.float64),
+        "base_pose_w_pos": np.asarray(rendered["base_pos_w"], dtype=np.float64),
+        "base_pose_w_quat_wxyz": np.asarray(rendered["base_quat_w"], dtype=np.float64),
+        "cam_pose_w_convention": "ros",  # 相机世界姿态约定（与外参一致）
     }, allow_pickle=True)
 
 
@@ -477,12 +499,12 @@ def main():
         rendered = render_batch(sim, scene, batch_poses, scene["offsets"],
                                 scene["robots"], joint_names, retract_config,
                                 args_cli.settle_steps)
-        # [debug] 保存整个场景 USD，便于离线检查相机/工件/机械臂相对位姿
-        dbg_usd = out_root / f"scene_batch_{start}.usd"
-        dbg_usd.parent.mkdir(parents=True, exist_ok=True)
-        n_baked = bake_joint_state_to_usd(num_envs, joint_names, retract_config)
-        omni.usd.get_context().get_stage().Export(str(dbg_usd))
-        print(f"  [debug] 场景 USD -> {dbg_usd}（回写 {n_baked} 个关节角）")
+        # # [debug] 保存整个场景 USD，便于离线检查相机/工件/机械臂相对位姿
+        # dbg_usd = out_root / f"scene_batch_{start}.usd"
+        # dbg_usd.parent.mkdir(parents=True, exist_ok=True)
+        # n_baked = bake_joint_state_to_usd(num_envs, joint_names, retract_config)
+        # omni.usd.get_context().get_stage().Export(str(dbg_usd))
+        # print(f"  [debug] 场景 USD -> {dbg_usd}（回写 {n_baked} 个关节角）")
         for env_idx, p in enumerate(chunk):
             save_pose(out_root / f"pose_{p}", rendered[env_idx], poses[p],
                       joint_names, retract_config)
