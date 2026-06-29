@@ -44,6 +44,15 @@ CAM_V_APERTURE = 4.672
 CAM_CLIP = (1e-5, 1e3)
 DEPTH_KEY = "distance_to_image_plane"   # 用户写的 "depth" 的真实键（针孔 z 深度，单位 m）
 
+# ======================= 整组离地高度约束 =======================
+# 保持机械臂↔工件相对位姿不变，把整组沿 z 平移，使二者最低点落在地板上方
+# FLOOR_CLEARANCE，整组抬升不超过 MAX_LIFT。相机挂在机械臂上、只看相对几何，
+# 故「整组抬高 lift」等价于「warehouse(地/墙/灯)整体下移 lift」——实现上后者更干净
+# （不必动 fix_base 机械臂的物理根），渲染结果完全相同。
+FLOOR_CLEARANCE = 0.0     # 最低点贴地板（留 0；可设小正值避免 z-fighting）
+MAX_LIFT = 5.0            # 整组相对地板的高度上限(米)
+ROBOT_Z_RANGE_EST = (0.0, 3.0)   # 机械臂立在地面：底座≈z0，顶端约 3m（工件包围盒之外的兜底）
+
 
 def timer(stage_name):
     def deco(func):
@@ -176,6 +185,46 @@ def set_prim_pose(prim_path, pos, quat_wxyz):
     o.Set(Gf.Quatd(w, Gf.Vec3d(x, y, z)))
 
 
+def prim_world_z_range(prim_path):
+    """返回 prim 世界坐标对齐包围盒的 (min_z, max_z)；空几何返回 None。"""
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(prim_path)
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+    )
+    rng = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+    if rng.IsEmpty():
+        return None
+    return float(rng.GetMin()[2]), float(rng.GetMax()[2])
+
+
+def compute_group_lift(workpiece_path):
+    """按工件世界包围盒 + 机械臂(立地)估计，算出整组离地抬升量 lift。
+
+    目标：保持机械臂↔工件相对位姿不变，把二者最低点抬到地板上方 FLOOR_CLEARANCE，
+    抬升不超过 MAX_LIFT（顶端不超过地板上方 MAX_LIFT 米）。返回 lift(米, ≥0)。
+    渲染时通过把 warehouse 下移 lift 来等价实现整组抬高。
+    """
+    wp = prim_world_z_range(workpiece_path)
+    wp_min, wp_max = wp if wp is not None else (0.0, 0.0)
+    rb_min, rb_max = ROBOT_Z_RANGE_EST
+    group_min = min(wp_min, rb_min)
+    group_max = max(wp_max, rb_max)
+
+    # 把最低点抬到地板上方 FLOOR_CLEARANCE（group_min<0 时 lift>0；否则不下压）
+    lift = max(0.0, FLOOR_CLEARANCE - group_min)
+    # 上限：顶端不超过地板上方 MAX_LIFT
+    span = group_max - group_min
+    if span + FLOOR_CLEARANCE > MAX_LIFT:
+        # 整组本身就高于上限，无法两头兼顾：保最低贴地，顶端必然超限，警告
+        print(f"  [warn] 整组 z 跨度 {span:.2f}m > 上限 {MAX_LIFT}m，无法在 5m 内放下，"
+              f"按最低点贴地处理（顶端将超 {MAX_LIFT}m）")
+    elif group_max + lift > MAX_LIFT:
+        lift = max(0.0, MAX_LIFT - group_max)
+    return lift
+
+
 def hide_prims_by_name(substrings):
     """把名字/路径包含任一 substring 的可渲染 prim 设为不可见。
 
@@ -224,6 +273,7 @@ def build_scene(robot_usd, workpiece_usd, link6_subpath, num_envs, spacing,
 
     robots = []
     workpiece_paths = []
+    warehouse_paths = []
     for i, off in enumerate(offsets):
         env_root = f"/World/envs/env_{i:02d}"
 
@@ -232,8 +282,10 @@ def build_scene(robot_usd, workpiece_usd, link6_subpath, num_envs, spacing,
             usd_path=warehouse_usd,
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
         )
-        bg_cfg.func(f"{env_root}/warehouse", bg_cfg,
+        wh_path = f"{env_root}/warehouse"
+        bg_cfg.func(wh_path, bg_cfg,
                     translation=(float(off[0]), float(off[1]), 0.0))
+        warehouse_paths.append(wh_path)
 
         # 机械臂（固定底座、关重力、初始关节角=retract）
         robot_cfg = ArticulationCfg(
@@ -269,6 +321,7 @@ def build_scene(robot_usd, workpiece_usd, link6_subpath, num_envs, spacing,
         "offsets": offsets,
         "robots": robots,
         "workpiece_paths": workpiece_paths,
+        "warehouse_paths": warehouse_paths,
         "left_cam": left_cam,
         "right_cam": right_cam,
     }
@@ -301,6 +354,17 @@ def render_batch(sim, scene, batch_poses, offsets, robots, joint_names,
         off = offsets[env_idx]
         world_pos = (pose7[0] + off[0], pose7[1] + off[1], pose7[2] + off[2])
         set_prim_pose(scene["workpiece_paths"][env_idx], world_pos, pose7[3:7])
+
+    # 整组离地高度调整：算每个 env 的抬升量 lift，把对应 warehouse 下移 lift
+    # （等价于机械臂+工件相对地板整体抬高 lift，相对位姿不变）
+    lifts = {}
+    for env_idx, _ in batch_poses:
+        off = offsets[env_idx]
+        lift = compute_group_lift(scene["workpiece_paths"][env_idx])
+        lifts[env_idx] = lift
+        set_prim_pose(scene["warehouse_paths"][env_idx],
+                      (off[0], off[1], -lift), (1.0, 0.0, 0.0, 0.0))
+        print(f"  env_{env_idx}: 整组抬升 lift={lift:.3f}m（warehouse 下移同量）")
 
     # 设机械臂初始关节角
     for env_idx, _ in batch_poses:
@@ -335,6 +399,7 @@ def render_batch(sim, scene, batch_poses, offsets, robots, joint_names,
             "right_depth": right_depth[env_idx, :, :, 0].detach().cpu().numpy(),
             "left_K": left_K[env_idx],
             "right_K": right_K[env_idx],
+            "z_lift": lifts.get(env_idx, 0.0),
         }
     torch.cuda.empty_cache()
     return out
@@ -360,6 +425,7 @@ def save_pose(out_dir, rendered, pose7, joint_names, retract_config):
         "extrinsic_convention": "ros",
         "extrinsic_ref_link": "Link6",
         "depth_type": DEPTH_KEY,
+        "z_lift": float(rendered.get("z_lift", 0.0)),  # 整组相对地板抬升量(米)，warehouse 下移同量
     }, allow_pickle=True)
 
 
