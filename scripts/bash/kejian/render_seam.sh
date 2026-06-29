@@ -90,7 +90,53 @@ echo "[render] seam npy  : $SEAM_NPY"
 echo "[render] out       : $OUT"
 echo "[render] max_envs=$MAX_ENVS spacing=$SPACING settle_steps=$SETTLE_STEPS headless=$HEADLESS force_convert=$FORCE_CONVERT"
 
-PYTHONUNBUFFERED=1 "$PY" -u "$SCRIPT" "${ARGS[@]}"
-rc=$?
-[[ $rc -eq 0 ]] && echo "[render] 完成 -> $OUT" || echo "[render] 失败 rc=$rc" >&2
+# ---- 运行 + 完成即强杀（靠哨兵文件，不依赖 stdout）------------------------
+# 渲染跑完所有 pose 后会卡在 isaac 的 simulation_app.close()（不自己退出）。让 render_seam.py
+# 在“全部 pose 落盘后”写一个哨兵文件（RENDER_DONE_FILE）；本脚本把 python 放进独立进程组
+# 后台跑，输出经 tee 边显示边落日志，轮询到哨兵出现即判定成功并 SIGKILL 整个进程组
+# （连带 isaac 子进程）。比 grep stdout 更鲁棒：不受编码/缓冲/print 文案改动影响。
+# 多 GPU 调度器（render_dispatch.sh）会为每个作业传入唯一的 RENDER_DONE_FILE。
+GRACE_SEC="${GRACE_SEC:-3}"          # 命中哨兵后等几秒让缓冲/文件落盘再杀
+POLL_SEC="${POLL_SEC:-2}"           # 轮询哨兵间隔
+DONE_FILE="${RENDER_DONE_FILE:-$(mktemp /tmp/render_seam_done.XXXXXX)}"
+rm -f "$DONE_FILE"                   # 起跑前清空，避免命中上次残留
+export RENDER_DONE_FILE="$DONE_FILE" # 传给 python：完成后写它
+
+LOG="$(mktemp /tmp/render_seam_log.XXXXXX)"
+# 清理临时 config 与 log；DONE_FILE 默认是本脚本的 mktemp，也一并清；若由调度器传入
+# （/tmp/render_seam_done.* 之外的路径），保留给调度器判完成。
+trap 'rm -f "$CONFIG" "$LOG"; [[ "$DONE_FILE" == /tmp/render_seam_done.* ]] && rm -f "$DONE_FILE"' EXIT
+
+echo "[render] done file : $DONE_FILE"
+
+# setsid：python 成为新进程组组长（PGID==其 PID），便于一次性杀掉整棵进程树
+setsid env PYTHONUNBUFFERED=1 "$PY" -u "$SCRIPT" "${ARGS[@]}" > >(tee "$LOG") 2>&1 &
+PGID=$!
+
+rc=0
+killed_on_done=0
+while kill -0 "$PGID" 2>/dev/null; do
+    if [[ -f "$DONE_FILE" ]]; then
+        echo "[render] 检测到完成哨兵 $DONE_FILE，${GRACE_SEC}s 后强制结束进程组 $PGID ..."
+        sleep "$GRACE_SEC"
+        kill -KILL -- -"$PGID" 2>/dev/null
+        killed_on_done=1
+        break
+    fi
+    sleep "$POLL_SEC"
+done
+
+if [[ "$killed_on_done" == "1" ]]; then
+    wait "$PGID" 2>/dev/null          # 回收，忽略被 KILL 的退出码
+    rc=0
+    echo "[render] 完成（已强杀挂起进程）-> $OUT"
+else
+    wait "$PGID"; rc=$?               # 进程自行退出：用其真实退出码
+    if [[ $rc -eq 0 && -f "$DONE_FILE" ]]; then
+        echo "[render] 完成 -> $OUT"
+    else
+        echo "[render] 失败 rc=$rc（未见完成哨兵）" >&2
+        [[ $rc -eq 0 ]] && rc=1
+    fi
+fi
 exit $rc

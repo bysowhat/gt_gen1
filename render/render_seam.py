@@ -544,6 +544,22 @@ def main():
 
     print(f"[main] 完成，共保存 {saved} 个 pose 到 {out_root}")
 
+    # 完成哨兵（鲁棒信号，不依赖 stdout/print）：渲染全部 pose 后写标记文件。
+    # 渲染进程随后会卡在 isaac 的 simulation_app.close()（不自退），多 GPU 调度器据此哨兵
+    # 判定本作业完成 → 强杀挂起进程 → 让该卡去跑下一个作业。
+    #   · 始终在输出目录写 out_root/_DONE（人可见、与作业一一对应）；
+    #   · 若设了环境变量 RENDER_DONE_FILE，再额外写该路径——调度器用它做唯一、易轮询的
+    #     哨兵，免去在 shell 里重算 ascii obj_stem。两者都只在“全部 pose 落盘后”才写。
+    try:
+        (out_root / "_DONE").write_text(f"saved={saved}\nout={out_root}\n")
+        ext = os.environ.get("RENDER_DONE_FILE")
+        if ext:
+            ext_p = Path(ext)
+            ext_p.parent.mkdir(parents=True, exist_ok=True)
+            ext_p.write_text(f"saved={saved}\nout={out_root}\n")
+    except Exception as e:  # 写标记失败不应影响已落盘的渲染结果
+        print(f"[main] 写完成哨兵失败（渲染结果不受影响）：{e}")
+
 
 if __name__ == "__main__":
     print(f"PID: {os.getpid()}")
