@@ -44,6 +44,7 @@ BLACKLIST = [
     "Polycarbonate_Spectral_Clear", "Polycarbonate_Cloudy", "Polycarbonate_Opaque",
     "Polyethylene_Cloudy", "Polyethylene_Opaque",
     "Polypropylene_Cloudy", "Polypropylene_Opaque",
+    "Light_",  # 自发光色温材质族（Light_3000K/7000K…），会把工件照得过曝/发光，整族剔除
 ]
 
 # ======================= 投影参数（针对无 UV 工件）=======================
