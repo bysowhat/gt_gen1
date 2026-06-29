@@ -110,6 +110,7 @@ import sys  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import depth_io  # noqa: E402
 import asset_convert  # noqa: E402
+import materials  # noqa: E402
 
 
 def load_robot_cfg(robot_cfg_path):
@@ -123,12 +124,16 @@ def load_robot_cfg(robot_cfg_path):
 
 
 def load_poses(seam_npy):
-    """读 workpiece_pose7 → (N,7) [x,y,z, qw,qx,qy,qz]（T_base←workpiece，米，wxyz）。"""
+    """读 seam npy，返回 (poses, raw)。
+
+    poses = workpiece_pose7 → (N,7) [x,y,z, qw,qx,qy,qz]（T_base←workpiece，米，wxyz）。
+    raw   = npy 的全部原始内容（dict，含 weld/seam_idx/hand/joint_angles…），原样写进 meta。
+    """
     data = np.load(seam_npy, allow_pickle=True).item()
     poses = np.asarray(data["workpiece_pose7"], dtype=np.float64)
     if poses.ndim == 1:
         poses = poses[None, :]
-    return poses
+    return poses, data
 
 
 def grid_offsets(num_envs, spacing):
@@ -336,14 +341,16 @@ def ordered_joint_tensor(robot, joint_names, retract_config, device, dtype):
 
 
 @timer("渲染一批")
-def render_batch(sim, scene, batch_poses, offsets, robots, joint_names,
-                 retract_config, settle_steps):
-    """设置本批每个 env 的工件位姿 + 机械臂初始关节角，step 若干帧后读左右目数据。
+def render_batch(sim, scene, batch_poses, chunk, mat_pick, offsets, robots,
+                 joint_names, retract_config, settle_steps):
+    """设置本批每个 env 的工件位姿 + 材质 + 机械臂初始关节角，step 若干帧后读左右目数据。
 
     Args:
         batch_poses: list[(env_idx, pose7)]，长度 ≤ num_envs
+        chunk: list[int]，与 batch_poses 对齐的全局 pose 序号（用于材质采样/材质 prim 命名）
+        mat_pick: pick(global_idx)->(mdl_path,name) 或 None（无材质库时恒为 None）
     Returns:
-        dict env_idx -> {left_rgb,left_depth,right_rgb,right_depth, left_K, right_K}
+        dict env_idx -> {left_rgb,left_depth,right_rgb,right_depth, left_K, right_K, ...}
     """
     sim_dt = sim.get_physics_dt()
     device = robots[0].data.default_root_state.device
@@ -354,6 +361,21 @@ def render_batch(sim, scene, batch_poses, offsets, robots, joint_names,
         off = offsets[env_idx]
         world_pos = (pose7[0] + off[0], pose7[1] + off[1], pose7[2] + off[2])
         set_prim_pose(scene["workpiece_paths"][env_idx], world_pos, pose7[3:7])
+
+    # 给本批每个工件绑定随机材质（无 UV 工件靠 OmniPBR 世界/物体空间投影出纹理）。
+    # 材质 prim 用 (env, 全局pose序号) 命名，避免跨批重名；无材质库时跳过、保持灰色默认。
+    mat_names = {}
+    for i, (env_idx, _) in enumerate(batch_poses):
+        gidx = chunk[i]
+        m = mat_pick(gidx)
+        if m is None:
+            mat_names[env_idx] = None
+            continue
+        mdl_path, mname = m
+        mat_prim = f"/World/Looks/wpMat_{env_idx:02d}_{gidx}"
+        materials.bind_material_to_prim(scene["workpiece_paths"][env_idx], mdl_path, mat_prim)
+        mat_names[env_idx] = mname
+        print(f"  env_{env_idx}: 工件材质 = {mname}")
 
     # 整组离地高度调整：算每个 env 的抬升量 lift，把对应 warehouse 下移 lift
     # （等价于机械臂+工件相对地板整体抬高 lift，相对位姿不变）
@@ -414,12 +436,13 @@ def render_batch(sim, scene, batch_poses, offsets, robots, joint_names,
             "base_pos_w": rb.root_link_pos_w[0].detach().cpu().numpy(),
             "base_quat_w": rb.root_link_quat_w[0].detach().cpu().numpy(),
             "z_lift": lifts.get(env_idx, 0.0),
+            "material": mat_names.get(env_idx),
         }
     torch.cuda.empty_cache()
     return out
 
 
-def save_pose(out_dir, rendered, pose7, joint_names, retract_config):
+def save_pose(out_dir, rendered, pose7, joint_names, retract_config, seam_raw):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     depth_io.store_rgb(out_dir / "left_rgb.png", rendered["left_rgb"])
@@ -440,6 +463,7 @@ def save_pose(out_dir, rendered, pose7, joint_names, retract_config):
         "extrinsic_ref_link": "Link6",
         "depth_type": DEPTH_KEY,
         "z_lift": float(rendered.get("z_lift", 0.0)),  # 整组相对地板抬升量(米)，warehouse 下移同量
+        "workpiece_material": rendered.get("material"),  # 本 pose 绑定的工件材质名（无库时 None）
         # 渲染时的实际世界位姿（机械臂底座立于 z≈0；相对地板需 +z_lift）。wxyz。
         "left_pose_w_pos": np.asarray(rendered["left_pos_w"], dtype=np.float64),
         "left_pose_w_quat_wxyz": np.asarray(rendered["left_quat_w"], dtype=np.float64),
@@ -448,6 +472,9 @@ def save_pose(out_dir, rendered, pose7, joint_names, retract_config):
         "base_pose_w_pos": np.asarray(rendered["base_pos_w"], dtype=np.float64),
         "base_pose_w_quat_wxyz": np.asarray(rendered["base_quat_w"], dtype=np.float64),
         "cam_pose_w_convention": "ros",  # 相机世界姿态约定（与外参一致）
+        # seam_*.npy 的全部原始内容，原样存入（weld 焊缝几何/seam_idx/hand/joint_angles/
+        # workpiece_pose7 等）。坐标系按原文件，未做任何变换。
+        "seam_npy": seam_raw,
     }, allow_pickle=True)
 
 
@@ -462,7 +489,7 @@ def main():
     print(f"[main] joints    : {joint_names}")
     print(f"[main] retract   : {retract_config}")
 
-    poses = load_poses(args_cli.seam_npy)
+    poses, seam_raw = load_poses(args_cli.seam_npy)
     n_poses = len(poses)
     print(f"[main] poses     : {n_poses} 个")
 
@@ -474,6 +501,10 @@ def main():
 
     num_envs = min(n_poses, args_cli.max_envs)
     print(f"[main] num_envs  : {num_envs}")
+
+    # 扫描材质库（远程有、本地无→返回空，自动跳过加材质，保持灰色默认外观）
+    mat_list = materials.scan_materials()
+    mat_pick = materials.make_picker(mat_list, seed=0)
 
     # 仿真上下文
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
@@ -496,9 +527,9 @@ def main():
         chunk = list(range(start, min(start + num_envs, n_poses)))
         batch_poses = [(env_idx, poses[p]) for env_idx, p in enumerate(chunk)]
         print(f"[main] 批 {start}~{chunk[-1]}（{len(chunk)} 个 pose）")
-        rendered = render_batch(sim, scene, batch_poses, scene["offsets"],
-                                scene["robots"], joint_names, retract_config,
-                                args_cli.settle_steps)
+        rendered = render_batch(sim, scene, batch_poses, chunk, mat_pick,
+                                scene["offsets"], scene["robots"], joint_names,
+                                retract_config, args_cli.settle_steps)
         # # [debug] 保存整个场景 USD，便于离线检查相机/工件/机械臂相对位姿
         # dbg_usd = out_root / f"scene_batch_{start}.usd"
         # dbg_usd.parent.mkdir(parents=True, exist_ok=True)
@@ -507,7 +538,7 @@ def main():
         # print(f"  [debug] 场景 USD -> {dbg_usd}（回写 {n_baked} 个关节角）")
         for env_idx, p in enumerate(chunk):
             save_pose(out_root / f"pose_{p}", rendered[env_idx], poses[p],
-                      joint_names, retract_config)
+                      joint_names, retract_config, seam_raw)
             saved += 1
             print(f"  saved pose_{p} -> {out_root / f'pose_{p}'}")
 

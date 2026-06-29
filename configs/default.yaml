@@ -1,8 +1,8 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
 robot:                                  # 决策 B
-  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
-  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
+  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
+  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
   # 新版机械臂(2026-06-26)：base=a1_ground_rail_platform, accessory=No012_TRM651, cable=No001_12ebarket。
   # 由 scripts/build_robot_from_xacro_pkg.py 从 urdf_12e_260626/xiaoyu_description 离线生成(碰撞球 CPU 拟合)。
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复

@@ -11,10 +11,75 @@ _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_assets_c
 
 
 def _ascii_safe(name: str) -> str:
-    """把任意文件名压成 ASCII 安全名（规避中文如 '柱' 引发的 USD 路径问题）。"""
+    """把任意文件名压成 ASCII 安全名，用作缓存 USD 文件名（规避中文 '柱' 等）。
+
+    USD 标识符不能以数字开头，故只保留 [0-9A-Za-z_]，并在数字开头时加前缀。
+    """
     stem = os.path.splitext(os.path.basename(name))[0]
-    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", stem).strip("_")
-    return safe or "asset"
+    safe = re.sub(r"[^0-9A-Za-z_]+", "_", stem).strip("_")
+    if not safe:
+        safe = "asset"
+    if safe[0].isdigit():
+        safe = "m_" + safe
+    return safe
+
+
+def _parse_obj(obj_path: str):
+    """读 OBJ 的顶点与面，返回 (points, face_vertex_counts, face_vertex_indices)。
+
+    只取几何（v/f），忽略法线/UV/材质（工件无材质，渲染时另投影库材质）。支持多边形面、
+    ``v``、``v/vt``、``v//vn``、``v/vt/vn`` 格式与负索引（相对当前顶点数）。
+    """
+    points = []
+    face_counts = []
+    face_indices = []
+    with open(obj_path, "r", errors="ignore") as f:
+        for line in f:
+            if line.startswith("v "):
+                parts = line.split()
+                points.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif line.startswith("f "):
+                idxs = []
+                for tok in line.split()[1:]:
+                    vi = int(tok.split("/")[0])
+                    idxs.append(len(points) + vi if vi < 0 else vi - 1)  # → 0-based
+                if len(idxs) >= 3:
+                    face_counts.append(len(idxs))
+                    face_indices.extend(idxs)
+    return points, face_counts, face_indices
+
+
+def _write_obj_usd(obj_path: str, usd_path: str) -> None:
+    """直接用 pxr 把 OBJ 几何写成 USD（绕开 IsaacLab MeshConverter / omni 转换器）。
+
+    omni.kit.asset_converter 在本工件上会「返回成功但产出空几何」，导致 MeshConverter 在
+    ``geom_prim.GetChildren()`` 处崩（Accessed invalid null prim）。工件是纯视觉体、无 UV/
+    材质，这里自建 ``/workpiece``(Xform) + ``/workpiece/mesh``(Mesh)，结构、坐标系（Z-up，
+    米）、prim 路径全可控，且与 va_simulation 的 ``{prim}/mesh`` 约定一致。
+    """
+    from pxr import Usd, UsdGeom, Vt, Gf
+
+    points, face_counts, face_indices = _parse_obj(obj_path)
+    if not points or not face_counts:
+        raise RuntimeError(f"OBJ 解析为空（无顶点或无面）：{obj_path}")
+
+    stage = Usd.Stage.CreateNew(usd_path)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+    root = UsdGeom.Xform.Define(stage, "/workpiece")
+    stage.SetDefaultPrim(root.GetPrim())
+
+    mesh = UsdGeom.Mesh.Define(stage, "/workpiece/mesh")
+    mesh.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*p) for p in points]))
+    mesh.CreateFaceVertexCountsAttr(Vt.IntArray(face_counts))
+    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray(face_indices))
+    mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)  # 多边形网格，不做细分平滑
+    xs = [p[0] for p in points]; ys = [p[1] for p in points]; zs = [p[2] for p in points]
+    mesh.CreateExtentAttr(Vt.Vec3fArray([
+        Gf.Vec3f(min(xs), min(ys), min(zs)), Gf.Vec3f(max(xs), max(ys), max(zs)),
+    ]))
+    stage.GetRootLayer().Save()
 
 
 def convert_robot_urdf(urdf_path: str, usd_dir: str | None = None,
@@ -48,26 +113,22 @@ def convert_robot_urdf(urdf_path: str, usd_dir: str | None = None,
 
 def convert_workpiece_obj(obj_path: str, usd_dir: str | None = None,
                           force: bool = False) -> str:
-    """OBJ→USD（纯视觉，渲染用，不加物理/碰撞）。返回 USD 路径。"""
-    from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
+    """OBJ→USD（纯视觉，渲染用，不加物理/碰撞）。返回 USD 路径。
 
+    直接用 pxr 写几何（见 _write_obj_usd），不走 IsaacLab MeshConverter——后者底层的
+    omni 转换器在本工件上会产出空几何而崩溃。带缓存：USD 已存在且非 force 即跳过。
+    """
     if usd_dir is None:
         usd_dir = os.path.join(_CACHE_DIR, "workpiece")
     os.makedirs(usd_dir, exist_ok=True)
 
-    cfg = MeshConverterCfg(
-        asset_path=obj_path,
-        usd_dir=usd_dir,
-        usd_file_name=f"{_ascii_safe(obj_path)}.usd",
-        force_usd_conversion=force,
-        make_instanceable=False,
-        mass_props=None,          # 静态视觉体，无需质量/碰撞
-        rigid_props=None,
-        collision_props=None,
-    )
-    conv = MeshConverter(cfg)
-    print(f"[asset_convert] workpiece USD: {conv.usd_path}")
-    return conv.usd_path
+    usd_path = os.path.join(usd_dir, f"{_ascii_safe(obj_path)}.usd")
+    if force and os.path.exists(usd_path):
+        os.remove(usd_path)
+    if not os.path.exists(usd_path):
+        _write_obj_usd(obj_path, usd_path)
+    print(f"[asset_convert] workpiece USD: {usd_path}")
+    return usd_path
 
 
 def find_link_subpath(usd_path: str, link_name: str) -> str:
