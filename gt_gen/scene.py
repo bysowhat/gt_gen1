@@ -41,51 +41,50 @@ def _load_plan_init_pose():
 
 @dataclass
 class InitPoseCandidate:
-    """一个候选初始位姿 = 工件 mesh world ↔ 机械臂 base 的相对 pose (R, t)。
+    """一个候选初始位姿（kejian2 逻辑产出）= 工件 mesh world ↔ 机械臂 base 的相对 pose (R, t)
+    + 焊枪 goal 位姿 + 该焊缝可达参考关节角 + 正/反手分类。
 
     约定：p_base = R · p_world + t（R,t 即 T_workpiece_in_base 的旋转/平移）。
     它定义一整套自洽的世界布局（工件在 base 系的摆放），**不是机械臂的起步关节角**
     （起步仍恒为 retract）；q 仅是「焊枪头落在该焊缝 standoff 落点」的可达参考构型。
 
-    raw 保留 InitPoseLookupSolver 产出的原始解 dict，供可视化原样复用（见 SceneVisualizer）。
+    raw 保留 scripts/plan_init_pose.py:_kejian2_solve_weld 产出的原始结果 dict，
+    供可视化原样复用（见 SceneVisualizer）。
     """
-    R: np.ndarray                  # (3,3) 工件→base 旋转
+    R: np.ndarray                  # (3,3) 工件→base 旋转（已 snap 到某种允许朝向）
     t: np.ndarray                  # (3,)  工件→base 平移
     q: np.ndarray                  # (dof,) 可达该焊缝的关节角（参考/校验，非起步角）
-    ee_pos_in_base: np.ndarray     # 焊枪头落点（= standoff 落枪点）在 base
-    mid_in_base: np.ndarray        # 真实焊缝中点在 base（standoff>0 时 ≠ ee_pos_in_base）
-    ee_x_in_base: np.ndarray       # 末端局部 +x 在 base
+    goal_pose7: np.ndarray         # 焊枪 goal 位姿 [x,y,z,qw,qx,qy,qz]（base 系，落在 standoff 点）
+    bisector_base: np.ndarray      # 焊缝角平分线（背离工件=approach 方向）在 base
+    seam_center_base: np.ndarray   # 焊缝中心点在 base
     rot_x_deg: float               # 绕末端局部 x/y/z 轴的扰动角（度）
     rot_y_deg: float
     rot_z_deg: float
-    d_link: float                  # 整臂碰撞球对工件 ESDF 的最大穿透（<=tol 判 safe）
-    d_retract: float               # retract 碰撞球同上
-    align_score: float             # 三轴离 90° 整倍数偏差和（取负，越大越对齐）
-    combined_score: float
-    raw: dict = field(default=None, repr=False)   # 原始 solver 解（可视化复用）
+    orientation_id: int            # 命中的允许朝向编号（0..3）
+    hand: str                      # "forehand"(正手) / "backhand"(反手)
+    raw: dict = field(default=None, repr=False)   # 原始 kejian2 结果 dict（可视化复用）
 
     @classmethod
-    def from_solution(cls, sol: dict) -> "InitPoseCandidate":
-        """由 InitPoseLookupSolver.solve_one_weld_lookup 的单条解 dict 构造。"""
+    def from_kejian2(cls, d: dict) -> "InitPoseCandidate":
+        """由 _kejian2_solve_weld 结果（forehand/backhand 列表里的单条 dict）构造。"""
+        T = np.asarray(d["T_workpiece_in_base"], dtype=np.float64)
         return cls(
-            R=np.asarray(sol["R"], dtype=np.float64),
-            t=np.asarray(sol["t"], dtype=np.float64),
-            q=np.asarray(sol["q"], dtype=np.float64),
-            ee_pos_in_base=np.asarray(sol["ee_pos_in_base"], dtype=np.float64),
-            mid_in_base=np.asarray(sol["mid_in_base"], dtype=np.float64),
-            ee_x_in_base=np.asarray(sol["ee_x_in_base"], dtype=np.float64),
-            rot_x_deg=float(sol["rot_x_deg"]),
-            rot_y_deg=float(sol["rot_y_deg"]),
-            rot_z_deg=float(sol["rot_z_deg"]),
-            d_link=float(sol["d_link"]),
-            d_retract=float(sol["d_retract"]),
-            align_score=float(sol["align_score"]),
-            combined_score=float(sol["combined_score"]),
-            raw=sol,
+            R=T[:3, :3].copy(),
+            t=T[:3, 3].copy(),
+            q=np.asarray(d["joint_angles"], dtype=np.float64),
+            goal_pose7=np.asarray(d["goal_pose7"], dtype=np.float64),
+            bisector_base=np.asarray(d["bisector_base"], dtype=np.float64),
+            seam_center_base=np.asarray(d["seam_center_base"], dtype=np.float64),
+            rot_x_deg=float(d["rot_x_deg"]),
+            rot_y_deg=float(d["rot_y_deg"]),
+            rot_z_deg=float(d["rot_z_deg"]),
+            orientation_id=int(d["orientation_id"]),
+            hand=str(d["hand"]),
+            raw=d,
         )
 
-    def to_solution(self) -> dict:
-        """还原成 InitPoseLookupSolver 解 dict 的形态（供 plan_init_pose 的可视化函数原样吃）。"""
+    def to_kejian2(self) -> dict:
+        """还原成 _kejian2_solve_weld 结果 dict 的形态（供 kejian2 可视化函数原样吃）。"""
         return self.raw
 
     @property
@@ -112,8 +111,8 @@ class Scene:
             workpiece_obj="/.../BEAM_..._part_watertight.obj",
             weld_json="/.../BEAM_..._weld_angle3.json",
             seam_id=0)
-        cands = scene.plan_init_pose()      # 候选初始位姿（工件↔臂相对 pose）
-        scene.init_pose                     # = cands[0]（best）
+        cands = scene.plan_init_pose()      # 候选初始位姿（工件↔臂相对 pose，正反手全返回）
+        scene.init_pose_candidates          # = cands（全部候选，无数量上限）
 
     cfg 接受 Config 实例 / yaml 路径 / None（None→load_config() 取默认）。
     """
@@ -135,14 +134,14 @@ class Scene:
         # 焊缝信息：load_welds 解析的 weld dict（p0/p1/mid/bisector/boundary_dirs/raw…）
         self.seams: dict = self._load_seam()
         self._set_cur_seam()
-        # 工件在 base 系下的 pose（pose7）；plan_init_pose 选定候选后填入，构造期可由用户给定
+        # 工件在 base 系下的 pose（pose7）；构造期可由用户给定（plan_init_pose 不再自动选 best 回填，
+        # 候选全在 self.init_pose_candidates，由调用方挑选后自行 apply）
         self.workpiece_pose: Optional[np.ndarray] = workpiece_pose
         # 用户【直接输入】的 goal ((x,y,z),(qw,qx,qy,qz))，base 系；不由焊缝计算（后续 API 用）
         self.goal_user: Optional[tuple] = goal_user
 
         # ===== 世界状态（3D）—— 本期占位，后续 API 填实 =====
-        self.init_pose: Optional[InitPoseCandidate] = None   # 当前工件↔臂相对 pose；None=未求解/未应用
-        self.init_pose_candidates: List[InitPoseCandidate] = []   # plan_init_pose 产出的全部候选（已排序）
+        self.init_pose_candidates: List[InitPoseCandidate] = []   # plan_init_pose 产出的全部候选（正手在前、反手在后，无数量上限）
         self.obstacles: list = []            # 已放障碍（ObstacleSpec）——后续
         self.truth_scene = None              # 工件+障碍（base 系）trimesh，raycast 几何源——后续
         self.voxmap = None                   # 三态记忆 ThreeStateVoxelMap——后续
@@ -157,8 +156,8 @@ class Scene:
         self._world_plan = None     # 与 _h_plan 同源的裸 WorldConfig
         self._h_expl = None         # VOXEL 三态
         self._camera_model = None
-        self._solver = None         # InitPoseLookupSolver 句柄（按工件 key 复用查表）
-        self._solver_key = None     # (workpiece_obj, n_per_dof)：solver 复用标识
+        self._k2ctx = None          # kejian2 工件级求解上下文（solver/ESDF/joint表/允许朝向/底座圆/mesh）
+        self._k2ctx_key = None      # workpiece_obj：_k2ctx 复用标识
         self._dirty: set = set()    # {"worlds","truth_scene","goal"} 缓存失效标记
 
     # ------------------------------------------------------------------
@@ -179,59 +178,43 @@ class Scene:
         self.seam =  self.seams[self.seam_id]    
     
     # ------------------------------------------------------------------
-    # 初始位姿求解（包 scripts/plan_init_pose.py:InitPoseLookupSolver，算法/输入输出完全一致）
+    # 初始位姿求解（包 scripts/plan_init_pose.py 的 kejian2 逻辑，算法/输入输出完全一致）
     # ------------------------------------------------------------------
     def plan_init_pose(self,
-                       n_per_dof: Optional[int] = None,
                        diagnostic: bool = False,
                        rebuild: bool = False) -> List[InitPoseCandidate]:
-        """计算「工件 ↔ 机械臂」的候选初始位姿（lookup 式求解，本焊缝 self.seam）。
+        """计算「工件 ↔ 机械臂」的候选初始位姿（kejian2 逻辑，本焊缝 self.seam）。
 
-        等价于 scripts/plan_init_pose.py --solve 对单条焊缝跑一遍：
-          ① InitPoseLookupSolver(cfg, obj, tol, voxel, n_per_dof) → precompute_joint_table（与工件无关，
-             仅一次；按 (obj, n_per_dof) 缓存复用，rebuild=True 强制重建）；
-          ② solve_one_weld_lookup(self.seam, rot_x/y/z)（角度采样、standoff 等全部读 cfg / default.yaml
-             plan_init_pose 段，口径与脚本一致）。
-        产出全部候选（已按 combined_score 降序 + 真实焊缝中点 x>0 优先）；最优解写入 self.init_pose、
-        全部候选写入 self.init_pose_candidates，并据 best 填 self.workpiece_pose。
+        与 scripts/plan_init_pose.py 走【完全同一套过滤逻辑】（直接复用其 _kejian2_build_ctx /
+        _kejian2_solve_weld，不复制几何）：
+          ① 工件级 _kejian2_build_ctx：InitPoseLookupSolver（n^6 关节角采样 + 工件 ESDF 体素化 ②）、
+             joint 表（③，已存盘则复用）、4 种允许朝向、固定底座圆 + 工件顶点/三角形——按工件复用、只建一次；
+          ② 逐焊缝 _kejian2_solve_weld：lookup 碰撞过滤 → 朝向 snap → 正面过滤 / 焊缝中心 base-x>0 /
+             固定底座-工件 base-xy 相交过滤（由 plan_init_pose.base_overlap_filter 开关控制）→ 正反手分类。
+        配置全部读 default.yaml 的 plan_init_pose 段（口径与脚本 --solve-kejian2 一致）。
+
+        与脚本【落盘时「每只手最多 15 个」】不同：这里【有多少正反手就返回多少】，不做数量上限挑选。
+        全部候选（正手在前、反手在后）写入 self.init_pose_candidates 并返回。
 
         参数：
-          n_per_dof : 每关节采样档数；None→cfg.plan_init_n_per_dof。
-          diagnostic: 透传到 solver，逐 (αx,βy,γz) 打印诊断。
-          rebuild   : True 强制重建查表（换工件/换 n_per_dof 时）。
+          diagnostic: 预留（kejian2 逐焊缝求解暂不细分诊断，当前未使用）。
+          rebuild   : True 强制重建工件级 ctx（换工件 / 改 n_per_dof 等缓存失效时）。
 
-        返回：候选列表（list[InitPoseCandidate]，可能为空=求解失败）。
+        返回：候选列表（list[InitPoseCandidate]，可能为空=求解失败/无合格解）。
         """
         if not self.workpiece_obj:
             raise ValueError("plan_init_pose 需要 workpiece_obj（工件 mesh）")
         pim = _load_plan_init_pose()
-        cfg = self.cfg
-        n_per_dof = int(cfg.plan_init_n_per_dof if n_per_dof is None else n_per_dof)
-        rot_x = pim._deg_range(cfg.plan_init_rot_x_deg)
-        rot_y = pim._deg_range(cfg.plan_init_rot_y_deg)
-        rot_z = pim._deg_range(cfg.plan_init_rot_z_deg)
 
-        # —— 求解器：按 (工件, n_per_dof) 复用查表（同工件多焊缝只建一次） ——
-        key = (self.workpiece_obj, n_per_dof)
-        if rebuild or self._solver is None or self._solver_key != key:
-            self._solver = pim.InitPoseLookupSolver(
-                cfg, self.workpiece_obj,
-                collision_tolerance=cfg.plan_init_collision_tolerance,
-                voxel_size=cfg.plan_init_voxel_size,
-                n_per_dof=n_per_dof)
-            # 优先读 cfg.plan_init_joint_table_path 的缓存（与工件无关）；rebuild 或无缓存则现算并落盘。
-            if rebuild or not self._solver.load_joint_table():
-                self._solver.precompute_joint_table()
-                self._solver.save_joint_table()
-            self._solver_key = key
+        # —— 工件级 ctx：按工件复用（同工件多焊缝只建一次 ②③）。注意 _kejian2_build_ctx 内部用
+        #    load_config() 读默认 default.yaml；与 Scene 默认 cfg 同源，口径一致。 ——
+        if rebuild or self._k2ctx is None or self._k2ctx_key != self.workpiece_obj:
+            self._k2ctx = pim._kejian2_build_ctx(self.workpiece_obj)
+            self._k2ctx_key = self.workpiece_obj
 
-        sol = self._solver.solve_one_weld_lookup(
-            self.seam, rot_x, rot_y, rot_z, diagnostic=diagnostic)
+        res, _prof = pim._kejian2_solve_weld(self._k2ctx, self.seam)
 
-        all_sols = getattr(self._solver, "last_all_solutions", []) or []
-        self.init_pose_candidates = [InitPoseCandidate.from_solution(s) for s in all_sols]
-        self.init_pose = self.init_pose_candidates[0] if (sol is not None and
-                                                          self.init_pose_candidates) else None
-        if self.init_pose is not None:
-            self.workpiece_pose = self.init_pose.workpiece_pose7
+        # 有多少正反手都返回（不做 15 个上限挑选）：正手在前、反手在后
+        cands = list(res.get("forehand", [])) + list(res.get("backhand", []))
+        self.init_pose_candidates = [InitPoseCandidate.from_kejian2(d) for d in cands]
         return self.init_pose_candidates

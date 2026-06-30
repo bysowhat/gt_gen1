@@ -38,12 +38,14 @@ def main():
                   weld_json=args.weld_json,
                   seam_id=args.seam_id)
 
-    cands = scene.plan_init_pose()
+    scene.plan_init_pose()
 
-    if scene.init_pose is None:
+    if not scene.init_pose_candidates:
         print("[demo] 求解失败：无候选初始位姿")
         return
-    best = scene.init_pose
+    n_fore = sum(1 for c in scene.init_pose_candidates if c.hand == "forehand")
+    n_back = sum(1 for c in scene.init_pose_candidates if c.hand == "backhand")
+    print(f"[demo] 候选初始位姿 {len(scene.init_pose_candidates)} 个（正手 {n_fore} / 反手 {n_back}）")
 
     Open3DSceneVisualizer(scene).show_init_poses()
 

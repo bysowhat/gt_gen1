@@ -30,20 +30,23 @@ class SceneVisualizer:
 class Open3DSceneVisualizer(SceneVisualizer):
     """open3d 后端可视化（本机开窗）。"""
 
-    def show_init_poses(self):
+    def show_init_poses(self, stride: int = 1):
         """逐个可视化该 Scene 焊缝的【候选初始位姿】（工件相对机械臂的摆放）。
 
-        前提：先调用 Scene.plan_init_pose() 求出候选。可视化内容与
-        scripts/plan_init_pose.py 一致：整臂碰撞球 + init_free 盒 + base 架 + 按 (R,t) 摆放的
-        工件网格 + 绿色焊缝线/中点 + 红色 standoff 落点；同一窗口按 **C 键**切到下一个候选。
+        前提：先调用 Scene.plan_init_pose() 求出候选。可视化复用 scripts/plan_init_pose.py 的
+        _show_kejian2_results（正手→反手依次开窗：按 (R,t) 摆放的工件网格 + 焊缝/中点 + standoff 落点
+        + 蓝色 bisector 正反手判据轴）；同一窗口按 **C 键**切到下一个候选。
+
+        stride：每隔几个候选抽 1 个看（默认 1=逐个看全部）。
         """
         scene = self.scene
         if not scene.init_pose_candidates:
             raise RuntimeError(
                 "无候选初始位姿可视化：请先调用 Scene.plan_init_pose()（且求解成功）")
         pim = _load_plan_init_pose()
-        sols = [c.to_solution() for c in scene.init_pose_candidates]
-        pim.show_lookup_solutions(scene.cfg, scene.workpiece_obj, scene.seam, sols)
+        res = {"forehand": [c.raw for c in scene.init_pose_candidates if c.hand == "forehand"],
+               "backhand": [c.raw for c in scene.init_pose_candidates if c.hand == "backhand"]}
+        pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res, stride=stride)
 
 
 class IsaacSimSceneVisualizer(SceneVisualizer):

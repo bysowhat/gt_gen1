@@ -1850,7 +1850,7 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
         cyl_h = length - cone_h
         arrow = o3d.geometry.TriangleMesh.create_arrow(
             cylinder_radius=0.010, cone_radius=0.022,
-            cylinder_hceight=cyl_h, cone_height=cone_h)
+            cylinder_height=cyl_h, cone_height=cone_h)
         arrow.rotate(_align_rotmat([0.0, 0.0, 1.0], d), center=(0.0, 0.0, 0.0))  # 默认 +Z → bisector
         arrow.translate(p0.tolist())                                            # 箭尾在焊缝中心点
         arrow.compute_vertex_normals()
