@@ -16,8 +16,9 @@
 #   · 焊缝初始位姿: $INITPOSE_DIR/data/<stem>/seam_<idx>.npy   （含 workpiece_pose7）
 #   · 材质库      : /kpfs_dataset/dataset/baiyu/haoyue/Materials/{Base,vMaterials_2}（已写死在 materials.py）
 #
-# 输出：
-#   $OUT/<obj_stem>/<seam_stem>/pose_{p}/{left,right}_{rgb.png,depth.exr} + meta.npy
+# 输出（对齐示例 render_final2a/<part>/<part>_seam_<idx>_.../{left,right}）：
+#   $OUT/<part>/<part>_<seam>_pose{p}/{left,right}/{0_rgb.jpg,0_depth.exr,render_info.npy}
+#   （part = obj 名去 _watertight；每个候选位姿一个 unit，左右目各一份 render_info.npy）
 
 set -uo pipefail
 

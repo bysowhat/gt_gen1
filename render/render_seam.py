@@ -7,9 +7,15 @@
         --seam-npy '/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On/seam_40.npy' \
         --out /tmp/render_out --headless
 
-输出：
-    <out>/<obj_stem>/<seam_stem>/pose_{p}/
-        left_rgb.png  left_depth.exr  right_rgb.png  right_depth.exr  meta.npy
+输出（与 va_simulation/va_sim23_multi.py 的渲染目录一致；每个候选位姿=一个独立输出单元）：
+    <out>/<part_stem>/<part_stem>_<seam_stem>_pose{p}/    # 如 BEAM_..._part/BEAM_..._part_seam_31_pose0
+        left/   0_rgb.jpg  0_depth.exr  render_info.npy
+        right/  0_rgb.jpg  0_depth.exr  render_info.npy
+    （part_stem = 工件 obj 名去掉 _watertight 后缀；seam_stem = seam_npy 文件名，如 seam_31）
+    render_info.npy（每侧各一份）含 8 个对齐参考格式的键：
+        cam_pos_list(1,3) cam_quat_list(1,4) cam_intrinsic(3,3) jointstates(1,ndof)
+        seam_pose(20,7) all_seam_pose(list) idx_3d(1,) seam_line_index(int)
+    并额外保留本管线已有信息（z_lift / base 世界位姿 / 材质名 / 左右目内外参 / 完整 seam_raw 等）。
 """
 import argparse
 import os
@@ -442,14 +448,147 @@ def render_batch(sim, scene, batch_poses, chunk, mat_pick, offsets, robots,
     return out
 
 
-def save_pose(out_dir, rendered, pose7, joint_names, retract_config, seam_raw):
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    depth_io.store_rgb(out_dir / "left_rgb.png", rendered["left_rgb"])
-    depth_io.store_rgb(out_dir / "right_rgb.png", rendered["right_rgb"])
-    depth_io.store_depth(out_dir / "left_depth.exr", rendered["left_depth"])
-    depth_io.store_depth(out_dir / "right_depth.exr", rendered["right_depth"])
-    np.save(out_dir / "meta.npy", {
+# ======================= render_info.npy 辅助（对齐 va_sim23_multi 参考格式）=======================
+# 参考管线相机位姿在 arm(base) 系、并把 ROS 光学约定翻转到 USD（+Y/+Z 取反）。这里同样
+# 把本管线的 ROS 约定相机位姿翻到 USD，使 cam_pos_list/cam_quat_list 与参考口径一致。
+_POSE_CAM_ROS_TO_USD = np.diag([1.0, -1.0, -1.0, 1.0])
+SEAM_N_SEG = 20   # seam_pose 沿焊缝插值点数（与 plan_init_pose.n_seg / 参考 seam_pose (20,7) 一致）
+
+
+def _quat_wxyz_to_R(q):
+    """四元数 (w,x,y,z) → 3×3 旋转矩阵。"""
+    w, x, y, z = [float(v) for v in q]
+    n = math.sqrt(w * w + x * x + y * y + z * z) + 1e-12
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def _R_to_quat_wxyz(R):
+    """3×3 旋转矩阵 → 四元数 (w,x,y,z)。"""
+    R = np.asarray(R, dtype=np.float64)
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return np.array([w, x, y, z], dtype=np.float64)
+
+
+def _pose7_to_T(p7):
+    """pose7 (x,y,z, w,qx,qy,qz) → 4×4 齐次变换。"""
+    p7 = np.asarray(p7, dtype=np.float64)
+    T = np.eye(4)
+    T[:3, :3] = _quat_wxyz_to_R(p7[3:])
+    T[:3, 3] = p7[:3]
+    return T
+
+
+def _T_to_pose7(T):
+    """4×4 齐次变换 → pose7 (x,y,z, w,qx,qy,qz)。"""
+    return np.concatenate([np.asarray(T)[:3, 3], _R_to_quat_wxyz(np.asarray(T)[:3, :3])])
+
+
+def _cam_pose_arm(cam_pos_w, cam_quat_w_wxyz, base_pos_w, base_quat_w_wxyz):
+    """相机世界位姿(ROS) → arm(base) 系并翻到 USD 光学约定，返回 pose7 (1,7)。
+
+    与参考 get_camera_pose_arm 同口径：T_arm = inv(T_base_world) @ T_cam_world @ diag(1,-1,-1,1)。
+    """
+    T_cam_w = _pose7_to_T(np.concatenate([np.asarray(cam_pos_w, dtype=np.float64),
+                                          np.asarray(cam_quat_w_wxyz, dtype=np.float64)]))
+    T_base_w = _pose7_to_T(np.concatenate([np.asarray(base_pos_w, dtype=np.float64),
+                                           np.asarray(base_quat_w_wxyz, dtype=np.float64)]))
+    T_arm = np.linalg.inv(T_base_w) @ T_cam_w @ _POSE_CAM_ROS_TO_USD
+    return _T_to_pose7(T_arm)[None, :]
+
+
+def _seam_pose_arm(seam_raw, pose7, n_seg=SEAM_N_SEG):
+    """由 seam_raw(weld json 原始字段) + workpiece_pose7 算焊缝在 arm(base) 系的 (n_seg,7) 位姿。
+
+    位置：corrected_p0→corrected_p1 线性插值(mesh 系)后用 workpiece_pose7(T_base←workpiece) 变换到 base 系。
+    朝向：用焊缝局部帧 [x=切向, z=-bisector(指向工件), y=z×x] 经 workpiece 旋转到 base 系（直焊缝沿线恒定）。
+    缺字段则返回 (0,7) 空数组。
+    """
+    weld = seam_raw.get("weld", {}) if isinstance(seam_raw, dict) else {}
+    p0 = weld.get("corrected_p0")
+    p1 = weld.get("corrected_p1")
+    if p0 is None or p1 is None:
+        return np.zeros((0, 7), dtype=np.float64)
+    p0 = np.asarray(p0, dtype=np.float64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    T_wp = _pose7_to_T(pose7)
+    R_wp, t_wp = T_wp[:3, :3], T_wp[:3, 3]
+
+    ts = np.linspace(0.0, 1.0, n_seg)[:, None]
+    line_mesh = p0[None, :] * (1.0 - ts) + p1[None, :] * ts          # (n,3) mesh 系
+    line_base = (R_wp @ line_mesh.T).T + t_wp                        # (n,3) base 系
+
+    # 焊缝局部帧（mesh 系）→ base 系朝向
+    t_hat = (p1 - p0) / (np.linalg.norm(p1 - p0) + 1e-12)
+    bis = weld.get("bisector")
+    if bis is not None:
+        b_hat = np.asarray(bis, dtype=np.float64)
+        b_hat = b_hat / (np.linalg.norm(b_hat) + 1e-12)
+        z_axis = -b_hat                                             # 指向工件
+        z_axis = z_axis - np.dot(z_axis, t_hat) * t_hat
+        nz = np.linalg.norm(z_axis)
+        if nz < 1e-9:
+            quat = _R_to_quat_wxyz(R_wp)                            # bisector 与切向退化：回退工件朝向
+            return np.concatenate([line_base, np.tile(quat, (n_seg, 1))], axis=1)
+        z_axis /= nz
+        y_axis = np.cross(z_axis, t_hat)
+        R_seam_mesh = np.stack([t_hat, y_axis, z_axis], axis=1)     # 列向量为局部轴
+        quat = _R_to_quat_wxyz(R_wp @ R_seam_mesh)
+    else:
+        quat = _R_to_quat_wxyz(R_wp)
+    return np.concatenate([line_base, np.tile(quat, (n_seg, 1))], axis=1)
+
+
+def _render_info_for_side(side, rendered, pose7, joint_names, retract_config, seam_raw, pose_idx):
+    """构造某一侧(left/right)的 render_info.npy 内容：8 个参考键 + 本管线额外字段。"""
+    K = rendered[f"{side}_K"]
+    cam_pose7 = _cam_pose_arm(rendered[f"{side}_pos_w"], rendered[f"{side}_quat_w"],
+                              rendered["base_pos_w"], rendered["base_quat_w"])
+    seam_pose = _seam_pose_arm(seam_raw, pose7)
+    seam_idx = int(seam_raw.get("seam_idx", -1)) if isinstance(seam_raw, dict) else -1
+    jointstates = np.asarray(retract_config, dtype=np.float32)[None, :]   # 恒为 retract（机械臂不动）
+
+    info = {
+        # —— 对齐参考的 8 个键（本管线每个候选=1 帧，故数组长度 N=1）——
+        "cam_pos_list": cam_pose7[:, :3].astype(np.float64),         # (1,3) arm 系、USD 光学约定
+        "cam_quat_list": cam_pose7[:, 3:].astype(np.float64),        # (1,4) wxyz
+        "cam_intrinsic": np.asarray(K, dtype=np.float32),            # (3,3)
+        "jointstates": jointstates,                                  # (1,ndof) retract
+        "seam_pose": seam_pose,                                      # (20,7) arm 系焊缝线位姿
+        "all_seam_pose": [seam_pose],                                # 本管线仅当前焊缝→列表只含其一
+        "idx_3d": np.asarray([pose_idx], dtype=np.float32),          # (1,) 候选序号（无 3D 帧索引概念）
+        "seam_line_index": seam_idx,                                 # 该焊缝在 weld_json 的下标
+        # —— 保留本管线已有信息（不丢）——
+        "side": side,
+        "cam_pose_arm_convention": "usd",   # cam_pos_list/cam_quat_list 约定：arm 系 + USD 光学翻转
         "joint_names": joint_names,
         "retract_config": np.asarray(retract_config, dtype=np.float64),
         "workpiece_pose7": np.asarray(pose7, dtype=np.float64),
@@ -475,7 +614,21 @@ def save_pose(out_dir, rendered, pose7, joint_names, retract_config, seam_raw):
         # seam_*.npy 的全部原始内容，原样存入（weld 焊缝几何/seam_idx/hand/joint_angles/
         # workpiece_pose7 等）。坐标系按原文件，未做任何变换。
         "seam_npy": seam_raw,
-    }, allow_pickle=True)
+    }
+    return info
+
+
+def save_pose(out_dir, rendered, pose7, joint_names, retract_config, seam_raw, pose_idx):
+    """把单个候选位姿存成 left/right 两侧（各 0_rgb.jpg + 0_depth.exr + render_info.npy）。"""
+    out_dir = Path(out_dir)
+    for side in ("left", "right"):
+        side_dir = out_dir / side
+        side_dir.mkdir(parents=True, exist_ok=True)
+        depth_io.store_rgb(side_dir / "0_rgb.jpg", rendered[f"{side}_rgb"])
+        depth_io.store_depth(side_dir / "0_depth.exr", rendered[f"{side}_depth"])
+        info = _render_info_for_side(side, rendered, pose7, joint_names,
+                                     retract_config, seam_raw, pose_idx)
+        np.save(side_dir / "render_info.npy", info, allow_pickle=True)
 
 
 @timer("完整渲染")
@@ -518,8 +671,12 @@ def main():
     sim.play()
 
     obj_stem = asset_convert._ascii_safe(args_cli.obj)
-    seam_stem = Path(args_cli.seam_npy).stem
-    out_root = Path(args_cli.out) / obj_stem / seam_stem
+    # 对齐示例目录（render_final2a/<part>/<part>_seam_<idx>_.../{left,right}）：
+    #   · part 目录名去掉 _watertight 后缀（示例 part 目录为 *_part）；
+    #   · 每个候选位姿 = part 目录下一个独立 unit，unit 名编码 seam + 候选序号。
+    part_stem = obj_stem[:-len("_watertight")] if obj_stem.endswith("_watertight") else obj_stem
+    seam_stem = Path(args_cli.seam_npy).stem          # 如 "seam_31"
+    out_root = Path(args_cli.out) / part_stem         # <out>/<part>/
 
     # 按 num_envs 分批
     saved = 0
@@ -531,27 +688,30 @@ def main():
                                 scene["offsets"], scene["robots"], joint_names,
                                 retract_config, args_cli.settle_steps)
         # # [debug] 保存整个场景 USD，便于离线检查相机/工件/机械臂相对位姿
-        # dbg_usd = out_root / f"scene_batch_{start}.usd"
+        # # （out_root 现为 part 级、同 part 多 seam 共用，故加 seam 前缀防跨 seam 覆盖）
+        # dbg_usd = out_root / f"{seam_stem}_scene_batch_{start}.usd"
         # dbg_usd.parent.mkdir(parents=True, exist_ok=True)
         # n_baked = bake_joint_state_to_usd(num_envs, joint_names, retract_config)
         # omni.usd.get_context().get_stage().Export(str(dbg_usd))
         # print(f"  [debug] 场景 USD -> {dbg_usd}（回写 {n_baked} 个关节角）")
         for env_idx, p in enumerate(chunk):
-            save_pose(out_root / f"pose_{p}", rendered[env_idx], poses[p],
-                      joint_names, retract_config, seam_raw)
+            unit_dir = out_root / f"{part_stem}_{seam_stem}_pose{p}"   # 如 BEAM_..._part_seam_31_pose0
+            save_pose(unit_dir, rendered[env_idx], poses[p],
+                      joint_names, retract_config, seam_raw, p)
             saved += 1
-            print(f"  saved pose_{p} -> {out_root / f'pose_{p}'}")
+            print(f"  saved {unit_dir.name} -> {unit_dir}")
 
     print(f"[main] 完成，共保存 {saved} 个 pose 到 {out_root}")
 
     # 完成哨兵（鲁棒信号，不依赖 stdout/print）：渲染全部 pose 后写标记文件。
     # 渲染进程随后会卡在 isaac 的 simulation_app.close()（不自退），多 GPU 调度器据此哨兵
     # 判定本作业完成 → 强杀挂起进程 → 让该卡去跑下一个作业。
-    #   · 始终在输出目录写 out_root/_DONE（人可见、与作业一一对应）；
+    #   · 始终在输出目录写 out_root/_DONE_<seam_stem>（人可见、与作业一一对应；out_root 现为 part
+    #     级、同 part 多 seam 共用，故按 seam 命名防互相覆盖）；
     #   · 若设了环境变量 RENDER_DONE_FILE，再额外写该路径——调度器用它做唯一、易轮询的
     #     哨兵，免去在 shell 里重算 ascii obj_stem。两者都只在“全部 pose 落盘后”才写。
     try:
-        (out_root / "_DONE").write_text(f"saved={saved}\nout={out_root}\n")
+        (out_root / f"_DONE_{seam_stem}").write_text(f"saved={saved}\nout={out_root}\n")
         ext = os.environ.get("RENDER_DONE_FILE")
         if ext:
             ext_p = Path(ext)
