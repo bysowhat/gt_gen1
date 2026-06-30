@@ -129,11 +129,12 @@ class Scene:
 
         # ===== 静态输入 =====
         self.cfg: Config = cfg
-        self.workpiece_obj: str = workpiece_obj      # 工件 mesh（_part.obj / _watertight.obj）
+        self.workpiece_obj: str = workpiece_obj      # 工件 mesh（_watertight.obj）
         self.weld_json: str = weld_json              # 焊缝信息文件（_weld_angle3.json）
         self.seam_id: int = int(seam_id)             # 用 weld_json 中的第几条焊缝
         # 焊缝信息：load_welds 解析的 weld dict（p0/p1/mid/bisector/boundary_dirs/raw…）
-        self.seam: dict = self._load_seam()
+        self.seams: dict = self._load_seam()
+        self._set_cur_seam()
         # 工件在 base 系下的 pose（pose7）；plan_init_pose 选定候选后填入，构造期可由用户给定
         self.workpiece_pose: Optional[np.ndarray] = workpiece_pose
         # 用户【直接输入】的 goal ((x,y,z),(qw,qx,qy,qz))，base 系；不由焊缝计算（后续 API 用）
@@ -171,13 +172,12 @@ class Scene:
         welds = pim.load_welds(self.weld_json)
         if not welds:
             raise RuntimeError(f"weld_json 无焊缝：{self.weld_json}")
-        for w in welds:
-            if int(w["idx"]) == self.seam_id:
-                return w
-        raise IndexError(
-            f"seam_id={self.seam_id} 不在 weld_json（共 {len(welds)} 条，idx "
-            f"{welds[0]['idx']}..{welds[-1]['idx']}）：{self.weld_json}")
+        else:
+            return welds
 
+    def _set_cur_seam(self):
+        self.seam =  self.seams[self.seam_id]    
+    
     # ------------------------------------------------------------------
     # 初始位姿求解（包 scripts/plan_init_pose.py:InitPoseLookupSolver，算法/输入输出完全一致）
     # ------------------------------------------------------------------
