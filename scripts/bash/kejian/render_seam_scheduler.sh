@@ -21,7 +21,8 @@ OUT_DIR="/kpfs_dataset_ssd/dataset/render_kejian/render_outs"
 DONE_TMPDIR="/tmp/render_seam_done"
 NUM_GPUS=8
 POLL_INTERVAL=5          # 轮询间隔（秒）
-MAX_ENVS=3               # --max-envs 默认值
+TASK_TIMEOUT=800        # 单个任务超时（秒），30分钟
+MAX_ENVS=2               # --max-envs 默认值
 PYTHON_BIN="/workspace/isaaclab/_isaac_sim/python.sh"
 RENDER_SCRIPT="render/render_seam.py"
 DRY_RUN=false
@@ -44,7 +45,7 @@ tasks=()          # 每个元素: "stem|npy_path|obj_path|seam_idx"
 task_count=0
 
 for stem_dir in "$NPY_DIR"/*/; do
-    stem=$(basename "$stem_dir")
+    stem="${stem_dir%/}"; stem="${stem##*/}"   # 取目录名，代替 basename
     obj_path="$OBJ_DIR/${stem}_part/${stem}_part_watertight.obj"
 
     if [[ ! -f "$obj_path" ]]; then
@@ -52,9 +53,9 @@ for stem_dir in "$NPY_DIR"/*/; do
         continue
     fi
 
-    for npy in "$stem_dir"/seam_*.npy; do
+    for npy in "$stem_dir"seam_*.npy; do
         [[ -f "$npy" ]] || continue
-        npy_name=$(basename "$npy" .npy)   # 如 seam_47
+        npy_name="${npy##*/}"; npy_name="${npy_name%.npy}"   # 如 seam_47，代替 basename
         tasks+=("${stem}|${npy}|${obj_path}|${npy_name}")
         task_count=$((task_count + 1))
     done
@@ -93,8 +94,10 @@ fi
 declare -A gpu_pid       # gpu_id -> 子进程 PID
 declare -A gpu_done_file # gpu_id -> 对应哨兵文件路径
 declare -A gpu_task_idx  # gpu_id -> 任务在 tasks 数组中的索引
+declare -A gpu_start_time # gpu_id -> 任务启动时间戳 (epoch seconds)
 next_task=0               # 下一个待分配任务的索引
 finished=0                # 已完成任务数
+failed=0                  # 失败/超时任务数
 
 # ===== 清理函数 =====
 cleanup() {
@@ -152,6 +155,7 @@ launch_task() {
     gpu_pid[$gpu_id]=$pid
     gpu_done_file[$gpu_id]="$done_file"
     gpu_task_idx[$gpu_id]="$task_idx"
+    gpu_start_time[$gpu_id]=$(date +%s)
 
     echo "    PID=$pid  (GPU $gpu_id)"
 }
@@ -168,7 +172,7 @@ finish_gpu_task() {
     # 检查哨兵文件内容
     if [[ -f "$done_file" ]]; then
         echo "  [GPU $gpu_id] 哨兵文件已写入，任务完成: $stem / $seam_idx"
-        cat "$done_file" | while read line; do echo "    $line"; done
+        cat "$done_file" | while read -r line || [[ -n "$line" ]]; do echo "    $line"; done
     fi
 
     # 强杀进程（simulation_app.close() 会卡住）
@@ -185,9 +189,41 @@ finish_gpu_task() {
     unset gpu_pid[$gpu_id]
     unset gpu_done_file[$gpu_id]
     unset gpu_task_idx[$gpu_id]
+    unset gpu_start_time[$gpu_id]
 
     finished=$((finished + 1))
     echo "  [GPU $gpu_id] 已释放（进度: $finished / $task_count）"
+}
+
+# ===== 强行终止某个卡上的任务（超时或进程已死）=====
+kill_gpu_task() {
+    local gpu_id="$1"
+    local reason="$2"
+    local pid="${gpu_pid[$gpu_id]}"
+    local done_file="${gpu_done_file[$gpu_id]}"
+    local task_str="${tasks[${gpu_task_idx[$gpu_id]}]}"
+
+    IFS='|' read -r stem npy_path obj_path seam_idx <<< "$task_str"
+    local elapsed=$(( $(date +%s) - ${gpu_start_time[$gpu_id]} ))
+
+    echo "  [GPU $gpu_id] ${reason}: $stem / $seam_idx (已运行 ${elapsed}s)"
+
+    # 强杀进程
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "  [GPU $gpu_id] 强杀进程 PID=$pid"
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+
+    # 清理
+    rm -f "$done_file"
+    unset gpu_pid[$gpu_id]
+    unset gpu_done_file[$gpu_id]
+    unset gpu_task_idx[$gpu_id]
+    unset gpu_start_time[$gpu_id]
+
+    failed=$((failed + 1))
+    echo "  [GPU $gpu_id] 已释放（成功: $finished, 失败/超时: $failed）"
 }
 
 # ===== 主循环 =====
@@ -199,11 +235,12 @@ echo "哨兵目录: $DONE_TMPDIR"
 echo "轮询间隔: ${POLL_INTERVAL}s"
 echo ""
 
-while [[ $finished -lt $task_count ]]; do
+while [[ $((finished + failed)) -lt $task_count ]]; do
+    now_ts=$(date +%s)
+
     # 1. 检查哪些 GPU 空闲，分配新任务
     for ((gpu_id=0; gpu_id<NUM_GPUS; gpu_id++)); do
         if [[ -z "${gpu_pid[$gpu_id]+x}" ]] && [[ $next_task -lt $task_count ]]; then
-            # 该卡空闲且有剩余任务
             launch_task "$gpu_id" "${tasks[$next_task]}" "$next_task"
             next_task=$((next_task + 1))
         fi
@@ -217,14 +254,33 @@ while [[ $finished -lt $task_count ]]; do
         fi
     done
 
-    # 3. 如果全部完成了，退出循环
-    if [[ $finished -ge $task_count ]]; then
+    # 3. 检测超时任务（超过 TASK_TIMEOUT 还没有哨兵）
+    for gpu_id in "${!gpu_pid[@]}"; do
+        elapsed=$(( now_ts - ${gpu_start_time[$gpu_id]} ))
+        if [[ $elapsed -ge $TASK_TIMEOUT ]]; then
+            kill_gpu_task "$gpu_id" "任务超时 ($TASK_TIMEOUT s)"
+        fi
+    done
+
+    # 4. 检测进程是否已死（崩溃退出但没写哨兵）
+    for gpu_id in "${!gpu_pid[@]}"; do
+        pid="${gpu_pid[$gpu_id]}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            kill_gpu_task "$gpu_id" "进程已意外退出"
+        fi
+    done
+
+    # 5. 如果全部完成了，退出循环
+    if [[ $((finished + failed)) -ge $task_count ]]; then
         break
     fi
 
-    # 4. 如果所有卡都忙，等待后重试
+    # 6. 如果所有卡都忙或已无待分配任务，等待后重试
     if [[ ${#gpu_pid[@]} -ge $NUM_GPUS ]] || [[ $next_task -ge $task_count ]]; then
         sleep "$POLL_INTERVAL"
+    else
+        # 有空闲卡且有任务但分配不上？可能是刚释放的，短暂 sleep 防抖
+        sleep 1
     fi
 done
 
@@ -234,5 +290,10 @@ rm -f "$DONE_TMPDIR"/*.done
 
 echo ""
 echo "===== 全部完成！($(date)) ====="
-echo "总任务数: $task_count，全部完成"
+echo "总任务数: $task_count"
+echo "成功: $finished"
+echo "失败/超时: $failed"
 echo "输出目录: $OUT_DIR"
+if [[ $failed -gt 0 ]]; then
+    echo "⚠️  有 $failed 个任务未完成，请检查对应日志。"
+fi
