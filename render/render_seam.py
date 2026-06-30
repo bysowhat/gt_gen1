@@ -1,6 +1,9 @@
 """并行环境快速渲染：对工件相对机械臂的每个位姿，在固定初始关节角(retract_config)下
 渲染左右目 RGB + 深度。参考 va_simulation/va_sim23_multi.py 的并行环境做法。
 
+机械臂 USD：直接用人工制作好的 USD（default.yaml 的 robot.usd_path），不再自己 URDF→USD。
+（joint_names / retract_config 仍从 robot.cfg_path 的 cuRobo yml 读；工件仍按需 OBJ→USD。）
+
 用法（无显示器自检）：
     conda run -n env_isaaclab python render/render_seam.py \
         --obj '/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On_part_watertight.obj' \
@@ -633,12 +636,20 @@ def save_pose(out_dir, rendered, pose7, joint_names, retract_config, seam_raw, p
 
 @timer("完整渲染")
 def main():
-    # 解析机器人 cfg
+    # 解析机器人 cfg：joint_names / retract_config 仍从 cuRobo yml 读；
+    # 机械臂 USD 用人工制作好的（default.yaml 的 robot.usd_path），不再自己 URDF→USD。
     with open(args_cli.config, "r") as f:
-        robot_cfg_path = yaml.safe_load(f)["robot"]["cfg_path"]
+        robot_yaml = yaml.safe_load(f)["robot"]
+    robot_cfg_path = robot_yaml["cfg_path"]
+    robot_usd = robot_yaml.get("usd_path")
+    if not robot_usd:
+        raise RuntimeError("default.yaml 的 robot.usd_path 未配置（已改为直接用人工 USD，不再自转）")
+    if not os.path.isfile(robot_usd):
+        raise FileNotFoundError(f"robot.usd_path 不存在: {robot_usd}")
     urdf_path, joint_names, retract_config = load_robot_cfg(robot_cfg_path)
     print(f"[main] robot cfg : {robot_cfg_path}")
-    print(f"[main] urdf      : {urdf_path}")
+    print(f"[main] robot usd : {robot_usd}（人工制作，直接使用）")
+    print(f"[main] urdf      : {urdf_path}（仅参考，不再转 USD）")
     print(f"[main] joints    : {joint_names}")
     print(f"[main] retract   : {retract_config}")
 
@@ -646,8 +657,7 @@ def main():
     n_poses = len(poses)
     print(f"[main] poses     : {n_poses} 个")
 
-    # 转换资产
-    robot_usd = asset_convert.convert_robot_urdf(urdf_path, force=args_cli.force_convert)
+    # 工件仍按需 OBJ→USD（纯视觉）；机械臂 USD 已由上面的 robot.usd_path 给定。
     workpiece_usd = asset_convert.convert_workpiece_obj(args_cli.obj, force=args_cli.force_convert)
     link6_sub = asset_convert.find_link_subpath(robot_usd, "Link6")
     print(f"[main] Link6 子路径: {link6_sub}")
