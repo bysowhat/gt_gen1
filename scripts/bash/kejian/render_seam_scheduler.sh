@@ -10,7 +10,8 @@
 #   然后从队列取下一个任务分配给该卡。
 #
 # 用法：
-#   bash scripts/bash/kejian/render_seam_scheduler.sh [--dry-run] [--max-envs N]
+# cd /kpfs_dataset_ssd/dataset/baiyu/code/gt_gen_hanfeng
+# bash scripts/bash/kejian/render_seam_scheduler.sh
 
 set -euo pipefail
 
@@ -21,7 +22,7 @@ OUT_DIR="/kpfs_dataset_ssd/dataset/render_kejian/render_outs"
 DONE_TMPDIR="/tmp/render_seam_done"
 NUM_GPUS=8
 POLL_INTERVAL=5          # 轮询间隔（秒）
-TASK_TIMEOUT=800        # 单个任务超时（秒），30分钟
+TASK_TIMEOUT=3000        # 单个任务超时（秒）
 MAX_ENVS=2               # --max-envs 默认值
 PYTHON_BIN="/workspace/isaaclab/_isaac_sim/python.sh"
 RENDER_SCRIPT="render/render_seam.py"
@@ -106,8 +107,8 @@ cleanup() {
     for gpu_id in "${!gpu_pid[@]}"; do
         pid="${gpu_pid[$gpu_id]}"
         if kill -0 "$pid" 2>/dev/null; then
-            echo "  杀死 GPU $gpu_id 上的进程 PID=$pid"
-            kill -TERM "$pid" 2>/dev/null || true
+            echo "  杀死 GPU $gpu_id 上的进程组 PID=$pid"
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
         fi
     done
     # 清理哨兵文件
@@ -139,10 +140,15 @@ launch_task() {
 
     # 在后台启动 render_seam.py，通过 CUDA_VISIBLE_DEVICES 绑定 GPU
     # RENDER_DONE_FILE 是哨兵文件，render_seam.py 完成后会写入
+    #
+    # 用 setsid 让 python.sh 成为新进程组的组长，这样它 fork 出来的真正的
+    # Isaac Sim 进程 (python_exe) 与它同组。后面杀任务时按"进程组"杀，
+    # 否则只杀掉 python.sh 外壳、留下 python_exe 孤儿继续占着显存 ->
+    # 几轮之后每张卡显存被僵尸进程占满 -> 新任务 OOM 卡到超时。
     (
         export CUDA_VISIBLE_DEVICES="$gpu_id"
         export RENDER_DONE_FILE="$done_file"
-        exec "$PYTHON_BIN" "$RENDER_SCRIPT" \
+        exec setsid "$PYTHON_BIN" "$RENDER_SCRIPT" \
             --obj "$obj_path" \
             --seam-npy "$npy_path" \
             --out "$OUT_DIR" \
@@ -176,9 +182,10 @@ finish_gpu_task() {
     fi
 
     # 强杀进程（simulation_app.close() 会卡住）
+    # 按进程组杀，连同 python.sh fork 出来的 Isaac Sim 子进程一起干掉，释放显存
     if kill -0 "$pid" 2>/dev/null; then
-        echo "  [GPU $gpu_id] 强杀挂起进程 PID=$pid"
-        kill -KILL "$pid" 2>/dev/null || true
+        echo "  [GPU $gpu_id] 强杀挂起进程组 PID=$pid"
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     fi
 
@@ -208,12 +215,25 @@ kill_gpu_task() {
 
     echo "  [GPU $gpu_id] ${reason}: $stem / $seam_idx (已运行 ${elapsed}s)"
 
-    # 强杀进程
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "  [GPU $gpu_id] 强杀进程 PID=$pid"
-        kill -KILL "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
+    # 进程意外退出（崩溃）时，把对应日志尾部打出来，便于直接看到崩因
+    if [[ "$reason" == *意外退出* ]]; then
+        local log_file="$OUT_DIR/logs/${stem}__${seam_idx}.log"
+        if [[ -f "$log_file" ]]; then
+            echo "  [GPU $gpu_id] ---- 日志尾部 ($log_file) ----"
+            tail -n 20 "$log_file" | while read -r line || [[ -n "$line" ]]; do echo "    $line"; done
+            echo "  [GPU $gpu_id] ---- 日志结束 ----"
+        else
+            echo "  [GPU $gpu_id] 日志文件不存在: $log_file"
+        fi
     fi
+
+    # 强杀进程组：即使外壳 python.sh 已退出（意外退出场景），它 fork 的
+    # Isaac Sim 子进程也可能还活着占着显存，进程组仍存在，按组杀才能把孤儿
+    # 一并回收。无条件尝试，避免漏掉占显存的僵尸进程。
+    echo "  [GPU $gpu_id] 强杀进程组 PID=$pid"
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 
     # 清理
     rm -f "$done_file"
