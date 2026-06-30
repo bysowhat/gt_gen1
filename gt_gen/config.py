@@ -140,9 +140,14 @@ class Config:
         return list(self.raw.get("plan_init_pose", {}).get("ee_z_range_m", [-0.1, 0.1]))
 
     @property
-    def plan_init_n_per_dof(self) -> int:
-        """lookup 每关节采样档数，q_table = n_per_dof^6。见 default.yaml plan_init_pose.n_per_dof。"""
-        return int(self.raw.get("plan_init_pose", {}).get("n_per_dof", 7))
+    def plan_init_n_per_dof(self):
+        """lookup 每关节采样档数。见 default.yaml plan_init_pose.n_per_dof。
+        · 标量 → 各关节同档（q_table = n^6，旧行为）；
+        · 列表 [n0..n5] → link1..link6 各自档数（q_table = ∏ ni），用于按关节调采样精度/显存。"""
+        v = self.raw.get("plan_init_pose", {}).get("n_per_dof", 7)
+        if isinstance(v, (list, tuple)):
+            return [int(x) for x in v]
+        return int(v)
 
     @property
     def plan_init_rot_x_deg(self) -> list:
@@ -192,6 +197,32 @@ class Config:
         焊枪头不再落在焊缝中点，而是落在「中点 + standoff·bisector」处（中点退后 standoff 进入自由空间）。
         与 goal.standoff_cm 同义但作用于初始位姿求解。见 default.yaml plan_init_pose.standoff_cm。"""
         return float(self.raw.get("plan_init_pose", {}).get("standoff_cm", 0.0)) / 100.0
+
+    @property
+    def plan_init_clearance_inflate(self) -> float:
+        """间隙膨胀量（米）：把【手臂本体】碰撞球半径膨胀，让整臂离工件留间隙；0=关闭。
+        碰撞代价 get_collision_distance 是 clamp≥0（不返回负间隙），故「留间隙」靠膨胀球半径实现，
+        不能用负 collision_tolerance。焊枪尖端球由 plan_init_tip_spheres 排除（不膨胀，保证贴焊缝）。
+        见 default.yaml plan_init_pose.clearance_inflate_m。"""
+        return float(self.raw.get("plan_init_pose", {}).get("clearance_inflate_m", 0.0))
+
+    @property
+    def plan_init_tip_spheres(self) -> dict:
+        """焊枪尖端球（间隙膨胀时排除，不膨胀）：{link, centers:[[x,y,z]...], match_tol_m}，
+        center 为该 link 局部系坐标，与 robot cfg collision_spheres 定义一致。见 default.yaml plan_init_pose.tip_spheres。"""
+        return dict(self.raw.get("plan_init_pose", {}).get("tip_spheres", {}) or {})
+
+    @property
+    def plan_init_snap_deg(self) -> float:
+        """候选朝向 vs 4 种允许朝向：xyz 逐轴旋转误差上限（度），三轴全在内才保留并 snap。见 default.yaml plan_init_pose.snap_deg。"""
+        return float(self.raw.get("plan_init_pose", {}).get("snap_deg", 10.0))
+
+    @property
+    def plan_init_base_overlap_filter(self) -> bool:
+        """是否启用「固定底座(xiaoyu_base_link)碰撞球 vs 工件 在 base-xy 投影相交」过滤
+        （相交=机械臂底座压在工件下/工件盖在底座上，丢弃该候选）。true=做该过滤（默认）；false=关闭。
+        见 default.yaml plan_init_pose.base_overlap_filter。"""
+        return bool(self.raw.get("plan_init_pose", {}).get("base_overlap_filter", True))
 
     # ---- plan_init_pose_kejian（新逻辑：固定朝向 + 平移网格 + STOMP 可达，见 scripts/plan_init_pose_kejian.py） ----
     @property

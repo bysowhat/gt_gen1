@@ -19,7 +19,7 @@
    （文档同目录 docs/solve_arm_pose_lookup.md）。给定工件 mesh(_part.obj) + 焊缝
    (_weld_angle3.json)，离线一次性预计算 N=n_per_dof^6 个关节角的 FK（EE 位置/焊枪轴/连杆碰撞球），
    在线对每条焊缝反解出唯一工件位姿 (R,t)（焊枪头到焊缝中点、焊枪轴对准 bisector），只用「连杆球 +
-   retract 球 vs 工件 ESDF」做碰撞过滤，按 upright/cube 评分取最优。碰撞后端用裸 cuRobo
+   retract 球 vs 工件 ESDF」做碰撞过滤，按「绕自身三轴离 90° 整倍数偏差和」评分取最优。碰撞后端用裸 cuRobo
    RobotWorld + WorldVoxelCollision + 工件 ESDF（本项目 CuroboHandle 是固定位姿 MESH 世界，
    做不了"工件逐候选移动"的 batch 球碰撞查询）。
    运行（需 GPU；可选 --viz 复用 ① 的可视化）：
@@ -170,18 +170,25 @@ def batch_align_rotation(a_unit, b_unit):
     return R
 
 
-def cube_score_batch(R):
-    """R 各元素接近 {-1,0,1} 的程度（负的"到最近整值距离和"）；越大越接近 90° 倍数正交姿态。"""
+def axis_align_score_batch(R):
+    """工件姿态(R=T_workpiece_in_base 旋转部分)按【绕自身三轴 内旋 X→Y→Z】拆成 (rx,ry,rz)，
+    每轴各算「离最近 90° 整倍数的偏差」d=|a−90°×round(a/90°)|∈[0°,45°]，三轴 d 相加取负作分数。
+    =0 表示三轴恰好都落在 90° 整倍数(工件三轴对齐 base 三轴)，分最高；越斜各轴偏差越大、分越低。
+    （round-to-nearest 自动覆盖 …−2,−1,0,1,2… 各 90° 倍数，过 45° 即归到下一倍数→单轴偏差恒≤45°。）"""
     import torch
-    abs_r = torch.abs(R)
-    dist = torch.minimum(abs_r, 1.0 - abs_r)
-    return -torch.sum(dist, dim=(-2, -1))
+    half_pi = float(np.pi / 2.0)
+    rad2deg = float(180.0 / np.pi)
+    # 内旋 XYZ 分解：R = Rx(rx)·Ry(ry)·Rz(rz)
+    sy = torch.clamp(R[..., 0, 2], -1.0, 1.0)
+    ry = torch.asin(sy)
+    rx = torch.atan2(-R[..., 1, 2], R[..., 2, 2])
+    rz = torch.atan2(-R[..., 0, 1], R[..., 0, 0])
 
+    def _dev_deg(a):
+        nearest = torch.round(a / half_pi) * half_pi   # 最近的 90° 整倍数(rad)
+        return torch.abs(a - nearest) * rad2deg        # 偏差(度)，∈[0,45]
 
-def upright_score_batch(R):
-    """工件竖直程度 |R[2,2]| ∈ [0,1]，≥0.9 表示不歪。"""
-    import torch
-    return torch.abs(R[..., 2, 2])
+    return -(_dev_deg(rx) + _dev_deg(ry) + _dev_deg(rz))   # ∈[-135,0]，越大越对齐
 
 
 def quat_wxyz_to_x_axis_batch(quat):
@@ -345,7 +352,7 @@ def to_save_format(weld: Dict, sol: Dict, joint_names: List[str]) -> Dict:
         "_rot_x_deg": sol["rot_x_deg"],
         "_rot_y_deg": sol["rot_y_deg"],
         "_rot_z_deg": sol["rot_z_deg"],
-        "_cube_score": sol["cube_score"],
+        "_align_score": sol["align_score"],
         "_d_link": sol["d_link"],
         "_d_retract": sol["d_retract"],
     }
@@ -631,6 +638,68 @@ class InitPoseLookupSolver:
               f"y=[{float(self.ee_pos_t[:,1].min()):.3f},{float(self.ee_pos_t[:,1].max()):.3f}] "
               f"z=[{float(self.ee_pos_t[:,2].min()):.3f},{float(self.ee_pos_t[:,2].max()):.3f}]")
 
+    # ---- 离线预计算结果落盘 ----
+    def save_joint_table(self, path: Optional[str] = None) -> str:
+        """把 precompute_joint_table 的结果（与工件无关的关节角查表）存成 .pt，供复用免去 n^6 重算。
+
+        存储地址：path 缺省时取 cfg.plan_init_joint_table_path（= default.yaml plan_init_pose.joint_table_path）。
+        保存内容为 precompute_joint_table 产出的全部张量 + 重建/校验所需元信息；ESDF/robot_world 与工件相关、
+        不在此保存（换工件时各自重建）。"""
+        import torch
+        if self.q_table_t is None:
+            raise RuntimeError("尚未 precompute_joint_table，无结果可存；请先调用 precompute_joint_table()")
+        if path is None:
+            path = self.cfg.plan_init_joint_table_path
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        payload = {
+            "q_table_t": self.q_table_t.cpu(),
+            "ee_pos_t": self.ee_pos_t.cpu(),
+            "ee_x_t": self.ee_x_t.cpu(),
+            "ee_rot_t": self.ee_rot_t.cpu(),
+            "link_spheres_t": self.link_spheres_t.cpu(),
+            "retract_spheres_t": self.retract_spheres_t.cpu(),
+            "K_link": int(self.K_link),
+            "N": int(self.N),
+            "n_per_dof": int(self.n_per_dof),
+            "joint_names": list(self.joint_names),
+        }
+        torch.save(payload, path)
+        print(f"[lookup] joint_table saved -> {path} "
+              f"(N={payload['N']}, n_per_dof={payload['n_per_dof']}, K_link={payload['K_link']})")
+        return path
+
+    def load_joint_table(self, path: Optional[str] = None) -> bool:
+        """从 .pt 读回 precompute_joint_table 的结果，填回查表张量（免去 n^6 重算）。
+
+        存储地址：path 缺省时取 cfg.plan_init_joint_table_path（= default.yaml plan_init_pose.joint_table_path）。
+        文件不存在返回 False（调用方可回退到 precompute_joint_table）；n_per_dof 与当前 solver 不一致则报错
+        （查表是按 n_per_dof 采样的，混用会算错）。张量按 tensor_args 搬到当前设备。
+        注意：只恢复与工件无关的关节表，ESDF/robot_world 仍由构造/ set_workpiece 各自重建。"""
+        import torch
+        if path is None:
+            path = self.cfg.plan_init_joint_table_path
+        if not os.path.isfile(path):
+            print(f"[lookup] joint_table 不存在，未加载：{path}")
+            return False
+        payload = torch.load(path, map_location=self.tensor_args.device)
+        saved_n = int(payload.get("n_per_dof", -1))
+        if saved_n != int(self.n_per_dof):
+            raise RuntimeError(
+                f"joint_table n_per_dof={saved_n} 与当前 solver n_per_dof={self.n_per_dof} 不一致："
+                f"{path}（请用一致的 n_per_dof，或重新 precompute_joint_table+save_joint_table）")
+        dev, dt = self.tensor_args.device, self.tensor_args.dtype
+        self.q_table_t = payload["q_table_t"].to(device=dev, dtype=dt)
+        self.ee_pos_t = payload["ee_pos_t"].to(device=dev, dtype=dt)
+        self.ee_x_t = payload["ee_x_t"].to(device=dev, dtype=dt)
+        self.ee_rot_t = payload["ee_rot_t"].to(device=dev, dtype=dt)
+        self.link_spheres_t = payload["link_spheres_t"].to(device=dev, dtype=dt)
+        self.retract_spheres_t = payload["retract_spheres_t"].to(device=dev, dtype=dt)
+        self.K_link = int(payload["K_link"])
+        self.N = int(payload["N"])
+        print(f"[lookup] joint_table loaded <- {path} "
+              f"(N={self.N}, n_per_dof={saved_n}, K_link={self.K_link})")
+        return True
+
     # ---- 在线求解 ----
     def solve_one_weld_lookup(self, weld: Dict,
                               rot_x_deg: Tuple[float, ...] = (0.0,),
@@ -639,7 +708,7 @@ class InitPoseLookupSolver:
                               diagnostic: bool = False) -> Optional[Dict]:
         """每条焊缝 batch GPU 求解。先 align(bisector→名义焊枪轴 -ee_x) 得基准姿态 R0，再【绕
         xiaoyu_tip_link 末端局部 x/y/z 轴】分别转 (αx,βy,γz) 组成扰动 R_delta：R=R_delta@R0；
-        t=ee_pos−R@mid → 球反变到 mesh world → ESDF batch 碰撞 → safe → upright*10+cube 评分取 best。
+        t=ee_pos−R@mid → 球反变到 mesh world → ESDF batch 碰撞 → safe → 三轴 90° 偏差和评分取 best。
         （角度参数化由 θ(绕焊缝法向)×φ(绕切向) 改为绕末端自身 xyz 轴，三角全有效，绕 z 即焊枪自转 roll；
         三轴各按 default.yaml plan_init_pose.rot_{x,y,z}_deg 采样后取笛卡尔积。）"""
         import torch
@@ -649,6 +718,11 @@ class InitPoseLookupSolver:
         mid = torch.tensor(weld["mid_world"], device=device, dtype=dtype)
         bisector = torch.tensor(weld["bisector_world"], device=device, dtype=dtype)
         bisector = bisector / (torch.norm(bisector) + 1e-12)
+
+        # 落枪点(tip 目标) = 焊缝中点沿角平分线(bisector，远离工件方向)外移 standoff 米；
+        # standoff=0 即落在中点。t=ee_pos−R@target 让 tip 落在此点，真实焊缝中点随之退后 standoff。
+        standoff = float(self.cfg.plan_init_standoff)
+        target = mid + standoff * bisector
 
         # 焊缝起点/终点（mesh world）→ 在线按 R,t 变到 base 后须落在与 tip 同一组工作空间范围内
         # （复用 precompute 的 ee_xy_range_m / ee_z_range_m；中点=tip 已在 precompute 保证，无需再算）。
@@ -685,8 +759,10 @@ class InitPoseLookupSolver:
                         Rz = batch_axis_angle_rotmat(eaz, az_r.expand(N))
                         R_delta = Rz @ Ry @ Rx                       # (N,3,3)
                         R = R_delta @ R0                             # (N,3,3) R=R_delta@R0
+                        R_target = torch.einsum("nij,j->ni", R, target)
+                        t_arr = self.ee_pos_t - R_target  # (N,3) tip 落在 standoff 落枪点
                         R_mid = torch.einsum("nij,j->ni", R, mid)
-                        t_arr = self.ee_pos_t - R_mid  # (N,3)
+                        mid_base_arr = R_mid + t_arr  # (N,3) 真实焊缝中点在 base（standoff>0 时 ≠ ee_pos，供排序/sanity）
 
                         # 焊缝起/终点变到 base：p_base = R@p_world + t；须落在 ee_xy_range(xy 环)+ee_z_range(z) 内
                         p0_base = torch.einsum("nij,j->ni", R, p0_world) + t_arr   # (N,3)
@@ -737,9 +813,7 @@ class InitPoseLookupSolver:
                             continue
                         safe_idx = safe_mask.nonzero(as_tuple=True)[0]
                         R_safe = R[safe_idx]
-                        upright = upright_score_batch(R_safe)
-                        cube = cube_score_batch(R_safe)
-                        scores = upright * 10.0 + cube
+                        scores = axis_align_score_batch(R_safe)   # 三轴 90° 偏差和(取负)，越大越对齐
 
                     top_per = min(50, safe_idx.shape[0])
                     top_local = torch.argsort(scores, descending=True)[:top_per]
@@ -754,11 +828,11 @@ class InitPoseLookupSolver:
                             "rot_y_deg": ay_deg,
                             "rot_z_deg": az_deg,
                             "ee_pos_in_base": self.ee_pos_t[gi].cpu().numpy(),
+                            "mid_in_base": mid_base_arr[gi].cpu().numpy(),
                             "ee_x_in_base": self.ee_x_t[gi].cpu().numpy(),
                             "d_link": float(d_link[gi].item()),
                             "d_retract": float(d_ret[gi].item()),
-                            "cube_score": float(cube[li].item()),
-                            "upright_score": float(upright[li].item()),
+                            "align_score": float(scores[li].item()),
                             "combined_score": float(scores[li].item()),
                         })
 
@@ -774,26 +848,32 @@ class InitPoseLookupSolver:
             print(f"      [FAIL diag] 共 {n_zero}/{len(diag_stats)} 个采样完全无解 (safe=0)，"
                   f"全局 min_d_link={min(s[4] for s in diag_stats):.4f}, "
                   f"min_d_ret={min(s[5] for s in diag_stats):.4f} (tol={self.collision_tolerance:.4f})")
+            self.last_all_solutions = []
             return None
 
         all_solutions.sort(key=lambda s: -s["combined_score"])
+        # 二次稳定排序：真实焊缝中点(base 系，standoff>0 时 ≠ ee_pos)的 x>0 的结果排前、x<=0 的拍到后面；
+        # 稳定排序保证各组内部仍保持上面的 combined_score 降序。
+        all_solutions.sort(key=lambda s: 0 if float(s["mid_in_base"][0]) > 0.0 else 1)
+        self.last_all_solutions = all_solutions   # 供可视化分页浏览全部候选（x>0 优先、组内按分降序）
         best = all_solutions[0]
         if diagnostic:
             R, t = best["R"], best["t"]
-            mid_in_base = R @ weld["mid_world"] + t
-            err_mid_pos = float(np.linalg.norm(mid_in_base - best["ee_pos_in_base"]))
+            target_np = np.asarray(weld["mid_world"], float) + standoff * np.asarray(weld["bisector_world"], float)
+            target_in_base = R @ target_np + t
+            err_tip_pos = float(np.linalg.norm(target_in_base - best["ee_pos_in_base"]))  # 落枪点应贴 ee_pos
             so3_err = float(np.linalg.norm(R @ R.T - np.eye(3)))
-            print(f"      [sanity best] err_mid_pos={err_mid_pos:.4f} |R*R^T-I|={so3_err:.4f} "
-                  f"upright={best['upright_score']:.3f} "
+            print(f"      [sanity best] standoff={standoff:.3f}m err_tip_pos={err_tip_pos:.4f} "
+                  f"|R*R^T-I|={so3_err:.4f} align={best['align_score']:.2f} "
                   f"αx={best['rot_x_deg']:+.0f}° βy={best['rot_y_deg']:+.0f}° γz={best['rot_z_deg']:+.0f}°")
         return best
 
 
 
 # ---- 求解结果可视化（复用 init_space_geometries） ----
-def show_lookup_solution(cfg, obj_fp: str, weld: Dict, sol: Dict):
-    """复用 init_space_geometries（整臂碰撞球 + init_free 盒 + base 架），再叠加按解出的
-    T_workpiece_in_base 摆放的工件网格（浅灰半透）+ 绿色焊缝线 + 焊枪头落点小球。"""
+def _lookup_solution_geoms(cfg, obj_fp: str, weld: Dict, sol: Dict):
+    """构建单个解的可视化几何体列表（不开窗）：init_space_geometries（整臂碰撞球 + init_free
+    盒 + base 架）+ 按 T_workpiece_in_base 摆放的工件网格（浅灰半透）+ 绿色焊缝线 + 焊枪头落点小球。"""
     import open3d as o3d
 
     geoms, _ = init_space_geometries(cfg, q=sol["q"])
@@ -812,7 +892,7 @@ def show_lookup_solution(cfg, obj_fp: str, weld: Dict, sol: Dict):
         mesh.paint_uniform_color([0.7, 0.7, 0.72])
         geoms.append(mesh)
 
-    # 焊缝线 p0→p1（绿色）+ 焊枪头落点（= R@mid + t，应贴在 ee_pos）
+    # 焊缝线 p0→p1（绿色）+ 焊缝中点（绿球）+ 焊枪头实际落点（红球，= standoff 落枪点，应贴在 ee_pos）
     def _to_base(p):
         return (R @ np.asarray(p, float) + t).tolist()
     p0b, p1b = _to_base(weld["p0_world"]), _to_base(weld["p1_world"])
@@ -827,9 +907,65 @@ def show_lookup_solution(cfg, obj_fp: str, weld: Dict, sol: Dict):
     tip.paint_uniform_color([0.1, 0.85, 0.1])
     geoms.append(tip)
 
+    # standoff 落枪点：中点沿 bisector(远离工件)外移 standoff 米，焊枪头实际落在这（standoff>0 时与中点分离）
+    standoff = float(cfg.plan_init_standoff)
+    if standoff != 0.0:
+        target_world = np.asarray(weld["mid_world"], float) + standoff * np.asarray(weld["bisector_world"], float)
+        gun = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+        gun.translate(_to_base(target_world))
+        gun.compute_vertex_normals()
+        gun.paint_uniform_color([0.9, 0.1, 0.1])
+        geoms.append(gun)
+    return geoms
+
+
+def show_lookup_solution(cfg, obj_fp: str, weld: Dict, sol: Dict):
+    """单解可视化（关闭窗口即返回）。"""
+    import open3d as o3d
+    geoms = _lookup_solution_geoms(cfg, obj_fp, weld, sol)
     print(f"显示 weld {weld['idx']} 解（关闭窗口继续）…")
     o3d.visualization.draw_geometries(
         geoms, window_name=f"plan_init_pose: weld {weld['idx']} 解 + 工件 + 整臂碰撞球")
+
+
+def show_lookup_solutions(cfg, obj_fp: str, weld: Dict, solutions: List[Dict]):
+    """逐个可视化该焊缝【所有候选解】(按 combined_score 已降序，第 1 个=best)：同一个窗口里
+    按【C 键】切到下一个，不关窗口；切换时打印「第 i/N 个结果」。到最后一个再按 C 即关闭窗口
+    （进入下一条焊缝 / 结束）。中途也可直接关窗口跳过剩余。"""
+    import open3d as o3d
+
+    n = len(solutions)
+    if n == 0:
+        print(f"[viz] weld {weld['idx']} 无候选解，跳过可视化")
+        return
+
+    state = {"i": 0}
+
+    def _load(vis, idx, reset):
+        vis.clear_geometries()
+        sol = solutions[idx]
+        for g in _lookup_solution_geoms(cfg, obj_fp, weld, sol):
+            vis.add_geometry(g, reset_bounding_box=reset)
+        print(f"[viz] weld {weld['idx']} 第 {idx + 1}/{n} 个结果："
+              f"align={sol.get('align_score', float('nan')):.2f} "
+              f"αx={sol['rot_x_deg']:+.0f}° βy={sol['rot_y_deg']:+.0f}° γz={sol['rot_z_deg']:+.0f}° "
+              f"d_link={sol['d_link']:.3f} d_ret={sol['d_retract']:.3f}（按 C 看下一个）")
+
+    def _next(vis):
+        state["i"] += 1
+        if state["i"] >= n:
+            print(f"[viz] weld {weld['idx']} 已是最后一个（{n}/{n}），关闭窗口继续")
+            vis.close()
+            return False
+        _load(vis, state["i"], reset=False)   # 切换不重置视角，保留用户当前相机
+        return False
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(window_name=f"plan_init_pose: weld {weld['idx']} 全部候选（按 C 切下一个）")
+    vis.register_key_callback(ord("C"), _next)
+    _load(vis, 0, reset=True)   # 第 1 个 fit 一次视角
+    vis.run()
+    vis.destroy_window()
 
 
 def viz_joint_table(cfg, solver, n=3):
@@ -1009,11 +1145,16 @@ def _run_solve(args):
     solver = InitPoseLookupSolver(
         cfg, args.obj, collision_tolerance=cfg.plan_init_collision_tolerance,
         voxel_size=cfg.plan_init_voxel_size, n_per_dof=n_per_dof)
-    print("[solve] precomputing joint table（与工件无关，仅一次）…")
-    solver.precompute_joint_table()
+    # 优先读 cfg.plan_init_joint_table_path 的缓存（与工件无关）；没有则现算一次并落盘复用。
+    if solver.load_joint_table():
+        print("[solve] 复用已存的 joint table（跳过 n^6 预计算）")
+    else:
+        print("[solve] precomputing joint table（与工件无关，仅一次）…")
+        solver.precompute_joint_table()
+        solver.save_joint_table()   # 落盘 → cfg.plan_init_joint_table_path（下次可复用免重算）
 
     # 可视化 precompute_joint_table 结果（ee xyz 范围 + 随机 3 个关节角）；注释此行即关闭可视化
-    # viz_joint_table(cfg, solver, n=10)
+    # viz_joint_table(cfg, solver, n=1)
 
     # 可视化焊枪碰撞球 + xiaoyu_tip_link 末端三轴（核实焊枪沿哪根局部轴=roll 轴）；注释此行即关闭可视化
     # viz_tip_frame(cfg, solver)
@@ -1040,14 +1181,14 @@ def _run_solve(args):
         n_solved += 1
         print(f"[{i + 1:3d}/{len(welds)}] weld {w['idx']}: OK ({dt:.0f}ms) "
               f"αx={sol['rot_x_deg']:+.0f}° βy={sol['rot_y_deg']:+.0f}° γz={sol['rot_z_deg']:+.0f}° "
-              f"upright={sol['upright_score']:.2f} cube={sol['cube_score']:.2f} "
+              f"align={sol['align_score']:.2f} "
               f"d_link={sol['d_link']:.3f} d_ret={sol['d_retract']:.3f} "
               f"q={np.round(sol['q'], 3).tolist()}")
         target = to_save_format(w, sol, solver.joint_names)
         fp = save_seam_pkl(args.out_dir, stem, w, target, args.obj, n_seg=cfg.plan_init_n_seg)
         print(f"      saved → {fp}")
         if args.viz:
-            show_lookup_solution(cfg, args.obj, w, sol)
+            show_lookup_solutions(cfg, args.obj, w, solver.last_all_solutions)
 
     print(f"[solve] done: {n_solved}/{len(welds)} 条求解成功，输出目录 "
           f"{os.path.join(args.out_dir, stem)}")

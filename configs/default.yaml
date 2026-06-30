@@ -81,14 +81,34 @@ plan_init_pose:                         # lookup 式初始位姿求解（scripts
   #   ① xy 平面到原点距离 ∈ ee_xy_range_m；② z ∈ ee_z_range_m；③ 落在 init_free.box_min_m/box_max_m 盒内。
   ee_xy_range_m: [0.4, 1.0]             # 焊枪末端 xy 平面到 base_link 原点距离 [下限,上限]（米）
   ee_z_range_m: [-0.1, 0.1]             # 焊枪末端在 base_link 系 z [下限,上限]（米）
-  n_per_dof: 12                          # 每关节采样档数，q_table = n_per_dof^6
+  # n_per_dof: [15, 15, 15, 24, 24, 24]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,949,120（≈ 旧 12^6=2.99M，不易 OOM）。
+  n_per_dof: [12, 12, 12, 12, 12, 12]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,985,984（≈ 旧 12^6=2.99M）。
+                                        #   也可填标量(如 12)=各关节同档(=n^6，旧行为)。想加精度就调大对应关节；
+                                        #   显存≈幸存者数×碰撞球，先小步加。改了此值须重算关节表缓存。
   collision_tolerance_m: 0.00           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
   voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
+  clearance_inflate_m: 0.01              # 间隙膨胀量（米）：把【手臂本体】碰撞球半径 +此值再判碰，等效要求手臂离工件
+                                        #   至少留此间隙（0=关闭）。因 get_collision_distance 是 clamp≥0 的碰撞代价、
+                                        #   不返回负间隙，故「留间隙」靠膨胀半径实现，不能用负 collision_tolerance。
+                                        #   焊枪尖端球(下方 tip_spheres)不膨胀。
+  tip_spheres:                          # 焊枪尖端球（间隙膨胀时排除，不膨胀，保证尖端能贴焊缝 standoff）。
+    link: xiaoyu_accessory_link         #   球所在 link；center 为该 link 局部系坐标，与 robot cfg collision_spheres 一致
+    match_tol_m: 0.0005                 #   center 匹配容差（米）；匹配数须等于 centers 数，否则报错
+    centers:                            #   weld_wire 5 个尖端球（r=0.003，xiaoyu_accessory_link 局部系）
+      - [0.076256, 0.0, 0.573073]
+      - [0.073905, 0.0, 0.569837]
+      - [0.071554, 0.0, 0.566601]
+      - [0.069203, 0.0, 0.563365]
+      - [0.066852, 0.0, 0.560129]
   n_seg: 20                             # save_seam_pkl 的 seam_line 插值点数
   joint_table_path: "configs/plan_init_joint_table.pt"  # precompute_joint_table 结果(.pt)的存储路径(相对项目根)；
                                         # InitPoseLookupSolver.save_joint_table 写入，可复用免去 n^6 重算。
   standoff_cm: 2.0                     # 焊枪头落点沿焊缝角平分线(bisector，远离工件方向)外移的 standoff 距离(cm)；
                                         # 0=落在焊缝中点。与 goal.standoff_cm 同义，但作用于初始位姿求解。
+  snap_deg: 10.0                        # 候选朝向 vs 4 种允许朝向：xyz 逐轴旋转误差上限（度）；三轴全在内才保留并 snap 到该朝向
+  base_overlap_filter: false             # 是否启用「固定底座(xiaoyu_base_link)碰撞球 vs 工件 在 base-xy 投影相交」过滤：
+                                        #   相交=机械臂底座压在工件下/工件盖在底座上，丢弃该候选。
+                                        #   true=做该过滤（默认）；false=关闭（允许工件摆在底座正上方）。
   # 角度采样：先把焊缝平分线 align 到名义焊枪轴(-ee_x)得基准姿态 R0，再【绕 xiaoyu_tip_link 末端局部
   # x/y/z 轴】各转一点组成扰动 R_delta，R=R_delta@R0（三角全有效）。名义焊枪轴=末端局部 -x，故绕 x
   # 即焊枪自转 roll（指向不变），绕 y/z 为 tilt（改变焊枪指向）。可视化核实见 plan_init_pose.viz_tip_frame。
