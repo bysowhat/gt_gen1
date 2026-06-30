@@ -1,5 +1,5 @@
-"""读取 render_seam.py 保存的某个 pose 目录（left/right rgb + depth + meta.npy），
-用 open3d 反投影成彩色 3D 点云并可视化（左右目融合到世界系）。
+"""读取 render_seam.py 保存的某个 pose 目录，用 open3d 反投影成彩色 3D 点云并
+可视化（左右目融合到世界系）。
 
 依赖：numpy、opencv-python、open3d（不需要 isaaclab）。
 
@@ -8,9 +8,16 @@
         [--max-depth 50] [--voxel 0.0] [--frame world|camera] [--save out.ply] [--no-vis]
 
 例：
-    python render/visualize_pointcloud.py /tmp/render_out/<obj>/<seam>/pose_0
+    python render/visualize_pointcloud.py \
+        /home/a/Downloads/render_out2/<part>/<part>_seam_40_pose0
 
-坐标与约定（与 meta.npy 一致）：
+目录格式（render_seam.py save_pose 写出，每侧一个子目录）：
+    <pose_dir>/left/   0_rgb.jpg  0_depth.exr  render_info.npy
+    <pose_dir>/right/  0_rgb.jpg  0_depth.exr  render_info.npy
+  每侧的 render_info.npy 都含两目完整信息（left/right 内参 + 各自世界位姿），
+  故本脚本任取一侧的 render_info.npy 当 meta 用。
+
+坐标与约定（与 render_info.npy 一致）：
   - depth 是 distance_to_image_plane（针孔 z 深度，单位 m），标准针孔反投影即可。
   - 内参 left_intrinsic/right_intrinsic 为 3x3。
   - 相机世界位姿 *_pose_w_pos / *_pose_w_quat_wxyz 为 ROS 约定（+Z 朝前、-Y 朝上、
@@ -44,7 +51,7 @@ def quat_wxyz_to_R(q):
 
 
 def load_rgb(path):
-    """读 store_rgb 写的 BGR png -> (H,W,3) RGB uint8。"""
+    """读 store_rgb 写的 BGR jpg -> (H,W,3) RGB uint8。"""
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(f"无法读取 RGB: {path}")
@@ -90,8 +97,8 @@ def cam_to_world(pts_cam, pos_w, quat_w_wxyz):
 
 
 def build_eye_pcd(pose_dir, meta, eye, max_depth, frame):
-    rgb = load_rgb(pose_dir / f"{eye}_rgb.png")
-    depth = load_depth(pose_dir / f"{eye}_depth.exr")
+    rgb = load_rgb(pose_dir / eye / "0_rgb.jpg")
+    depth = load_depth(pose_dir / eye / "0_depth.exr")
     K = np.asarray(meta[f"{eye}_intrinsic"], dtype=np.float64)
     if rgb.shape[:2] != depth.shape:
         raise ValueError(f"{eye}: rgb {rgb.shape[:2]} 与 depth {depth.shape} 尺寸不一致")
@@ -112,7 +119,7 @@ def build_eye_pcd(pose_dir, meta, eye, max_depth, frame):
 
 def main():
     ap = argparse.ArgumentParser(description="open3d 可视化左右目彩色点云")
-    ap.add_argument("pose_dir", help="pose_N 目录（含 left/right rgb+depth+meta.npy）")
+    ap.add_argument("pose_dir", help="pose 目录（含 left/ right/ 子目录，每侧 0_rgb.jpg+0_depth.exr+render_info.npy）")
     ap.add_argument("--eye", choices=["both", "left", "right"], default="both")
     ap.add_argument("--max-depth", type=float, default=50.0,
                     help="丢弃 z 大于该值的点（米，0=不限）")
@@ -125,7 +132,15 @@ def main():
     args = ap.parse_args()
 
     pose_dir = Path(args.pose_dir)
-    meta = np.load(pose_dir / "meta.npy", allow_pickle=True).item()
+    # meta 用任一侧的 render_info.npy（每侧都含两目完整内参与世界位姿）
+    meta = None
+    for side in ("left", "right"):
+        info_p = pose_dir / side / "render_info.npy"
+        if info_p.exists():
+            meta = np.load(info_p, allow_pickle=True).item()
+            break
+    if meta is None:
+        raise FileNotFoundError(f"{pose_dir} 下未找到 left/render_info.npy 或 right/render_info.npy")
     print(f"[meta] z_lift={meta.get('z_lift', 0.0):.3f}m  depth_type={meta.get('depth_type')}")
 
     eyes = ["left", "right"] if args.eye == "both" else [args.eye]
