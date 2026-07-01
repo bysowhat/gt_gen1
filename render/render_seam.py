@@ -9,6 +9,8 @@
         --obj '/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On_part_watertight.obj' \
         --seam-npy '/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On/seam_40.npy' \
         --out /tmp/render_out --headless
+    或整工件一次渲染其全部 seam（场景只建一次，摊销 app 启动/建场景/材质编译开销）：
+        ... --obj <part_watertight.obj> --seam-dir <stem 目录> --max-seams-per-proc 8 --out ... --headless
 
 输出（与 va_simulation/va_sim23_multi.py 的渲染目录一致；每个候选位姿=一个独立输出单元）：
     <out>/<part_stem>/<part_stem>_<seam_stem>_pose{p}/    # 如 BEAM_..._part/BEAM_..._part_seam_31_pose0
@@ -78,11 +80,16 @@ def timer(stage_name):
 def parse_args():
     parser = argparse.ArgumentParser(description="并行环境渲染左右目 RGB+深度")
     parser.add_argument("--obj", required=True, help="工件 .obj（watertight）路径")
-    parser.add_argument("--seam-npy", required=True, help="seam_*.npy（含 workpiece_pose7）")
+    # --seam-npy（单缝）/ --seam-dir（整工件目录，glob seam_*.npy）二选一。
+    parser.add_argument("--seam-npy", help="单条 seam_*.npy（含 workpiece_pose7）；调试用")
+    parser.add_argument("--seam-dir", help="工件 stem 目录，渲染其下全部 seam_*.npy")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="default.yaml 路径")
     parser.add_argument("--warehouse-usd", default=DEFAULT_WAREHOUSE_USD, help="环境 USD")
     parser.add_argument("--out", required=True, help="输出根目录")
     parser.add_argument("--max-envs", type=int, default=2, help="并行环境数上限")
+    parser.add_argument("--max-seams-per-proc", type=int, default=8,
+                        help="本进程最多渲染多少条 seam 即退出（0=不限）；用于按工件分块、给"
+                             "显存累积兜底，剩余 seam 由调度器重排续跑")
     parser.add_argument("--spacing", type=float, default=40.0, help="相邻环境间距(米)")
     parser.add_argument("--settle-steps", type=int, default=12, help="读图前 step 帧数")
     parser.add_argument("--force-convert", action="store_true", help="强制重转 USD")
@@ -95,6 +102,9 @@ from isaaclab.app import AppLauncher  # noqa: E402
 _parser = parse_args()
 AppLauncher.add_app_launcher_args(_parser)
 args_cli = _parser.parse_args()
+# --seam-npy / --seam-dir 必须且只能给一个
+if bool(args_cli.seam_npy) == bool(args_cli.seam_dir):
+    _parser.error("必须且只能给 --seam-npy 或 --seam-dir 之一")
 args_cli.enable_cameras = True   # 渲染相机必需
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -634,6 +644,46 @@ def save_pose(out_dir, rendered, pose7, joint_names, retract_config, seam_raw, p
         np.save(side_dir / "render_info.npy", info, allow_pickle=True)
 
 
+def render_one_seam(seam_npy, sim, scene, mat_pick, joint_names, retract_config,
+                    num_envs, part_stem, out_base):
+    """渲染单条 seam 的全部 pose（复用已建好的场景），落盘并写 _DONE_<seam_stem>。
+
+    返回 "skipped"（已 done 跳过）或本条已保存的 pose 数（int）。
+    场景不在此重建——同 stem 所有 seam 共用 setup 阶段建好的 scene/相机/材质库。
+    """
+    seam_stem = Path(seam_npy).stem                   # 如 "seam_31"
+    out_root = Path(out_base) / part_stem             # <out>/<part>/
+    done_marker = out_root / f"_DONE_{seam_stem}"
+    if done_marker.exists():
+        print(f"[seam {seam_stem}] 已有 {done_marker.name}，跳过（skip-on-resume）")
+        return "skipped"
+
+    poses, seam_raw = load_poses(seam_npy)
+    n_poses = len(poses)
+    print(f"[seam {seam_stem}] poses: {n_poses} 个")
+
+    saved = 0
+    for start in range(0, n_poses, num_envs):
+        chunk = list(range(start, min(start + num_envs, n_poses)))
+        batch_poses = [(env_idx, poses[p]) for env_idx, p in enumerate(chunk)]
+        print(f"[seam {seam_stem}] 批 {start}~{chunk[-1]}（{len(chunk)} 个 pose）")
+        rendered = render_batch(sim, scene, batch_poses, chunk, mat_pick,
+                                scene["offsets"], scene["robots"], joint_names,
+                                retract_config, args_cli.settle_steps)
+        for env_idx, p in enumerate(chunk):
+            unit_dir = out_root / f"{part_stem}_{seam_stem}_pose{p}"   # 如 BEAM_..._part_seam_31_pose0
+            save_pose(unit_dir, rendered[env_idx], poses[p],
+                      joint_names, retract_config, seam_raw, p)
+            saved += 1
+            print(f"  saved {unit_dir.name} -> {unit_dir}")
+
+    # 每条 seam 的完成哨兵（人可见 + skip-on-resume 依据）
+    done_marker.parent.mkdir(parents=True, exist_ok=True)
+    done_marker.write_text(f"saved={saved}\nout={out_root}\n")
+    print(f"[seam {seam_stem}] 完成，共保存 {saved} 个 pose 到 {out_root}")
+    return saved
+
+
 @timer("完整渲染")
 def main():
     # 解析机器人 cfg：joint_names / retract_config 仍从 cuRobo yml 读；
@@ -653,16 +703,23 @@ def main():
     print(f"[main] joints    : {joint_names}")
     print(f"[main] retract   : {retract_config}")
 
-    poses, seam_raw = load_poses(args_cli.seam_npy)
-    n_poses = len(poses)
-    print(f"[main] poses     : {n_poses} 个")
+    # 解析待渲染 seam 列表：--seam-dir → glob 整工件；否则单条 --seam-npy
+    if args_cli.seam_dir:
+        seam_paths = sorted(str(p) for p in Path(args_cli.seam_dir).glob("seam_*.npy"))
+        if not seam_paths:
+            raise FileNotFoundError(f"--seam-dir 下无 seam_*.npy: {args_cli.seam_dir}")
+    else:
+        seam_paths = [args_cli.seam_npy]
+    print(f"[main] seam 总数 : {len(seam_paths)}（来自 {'--seam-dir' if args_cli.seam_dir else '--seam-npy'}）")
 
-    # 工件仍按需 OBJ→USD（纯视觉）；机械臂 USD 已由上面的 robot.usd_path 给定。
+    # ===== 以下只建一次：同 stem 所有 seam 共用工件 USD / 机械臂 / warehouse / 相机 / 材质库 =====
+    # 工件仍按需 OBJ→USD（纯视觉、按 stem 磁盘缓存）；机械臂 USD 已由 robot.usd_path 给定。
     workpiece_usd = asset_convert.convert_workpiece_obj(args_cli.obj, force=args_cli.force_convert)
     link6_sub = asset_convert.find_link_subpath(robot_usd, "Link6")
     print(f"[main] Link6 子路径: {link6_sub}")
 
-    num_envs = min(n_poses, args_cli.max_envs)
+    # 场景按 max_envs 固定建一次；pose 少的 seam 走不满批（render_batch 已支持）。
+    num_envs = max(1, args_cli.max_envs)
     print(f"[main] num_envs  : {num_envs}")
 
     # 扫描材质库（远程有、本地无→返回空，自动跳过加材质，保持灰色默认外观）
@@ -685,48 +742,46 @@ def main():
     #   · part 目录名去掉 _watertight 后缀（示例 part 目录为 *_part）；
     #   · 每个候选位姿 = part 目录下一个独立 unit，unit 名编码 seam + 候选序号。
     part_stem = obj_stem[:-len("_watertight")] if obj_stem.endswith("_watertight") else obj_stem
-    seam_stem = Path(args_cli.seam_npy).stem          # 如 "seam_31"
-    out_root = Path(args_cli.out) / part_stem         # <out>/<part>/
+    out_base = Path(args_cli.out)
 
-    # 按 num_envs 分批
-    saved = 0
-    for start in range(0, n_poses, num_envs):
-        chunk = list(range(start, min(start + num_envs, n_poses)))
-        batch_poses = [(env_idx, poses[p]) for env_idx, p in enumerate(chunk)]
-        print(f"[main] 批 {start}~{chunk[-1]}（{len(chunk)} 个 pose）")
-        rendered = render_batch(sim, scene, batch_poses, chunk, mat_pick,
-                                scene["offsets"], scene["robots"], joint_names,
-                                retract_config, args_cli.settle_steps)
-        # # [debug] 保存整个场景 USD，便于离线检查相机/工件/机械臂相对位姿
-        # # （out_root 现为 part 级、同 part 多 seam 共用，故加 seam 前缀防跨 seam 覆盖）
-        # dbg_usd = out_root / f"{seam_stem}_scene_batch_{start}.usd"
-        # dbg_usd.parent.mkdir(parents=True, exist_ok=True)
-        # n_baked = bake_joint_state_to_usd(num_envs, joint_names, retract_config)
-        # omni.usd.get_context().get_stage().Export(str(dbg_usd))
-        # print(f"  [debug] 场景 USD -> {dbg_usd}（回写 {n_baked} 个关节角）")
-        for env_idx, p in enumerate(chunk):
-            unit_dir = out_root / f"{part_stem}_{seam_stem}_pose{p}"   # 如 BEAM_..._part_seam_31_pose0
-            save_pose(unit_dir, rendered[env_idx], poses[p],
-                      joint_names, retract_config, seam_raw, p)
-            saved += 1
-            print(f"  saved {unit_dir.name} -> {unit_dir}")
+    # ===== 逐 seam 渲染：跳过已 done 的；本进程最多渲 max_seams_per_proc 条（0=不限）=====
+    cap = args_cli.max_seams_per_proc
+    rendered_this_run = 0
+    for seam_npy in seam_paths:
+        if cap > 0 and rendered_this_run >= cap:
+            print(f"[main] 达到 --max-seams-per-proc={cap}，剩余 seam 留待续跑")
+            break
+        status = render_one_seam(seam_npy, sim, scene, mat_pick, joint_names,
+                                 retract_config, num_envs, part_stem, out_base)
+        if status != "skipped":
+            rendered_this_run += 1
 
-    print(f"[main] 完成，共保存 {saved} 个 pose 到 {out_root}")
+    # ===== 统计该 stem 完成情况，写外部哨兵（带 complete 标志）=====
+    out_root = out_base / part_stem
+    remaining = sum(
+        0 if (out_root / f"_DONE_{Path(s).stem}").exists() else 1
+        for s in seam_paths
+    )
+    complete = (remaining == 0)
+    print(f"[main] 本进程渲染 {rendered_this_run} 条 seam；该 stem 剩余未完成 {remaining} 条"
+          f"（complete={complete}）")
 
-    # 完成哨兵（鲁棒信号，不依赖 stdout/print）：渲染全部 pose 后写标记文件。
-    # 渲染进程随后会卡在 isaac 的 simulation_app.close()（不自退），多 GPU 调度器据此哨兵
-    # 判定本作业完成 → 强杀挂起进程 → 让该卡去跑下一个作业。
-    #   · 始终在输出目录写 out_root/_DONE_<seam_stem>（人可见、与作业一一对应；out_root 现为 part
-    #     级、同 part 多 seam 共用，故按 seam 命名防互相覆盖）；
-    #   · 若设了环境变量 RENDER_DONE_FILE，再额外写该路径——调度器用它做唯一、易轮询的
-    #     哨兵，免去在 shell 里重算 ascii obj_stem。两者都只在“全部 pose 落盘后”才写。
+    # 完成哨兵（鲁棒信号，不依赖 stdout/print）：渲染进程随后会卡在 isaac 的
+    # simulation_app.close()（不自退），多 GPU 调度器据此哨兵判定本作业可回收。
+    #   · complete=true → 整 stem 全部 seam 已落盘，调度器销账；
+    #   · complete=false → 因 cap 命中仍有 seam 未做，调度器据此重排该 stem 续跑。
+    # 始终写（即使 partial）；调度器读 complete 标志而非仅判文件存在。
     try:
-        (out_root / f"_DONE_{seam_stem}").write_text(f"saved={saved}\nout={out_root}\n")
         ext = os.environ.get("RENDER_DONE_FILE")
         if ext:
             ext_p = Path(ext)
             ext_p.parent.mkdir(parents=True, exist_ok=True)
-            ext_p.write_text(f"saved={saved}\nout={out_root}\n")
+            ext_p.write_text(
+                f"complete={'true' if complete else 'false'}\n"
+                f"remaining={remaining}\n"
+                f"done_this_run={rendered_this_run}\n"
+                f"out={out_root}\n"
+            )
     except Exception as e:  # 写标记失败不应影响已落盘的渲染结果
         print(f"[main] 写完成哨兵失败（渲染结果不受影响）：{e}")
 

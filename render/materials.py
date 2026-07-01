@@ -136,6 +136,14 @@ def bind_material_to_prim(prim_path, mdl_path, mat_prim_path,
     与 va_simulation 同流程：MdlFileCfg(mdl).func(mat_prim) -> bind_visual_material。
     """
     import isaaclab.sim as sim_utils
+    import omni.usd
+
+    # 同一进程渲多条 seam 时共用 stage，材质 prim 名按 (env, seam内pose序号) 命名会跨 seam
+    # 重名（每条 seam 的 gidx 都从 0 起）。spawn_from_mdl_file 遇到已存在的 prim 会抛
+    # ValueError，故先删掉残留的同名 prim，使绑定幂等。
+    stage = omni.usd.get_context().get_stage()
+    if stage.GetPrimAtPath(mat_prim_path).IsValid():
+        stage.RemovePrim(mat_prim_path)
 
     cfg = sim_utils.MdlFileCfg(mdl_path=mdl_path)
     cfg.func(mat_prim_path, cfg)

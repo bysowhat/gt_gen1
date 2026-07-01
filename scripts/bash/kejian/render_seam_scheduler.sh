@@ -1,29 +1,36 @@
 #!/usr/bin/env bash
 #
-# 多卡调度器：将 initpose_full/data 下所有 (npy, obj) 任务分配到 8 张 GPU 上执行。
+# 多卡调度器：将 initpose_full/data 下每个工件(stem)分配到 8 张 GPU 上执行。
 #
 # 原理：
-#   每个任务启动一个 render_seam.py 子进程，设置环境变量 RENDER_DONE_FILE 指向
-#   唯一的哨兵文件（/tmp/render_seam_done/<stem>_<seam_idx>.done）。
-#   render_seam.py 完成全部 pose 渲染后会写入该哨兵文件。
-#   调度器每 5 秒轮询一次哨兵文件，一旦出现就 kill 对应进程，把该卡标记为空闲，
-#   然后从队列取下一个任务分配给该卡。
+#   任务单元 = 一个工件(stem)。每个任务启动一个 render_seam.py 子进程，传 --seam-dir
+#   指向该工件目录，进程内一次性渲染其下全部 seam_*.npy（最多 --max-seams-per-proc 条），
+#   从而把 Isaac Sim 启动 / 建场景 / 材质编译等与 seam 无关的固定开销摊销到多条 seam 上。
+#   进程设环境变量 RENDER_DONE_FILE 指向唯一哨兵（/tmp/render_seam_done/<stem>.done），
+#   渲完后写入哨兵，内含：
+#     complete=true|false  remaining=<未完成 seam 数>  done_this_run=<本进程渲染条数>
+#   调度器每 5 秒轮询哨兵：出现即 kill 该进程释放显存；再据 complete 标志——
+#     complete=true  → 整工件完成，销账；
+#     complete=false → 因 cap 命中仍有 seam 未渲，把该工件重排回队列续跑（靠 render_seam.py
+#                      的 skip-on-resume 跳过已完成的 seam）。
+#   崩溃/超时(无完整哨兵)判失败，靠重跑本脚本时 skip-on-resume 增量补回。
 #
 # 用法：
 # cd /kpfs_dataset_ssd/dataset/baiyu/code/gt_gen_hanfeng
-# bash scripts/bash/kejian/render_seam_scheduler.sh
+# bash scripts/bash/kejian/render_seam_scheduler.sh [--max-envs N] [--max-seams-per-proc N] [--dry-run]
 
 set -euo pipefail
 
 # ===== 可调参数 =====
 NPY_DIR="/kpfs_dataset_ssd/dataset/render_kejian/initpose_full/data"
 OBJ_DIR="/kpfs_dataset_ssd/dataset/render_kejian/segment_output_sub"
-OUT_DIR="/kpfs_dataset_ssd/dataset/render_kejian/render_outs"
+OUT_DIR="/kpfs_dataset/dataset/render_kejian/render_outs"
 DONE_TMPDIR="/tmp/render_seam_done"
 NUM_GPUS=8
 POLL_INTERVAL=5          # 轮询间隔（秒）
-TASK_TIMEOUT=3000        # 单个任务超时（秒）
+TASK_TIMEOUT=8000        # 单个任务(一个工件、最多 MAX_SEAMS_PER_PROC 条 seam)超时（秒）
 MAX_ENVS=2               # --max-envs 默认值
+MAX_SEAMS_PER_PROC=8     # 单进程最多渲染多少条 seam 即退出（剩余由调度器重排续跑；0=不限）
 PYTHON_BIN="/workspace/isaaclab/_isaac_sim/python.sh"
 RENDER_SCRIPT="render/render_seam.py"
 DRY_RUN=false
@@ -33,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=true; shift ;;
         --max-envs) MAX_ENVS="$2"; shift 2 ;;
+        --max-seams-per-proc) MAX_SEAMS_PER_PROC="$2"; shift 2 ;;
         *) echo "未知参数: $1"; exit 1 ;;
     esac
 done
@@ -42,7 +50,7 @@ mkdir -p "$DONE_TMPDIR"
 
 # ===== 收集全部任务 =====
 echo "===== 收集任务列表 ====="
-tasks=()          # 每个元素: "stem|npy_path|obj_path|seam_idx"
+tasks=()          # 每个元素: "stem|stem_dir|obj_path"（一个工件一个任务，进程内渲其全部 seam）
 task_count=0
 
 for stem_dir in "$NPY_DIR"/*/; do
@@ -54,15 +62,20 @@ for stem_dir in "$NPY_DIR"/*/; do
         continue
     fi
 
-    for npy in "$stem_dir"seam_*.npy; do
-        [[ -f "$npy" ]] || continue
-        npy_name="${npy##*/}"; npy_name="${npy_name%.npy}"   # 如 seam_47，代替 basename
-        tasks+=("${stem}|${npy}|${obj_path}|${npy_name}")
-        task_count=$((task_count + 1))
-    done
+    # 该工件目录下至少要有一条 seam_*.npy 才算一个任务
+    shopt -s nullglob
+    seam_list=("$stem_dir"seam_*.npy)
+    shopt -u nullglob
+    if [[ ${#seam_list[@]} -eq 0 ]]; then
+        echo "  [跳过] 无 seam_*.npy: $stem_dir"
+        continue
+    fi
+
+    tasks+=("${stem}|${stem_dir%/}|${obj_path}")
+    task_count=$((task_count + 1))
 done
 
-echo "共收集到 $task_count 个任务"
+echo "共收集到 $task_count 个工件任务"
 echo ""
 
 if [[ $task_count -eq 0 ]]; then
@@ -73,8 +86,8 @@ fi
 if $DRY_RUN; then
     echo "===== [DRY RUN] 打印任务列表（前 20 个）====="
     for ((i=0; i<task_count && i<20; i++)); do
-        IFS='|' read -r stem npy_path obj_path seam_idx <<< "${tasks[$i]}"
-        echo "  [$i] stem=$stem  seam=$seam_idx  npy=$npy_path  obj=$obj_path"
+        IFS='|' read -r stem stem_dir obj_path <<< "${tasks[$i]}"
+        echo "  [$i] stem=$stem  dir=$stem_dir  obj=$obj_path"
     done
     if [[ $task_count -gt 20 ]]; then
         echo "  ... 还有 $((task_count - 20)) 个任务未显示"
@@ -82,10 +95,10 @@ if $DRY_RUN; then
     echo ""
     echo "===== 命令预览（前 3 个）====="
     for ((i=0; i<task_count && i<3; i++)); do
-        IFS='|' read -r stem npy_path obj_path seam_idx <<< "${tasks[$i]}"
-        done_file="$DONE_TMPDIR/${stem}__${seam_idx}.done"
+        IFS='|' read -r stem stem_dir obj_path <<< "${tasks[$i]}"
+        done_file="$DONE_TMPDIR/${stem}.done"
         echo "RENDER_DONE_FILE=$done_file \\"
-        echo "  $PYTHON_BIN $RENDER_SCRIPT --obj '$obj_path' --seam-npy '$npy_path' --out '$OUT_DIR' --max-envs=$MAX_ENVS --headless"
+        echo "  $PYTHON_BIN $RENDER_SCRIPT --obj '$obj_path' --seam-dir '$stem_dir' --out '$OUT_DIR' --max-envs=$MAX_ENVS --max-seams-per-proc=$MAX_SEAMS_PER_PROC --headless"
         echo ""
     done
     exit 0
@@ -97,8 +110,10 @@ declare -A gpu_done_file # gpu_id -> 对应哨兵文件路径
 declare -A gpu_task_idx  # gpu_id -> 任务在 tasks 数组中的索引
 declare -A gpu_start_time # gpu_id -> 任务启动时间戳 (epoch seconds)
 next_task=0               # 下一个待分配任务的索引
-finished=0                # 已完成任务数
+finished=0                # 已完成工件数（整 stem 全部 seam 渲完）
 failed=0                  # 失败/超时任务数
+requeued=0                # 因 cap 命中被重排续跑的次数
+total_stems=$task_count   # 工件总数（tasks 会因续跑动态增长，用它做进度分母）
 
 # ===== 清理函数 =====
 cleanup() {
@@ -124,22 +139,23 @@ launch_task() {
     local task_str="$2"
     local task_idx="$3"
 
-    IFS='|' read -r stem npy_path obj_path seam_idx <<< "$task_str"
+    IFS='|' read -r stem stem_dir obj_path <<< "$task_str"
 
-    local done_file="$DONE_TMPDIR/${stem}__${seam_idx}.done"
+    local done_file="$DONE_TMPDIR/${stem}.done"
     # 先删掉可能残留的旧哨兵
     rm -f "$done_file"
 
-    local log_file="$OUT_DIR/logs/${stem}__${seam_idx}.log"
+    local log_file="$OUT_DIR/logs/${stem}.log"
     mkdir -p "$(dirname "$log_file")" "$OUT_DIR"
 
-    echo "  [GPU $gpu_id] 启动: $stem / $seam_idx"
-    echo "    npy: $npy_path"
+    echo "  [GPU $gpu_id] 启动工件: $stem"
+    echo "    dir: $stem_dir"
     echo "    obj: $obj_path"
     echo "    log: $log_file"
 
-    # 在后台启动 render_seam.py，通过 CUDA_VISIBLE_DEVICES 绑定 GPU
-    # RENDER_DONE_FILE 是哨兵文件，render_seam.py 完成后会写入
+    # 在后台启动 render_seam.py，通过 CUDA_VISIBLE_DEVICES 绑定 GPU。
+    # 进程内渲染该工件 --seam-dir 下全部 seam（最多 --max-seams-per-proc 条），跑完写
+    # RENDER_DONE_FILE 哨兵（内含 complete 标志）。
     #
     # 用 setsid 让 python.sh 成为新进程组的组长，这样它 fork 出来的真正的
     # Isaac Sim 进程 (python_exe) 与它同组。后面杀任务时按"进程组"杀，
@@ -150,9 +166,10 @@ launch_task() {
         export RENDER_DONE_FILE="$done_file"
         exec setsid "$PYTHON_BIN" "$RENDER_SCRIPT" \
             --obj "$obj_path" \
-            --seam-npy "$npy_path" \
+            --seam-dir "$stem_dir" \
             --out "$OUT_DIR" \
             --max-envs="$MAX_ENVS" \
+            --max-seams-per-proc="$MAX_SEAMS_PER_PROC" \
             --headless \
             > "$log_file" 2>&1
     ) &
@@ -171,14 +188,19 @@ finish_gpu_task() {
     local gpu_id="$1"
     local pid="${gpu_pid[$gpu_id]}"
     local done_file="${gpu_done_file[$gpu_id]}"
-    local task_str="${tasks[${gpu_task_idx[$gpu_id]}]}"
+    local task_idx="${gpu_task_idx[$gpu_id]}"
+    local task_str="${tasks[$task_idx]}"
 
-    IFS='|' read -r stem npy_path obj_path seam_idx <<< "$task_str"
+    IFS='|' read -r stem stem_dir obj_path <<< "$task_str"
 
-    # 检查哨兵文件内容
+    # 读哨兵内容里的 complete 标志：true=整工件全部 seam 渲完；false=因 cap 命中仍有剩余
+    local complete="true"
+    local remaining="0"
     if [[ -f "$done_file" ]]; then
-        echo "  [GPU $gpu_id] 哨兵文件已写入，任务完成: $stem / $seam_idx"
-        cat "$done_file" | while read -r line || [[ -n "$line" ]]; do echo "    $line"; done
+        complete="$(grep -m1 '^complete=' "$done_file" | cut -d= -f2)"
+        remaining="$(grep -m1 '^remaining=' "$done_file" | cut -d= -f2)"
+        [[ -z "$complete" ]] && complete="true"   # 兜底（旧格式无该字段视为完成）
+        echo "  [GPU $gpu_id] 哨兵已写入: $stem (complete=$complete, remaining=$remaining)"
     fi
 
     # 强杀进程（simulation_app.close() 会卡住）
@@ -198,8 +220,16 @@ finish_gpu_task() {
     unset gpu_task_idx[$gpu_id]
     unset gpu_start_time[$gpu_id]
 
-    finished=$((finished + 1))
-    echo "  [GPU $gpu_id] 已释放（进度: $finished / $task_count）"
+    if [[ "$complete" == "true" ]]; then
+        finished=$((finished + 1))
+        echo "  [GPU $gpu_id] 工件完成并释放（完成: $finished / $total_stems, 续跑重排: $requeued, 失败: $failed）"
+    else
+        # 因 cap 命中、仍有 seam 未渲 → 把该工件任务追加回队列续跑（下一轮某卡接手，
+        # 靠 skip-on-resume 跳过已完成的 seam）。每次续跑必然有进展，故收敛。
+        tasks+=("$task_str")
+        requeued=$((requeued + 1))
+        echo "  [GPU $gpu_id] 工件未完（剩 $remaining 条 seam）→ 重排续跑（续跑重排累计: $requeued）"
+    fi
 }
 
 # ===== 强行终止某个卡上的任务（超时或进程已死）=====
@@ -210,14 +240,14 @@ kill_gpu_task() {
     local done_file="${gpu_done_file[$gpu_id]}"
     local task_str="${tasks[${gpu_task_idx[$gpu_id]}]}"
 
-    IFS='|' read -r stem npy_path obj_path seam_idx <<< "$task_str"
+    IFS='|' read -r stem stem_dir obj_path <<< "$task_str"
     local elapsed=$(( $(date +%s) - ${gpu_start_time[$gpu_id]} ))
 
-    echo "  [GPU $gpu_id] ${reason}: $stem / $seam_idx (已运行 ${elapsed}s)"
+    echo "  [GPU $gpu_id] ${reason}: $stem (已运行 ${elapsed}s)"
 
     # 进程意外退出（崩溃）时，把对应日志尾部打出来，便于直接看到崩因
     if [[ "$reason" == *意外退出* ]]; then
-        local log_file="$OUT_DIR/logs/${stem}__${seam_idx}.log"
+        local log_file="$OUT_DIR/logs/${stem}.log"
         if [[ -f "$log_file" ]]; then
             echo "  [GPU $gpu_id] ---- 日志尾部 ($log_file) ----"
             tail -n 20 "$log_file" | while read -r line || [[ -n "$line" ]]; do echo "    $line"; done
@@ -249,24 +279,25 @@ kill_gpu_task() {
 # ===== 主循环 =====
 echo "===== 开始调度 ($(date)) ====="
 echo "GPU 数量: $NUM_GPUS"
-echo "总任务数: $task_count"
+echo "工件任务数: $task_count"
+echo "单进程 seam 上限: $MAX_SEAMS_PER_PROC"
 echo "输出目录: $OUT_DIR"
 echo "哨兵目录: $DONE_TMPDIR"
 echo "轮询间隔: ${POLL_INTERVAL}s"
 echo ""
 
-while [[ $((finished + failed)) -lt $task_count ]]; do
+while true; do
     now_ts=$(date +%s)
 
-    # 1. 检查哪些 GPU 空闲，分配新任务
+    # 1. 检查哪些 GPU 空闲，分配新任务（用动态队列长度 ${#tasks[@]} 做上界，含续跑重排进来的）
     for ((gpu_id=0; gpu_id<NUM_GPUS; gpu_id++)); do
-        if [[ -z "${gpu_pid[$gpu_id]+x}" ]] && [[ $next_task -lt $task_count ]]; then
+        if [[ -z "${gpu_pid[$gpu_id]+x}" ]] && [[ $next_task -lt ${#tasks[@]} ]]; then
             launch_task "$gpu_id" "${tasks[$next_task]}" "$next_task"
             next_task=$((next_task + 1))
         fi
     done
 
-    # 2. 检查已运行的 GPU 是否完成（哨兵文件出现）
+    # 2. 检查已运行的 GPU 是否完成（哨兵文件出现）；finish 内部据 complete 标志决定销账或重排
     for gpu_id in "${!gpu_pid[@]}"; do
         done_file="${gpu_done_file[$gpu_id]}"
         if [[ -f "$done_file" ]]; then
@@ -290,13 +321,13 @@ while [[ $((finished + failed)) -lt $task_count ]]; do
         fi
     done
 
-    # 5. 如果全部完成了，退出循环
-    if [[ $((finished + failed)) -ge $task_count ]]; then
+    # 5. 终止条件：队列已分配完（含续跑重排）且无 GPU 在跑
+    if [[ $next_task -ge ${#tasks[@]} ]] && [[ ${#gpu_pid[@]} -eq 0 ]]; then
         break
     fi
 
     # 6. 如果所有卡都忙或已无待分配任务，等待后重试
-    if [[ ${#gpu_pid[@]} -ge $NUM_GPUS ]] || [[ $next_task -ge $task_count ]]; then
+    if [[ ${#gpu_pid[@]} -ge $NUM_GPUS ]] || [[ $next_task -ge ${#tasks[@]} ]]; then
         sleep "$POLL_INTERVAL"
     else
         # 有空闲卡且有任务但分配不上？可能是刚释放的，短暂 sleep 防抖
@@ -310,10 +341,11 @@ rm -f "$DONE_TMPDIR"/*.done
 
 echo ""
 echo "===== 全部完成！($(date)) ====="
-echo "总任务数: $task_count"
-echo "成功: $finished"
+echo "工件总数: $total_stems"
+echo "成功(整工件完成): $finished"
+echo "续跑重排次数: $requeued"
 echo "失败/超时: $failed"
 echo "输出目录: $OUT_DIR"
 if [[ $failed -gt 0 ]]; then
-    echo "⚠️  有 $failed 个任务未完成，请检查对应日志。"
+    echo "⚠️  有 $failed 个工件任务未完成（崩溃/超时），请检查对应日志；重跑本脚本会靠 skip-on-resume 增量补回。"
 fi
