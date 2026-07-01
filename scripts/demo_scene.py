@@ -32,8 +32,7 @@ def _make_scene(args):
     from gt_gen.scene import Scene
     scene = Scene(cfg="configs/default.yaml",
                  workpiece_obj=args.obj,
-                 weld_json=args.weld_json,
-                 seam_id=args.seam_id)
+                 weld_json=args.weld_json)
     return scene
 
 def demo_init_pose(args):
@@ -81,34 +80,28 @@ def demo_obstacle_type3(args):
 def demo_main(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
-    # scene = _make_scene(args)
-    # scene._set_cur_seam(9)
-    # scene.add_obstacle_type2()
-    # scene.plan_init_pose()
-    # scene.set_init_pose(0)
-    # scene.compute_goal_pose()
-    # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    scene = _make_scene(args)
+    scene._set_cur_seam(9)
+    scene.add_obstacle_type2()
+    scene.plan_init_pose()
+    scene.set_init_pose(0)
+    scene.compute_goal_pose()
+    # scene.plan_explore_path(goal_index=0)     # 边走边看规划到 goal pose[0]（起点=当前关节角，缺省 retract）
+    # scene.save('/kpfs_dataset_ssd/tempt/scene2.pkl')
+    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
 
-    from gt_gen.scene import Scene
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless)
-
-
-    # if not scene.init_pose_candidates:
-    #     print("[demo] 求解失败：无候选初始位姿")
-    #     return
-    # n_fore = sum(1 for c in scene.init_pose_candidates if c.hand == "forehand")
-    # n_back = sum(1 for c in scene.init_pose_candidates if c.hand == "backhand")
-    # print(f"[demo] 候选初始位姿 {len(scene.init_pose_candidates)} 个（正手 {n_fore} / 反手 {n_back}）")
-    
-    # Open3DSceneVisualizer(scene).show_init_poses()
+    # from gt_gen.scene import Scene
+    # # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    # scene = Scene.load('/media/a/新加卷/tempt/4/1/scene1.pkl')
+    # # scene = Scene.load('/kpfs_dataset_ssd/tempt/scene1.pkl')
+    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless)
+    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(headless=args.headless)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Scene API demo：初始位姿求解 / 障碍物类型2 / 障碍物类型3 + isaacsim 可视化")
     ap.add_argument("--obj", default=DEFAULT_OBJ, help="工件 mesh（_part.obj / _watertight.obj）")
     ap.add_argument("--weld-json", default=DEFAULT_WELD_JSON, help="焊缝 _weld_angle3.json")
-    ap.add_argument("--seam-id", type=int, default=1, help="用 weld_json 中的第几条焊缝")
     ap.add_argument("--headless", action="store_true", help="无显示器自检：spawn 后跑几帧即退")
     args = ap.parse_args()
 

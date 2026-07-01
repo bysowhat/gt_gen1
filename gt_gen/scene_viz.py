@@ -90,7 +90,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         return _factory
 
-    def show_scene_isaacsim(self, headless: bool = False, goal_variant: int = 0):
+    def show_scene_isaacsim(self, headless: bool = False, goal_variant: int = 0,
+                            trajectory=None, fps: int = 30):
         """用 **isaacsim** 可视化当前 3D 场景：工件 + 障碍物（如有）+ 机械臂 + goal pose（如有）+ 当前焊缝红线（如有）。
 
         两种坐标系，取决于是否已 Scene.set_init_pose(index) 选定当前 init pose：
@@ -100,6 +101,10 @@ class Open3DSceneVisualizer(SceneVisualizer):
             T_workpiece_in_base 摆到 base 系；障碍/当前焊缝红线/goal pose 视锥都随同一 T 变换后叠加。
             goal pose（若已 compute_goal_pose）以相机视锥（青→黄渐变）画出，cam_pose 经 T 从工件系变到 base 系；
             并在每个 goal pose 处放一个【真实 UsdGeom.Camera】（FOV 匹配视锥，看向焊缝），共 B 个。
+
+        trajectory（可选，(T,DOF) 关节角序列，仅 base 系有意义）：给定则机械臂沿该序列【逐帧回放】
+        （首尾各补 30 帧静止、播完保持 fps*2 帧后循环），用于看 plan_explore_path 的边走边看 GT；
+        None 时保持原静态显示。fps=回放帧率。一般经 show_trajectory_isaacsim 转调，不直接传。
 
         障碍以 Box 原语（open_box）与棱柱/圆筒 mesh（遮挡板 / open_cylinder）两种形态渲染，颜色取各
         ObstacleSpec.color。须在【未初始化 curobo/torch】的干净进程里调用（SimulationApp 要最先启动）。
@@ -301,9 +306,15 @@ class Open3DSceneVisualizer(SceneVisualizer):
             try:
                 from gt_gen import compat as _compat  # noqa: F401  warp shim（须在 curobo 前）
                 from curobo.util_file import load_yaml
-                CUROBO_ISAAC = "/home/a/Projects/Github/curobo/examples/isaac_sim"
-                if CUROBO_ISAAC not in sys.path:
-                    sys.path.insert(0, CUROBO_ISAAC)
+                import curobo as _curobo
+                # helper.py 在 curobo 的 examples/isaac_sim（不在包内）。从 curobo 包位置推该目录，
+                # 跨机器通用（本地 /home/a/...、远程 /kpfs_dataset/.../curobo）；本地路径留作回退。
+                _curobo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(_curobo.__file__))))          # .../curobo/src/curobo → .../curobo
+                for _isaac in (os.path.join(_curobo_root, "examples", "isaac_sim"),
+                               "/home/a/Projects/Github/curobo/examples/isaac_sim"):
+                    if os.path.isdir(_isaac) and _isaac not in sys.path:
+                        sys.path.insert(0, _isaac)
                 from helper import add_robot_to_scene
                 robot_cfg = load_yaml(scene.cfg.robot_cfg_path)["robot_cfg"]
                 robot, _ = add_robot_to_scene(robot_cfg, world)
@@ -355,13 +366,17 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         world.reset()
 
-        # 机械臂 retract 起始角
+        # 机械臂起始角：给了 trajectory 用其首帧，否则 retract 起始角（idx_list 供回放复用）
+        n_dof = len(scene.cfg.joint_names)
+        traj = None if trajectory is None else np.asarray(trajectory, float).reshape(-1, n_dof)
+        idx_list = None
         if robot is not None:
             try:
                 if hasattr(robot, "initialize"):
                     robot.initialize()
                 idx_list = [robot.get_dof_index(j) for j in scene.cfg.joint_names]
-                robot.set_joint_positions(np.asarray(scene.cur_cfg, float), idx_list)
+                q0 = traj[0] if traj is not None else np.asarray(scene.cur_cfg, float)
+                robot.set_joint_positions(q0, idx_list)
             except Exception as e:
                 print(f"[viz] 机械臂设关节角失败（忽略）: {e}")
 
@@ -369,7 +384,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
             for _ in range(3):
                 world.step(render=False)
             print(f"已 spawn 工件 + {len(obstacles)} 个障碍" +
-                  (f" + 机械臂(retract) + {n_goal} 个 goal 视锥 + {n_goal} 个真实相机" if base_frame else "") + "。")
+                  (f" + 机械臂(retract) + {n_goal} 个 goal 视锥 + {n_goal} 个真实相机" if base_frame else "") +
+                  (f" + 轨迹 {traj.shape[0]} 路点（逐帧回放）" if traj is not None else "") + "。")
             print("VIZ_SCENE_DONE")
             simulation_app.close()
             return
@@ -379,12 +395,67 @@ class Open3DSceneVisualizer(SceneVisualizer):
             _set_lighting_mode("Grey Studio")
         except Exception:
             pass
+
+        # —— 有轨迹：逐帧回放（首尾补静止帧、播完保持后循环）——
+        if traj is not None and robot is not None and idx_list is not None:
+            pad = np.concatenate([np.tile(traj[0][None], (30, 1)), traj,
+                                  np.tile(traj[-1][None], (30, 1))], axis=0)
+            print(f"回放边走边看轨迹（{pad.shape[0]} 帧，含首尾静止；base 系：机械臂沿 GT 运动 + "
+                  f"工件 + 障碍 + goal 视锥；关闭窗口结束）。")
+            i = hold = 0
+            while simulation_app.is_running():
+                world.step(render=True)
+                if not world.is_playing():
+                    continue
+                if i < pad.shape[0]:
+                    robot.set_joint_positions(pad[i], idx_list)
+                    i += 1
+                else:
+                    hold += 1
+                    if hold > int(fps) * 2:
+                        i = hold = 0
+            simulation_app.close()
+            return
+
         print("播放中（关闭窗口结束）。" +
               ("base 系：机械臂 retract + 工件 + 障碍 + 焊缝红线 + goal 视锥。" if base_frame
                else "mesh 系：工件 + 障碍 + 焊缝红线（未设 init pose，无机械臂）。"))
         while simulation_app.is_running():
             world.step(render=True)
         simulation_app.close()
+
+    def show_trajectory_isaacsim(self, traj_index: int = -1, headless: bool = False,
+                                 fps: int = 30, goal_variant: int = 0):
+        """用 **isaacsim** 回放【边走边看轨迹】（Scene.plan_explore_path 产出）。
+
+        base 系里机械臂沿 GT 关节序列逐帧运动，同屏显示工件 + 障碍物 + goal 观测视锥/真实相机
+        （复用 show_scene_isaacsim(trajectory=...)，故场景摆放与那套完全一致）。参考 launch.json 的
+        viz_placed_obstacle_isaacsim：首尾补静止帧、播完循环重播。
+
+        前提：先 plan_explore_path（其内部要求已 set_init_pose，故必为 base 系、会画机械臂）。跨进程时
+        先 Scene.save→另起干净进程 Scene.load 再调用（compute/plan 会污染 warp，见 save/load 说明）。
+
+        参数：
+          traj_index  : self.scene.trajectories 里第几条（默认 -1=最新；支持负索引）。
+          headless    : 无显示器自检（spawn+跑几帧即退，打印路点数 + VIZ_SCENE_DONE）。
+          fps         : 回放帧率。
+          goal_variant: 画 goal 视锥用 cam_pose 的第几个变体 K（默认 0）。
+        """
+        import numpy as np
+
+        trajs = list(getattr(self.scene, "trajectories", []) or [])
+        if not trajs:
+            raise RuntimeError("无可回放轨迹：请先 Scene.plan_explore_path()")
+        n = len(trajs)
+        if not (-n <= int(traj_index) < n):
+            raise IndexError(f"traj_index 越界：{traj_index}，共 {n} 条轨迹")
+        entry = trajs[int(traj_index)]
+        positions = np.asarray(entry["positions"], float)
+        print(f"[viz] 回放轨迹 #{int(traj_index) % n}/{n}：status={entry.get('status')} "
+              f"路点={len(positions)} goal=观测位姿#{entry.get('goal_index')}"
+              f"（变体#{entry.get('variant')}）")
+        self.show_scene_isaacsim(headless=headless, goal_variant=goal_variant,
+                                 trajectory=positions, fps=fps)
 
 
 class IsaacSimSceneVisualizer(SceneVisualizer):

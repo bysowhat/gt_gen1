@@ -301,7 +301,6 @@ class Scene:
                  cfg,
                  workpiece_obj: str,
                  weld_json: str,
-                 seam_id: int,
                  workpiece_pose: Optional[np.ndarray] = None,
                  goal_user: Optional[tuple] = None):
         cfg = load_config(cfg)
@@ -310,7 +309,6 @@ class Scene:
         self.cfg: Config = cfg
         self.workpiece_obj: str = workpiece_obj      # 工件 mesh（_watertight.obj）
         self.weld_json: str = weld_json              # 焊缝信息文件（_weld_angle3.json）
-        self.seam_id: int = int(seam_id)             # 用 weld_json 中的第几条焊缝
         # 焊缝信息：load_welds 解析的 weld dict（p0/p1/mid/bisector/boundary_dirs/raw…）
         self.seams: dict = self._load_seam()
         # 工件在 base 系下的 pose（pose7）；构造期可由用户给定（plan_init_pose 不再自动选 best 回填，
@@ -324,6 +322,7 @@ class Scene:
         self.cur_init_pose: Optional[InitPoseCandidate] = None    # 当前选定的 init pose 候选（set_init_pose 设定）——定义工件↔base 摆放
         self.cur_init_index: Optional[int] = None                 # 当前候选在 init_pose_candidates 中的下标
         self.goal_poses: list = []           # compute_goal_pose 产出的观测位姿结果（list[dict]，含 cam_pose 等）
+        self.trajectories: list = []         # plan_explore_path 产出的边走边看轨迹（list[dict]，含 positions/status 等）
         self.obstacles: list = []            # 已放障碍（ObstacleSpec）——后续
         self.truth_scene = None              # 工件+障碍（base 系）trimesh，raycast 几何源——后续
         self.voxmap = None                   # 三态记忆 ThreeStateVoxelMap——后续
@@ -360,6 +359,7 @@ class Scene:
     def _set_cur_seam(self, seam_id):
         # self._clear_scene()#todo
         self.seam = self.seams[seam_id]  
+        self.seam_id = seam_id
     
 
     # ------------------------------------------------------------------
@@ -610,6 +610,7 @@ class Scene:
             cur_init_index=self.cur_init_index,
             obstacles=self.obstacles,                  # ObstacleSpec（dataclass；prims=Box、meshes=dict）
             goal_poses=[{k: _to_np(v) for k, v in r.items()} for r in self.goal_poses],
+            trajectories=list(self.trajectories),      # 边走边看轨迹（positions 等均 numpy，可直接 pickle）
         )
         d = os.path.dirname(os.path.abspath(path))
         if d:
@@ -618,6 +619,7 @@ class Scene:
             pickle.dump(state, f)
         print(f"[scene] 已保存 → {path}（候选 {len(self.init_pose_candidates)}，"
               f"障碍 {len(self.obstacles)}，goal_poses {len(self.goal_poses)}，"
+              f"轨迹 {len(self.trajectories)}，"
               f"当前 init pose={'#%d' % self.cur_init_index if self.cur_init_index is not None else '未设'}）")
         return path
 
@@ -633,9 +635,10 @@ class Scene:
         with open(path, "rb") as f:
             state = pickle.load(f)
         self = cls(cfg=state["cfg"], workpiece_obj=state["workpiece_obj"],
-                   weld_json=state["weld_json"], seam_id=state["seam_id"])
+                   weld_json=state["weld_json"])
         if state.get("seam") is not None:
             self.seam = state["seam"]
+            self.seam_id = state["seam_id"]
         self.workpiece_pose = state.get("workpiece_pose")
         self.goal_user = state.get("goal_user")
         self.cur_cfg = list(state.get("cur_cfg", self.cur_cfg))
@@ -644,8 +647,10 @@ class Scene:
         self.cur_init_index = state.get("cur_init_index")
         self.obstacles = state.get("obstacles", []) or []
         self.goal_poses = state.get("goal_poses", []) or []
+        self.trajectories = state.get("trajectories", []) or []   # 旧 pkl 无此键 → 空
         print(f"[scene] 已加载 ← {path}（候选 {len(self.init_pose_candidates)}，"
               f"障碍 {len(self.obstacles)}，goal_poses {len(self.goal_poses)}，"
+              f"轨迹 {len(self.trajectories)}，"
               f"当前 init pose={'#%d' % self.cur_init_index if self.cur_init_index is not None else '未设'}）")
         return self
 
@@ -772,6 +777,141 @@ class Scene:
                   f"joints {tuple(joints.shape)}（障碍并入={want_obs}）")
         self.goal_poses = results
         return results
+
+    def plan_explore_path(self,
+                          goal_index: int = 0,
+                          cur_joints=None,
+                          variant: int = 0,
+                          include_obstacles: bool = True,
+                          device: str = None) -> dict:
+        """从【当前机械臂关节角】边走边看规划一条到 goal pose[goal_index] 的探索轨迹（GT）。
+
+        忠实复用 scripts/place_obstacles_to_gt.py 的主体（gt_gen.main_loop.generate_gt，一行不改），
+        只把它「读 npz → 建世界 → 跑主循环」的流程包成 Scene 方法，数据源改为本 Scene：
+          · h_truth（MESH 真值世界，全知教练）= 工件 mesh + 已放障碍实体（_obstacle_solid_trimeshes），
+            都按【当前 init pose】的 workpiece_pose7 摆到 base 系；
+          · h_expl（VOXEL 三态探索世界）+ 三态体素图 vm + 初始 FREE 圆柱（冷启动立足之地，落在起点末端处）；
+          · truth_scene（base 系 trimesh，raycast 几何源）= 工件 + 障碍 合并（同一 T_workpiece_in_base）；
+          · goal_pose = FK(joints[variant, goal_index])——compute_goal_pose 求得的第 variant 个变体、
+            第 goal_index 个观测位姿对应【可达构型】的末端 standoff 位姿（base 系，自洽可达）。
+        机械臂从 cur_joints（缺省=self.cur_cfg，通常 retract）起步，只敢走「亲眼看过是空的」区域，
+        边走边拍、已知区像水面扩大，直到规划到 goal（reached）或触发主循环终止条件。
+
+        实现上把起点喂给 generate_gt 的办法：generate_gt 固定从 cfg.retract_config 起步，这里在
+        调用期间【临时把 cfg 的 retract_config 覆盖为 cur_joints】（结束即还原），不改 main_loop 一行。
+
+        前提：先 set_init_pose(index)（定义工件↔base 摆放）+ compute_goal_pose（求 goal 观测位姿序列）。
+        ⚠ 会 import/初始化 warp+curobo，污染本进程；须在【未启动 SimulationApp 的进程】里调用。
+          可视化：本方法后 scene.save(path)，另起干净进程 Scene.load 再 show_trajectory_isaacsim。
+
+        参数：
+          goal_index       : goal pose 序列（B 个覆盖观测位姿）里第几个作为终点（支持负索引）。
+          cur_joints       : 机械臂当前关节角（rad，list/ndarray，长度=DOF）；None→用 self.cur_cfg。
+          variant          : cam_pose/joints 的第几个变体 K（默认 0）。
+          include_obstacles: 真值世界是否并入已放障碍（默认 True；open_cylinder 纯视觉不并入）。
+          device           : cuda/cpu（None→cfg.compute_goal_pose.device 或 'cuda'）。
+        返回 dict（同时 append 进 self.trajectories）：
+          {positions(T,DOF), status, goal_index, variant, cur_joints, goal_pose, info}。
+        """
+        if self.cur_init_pose is None:
+            raise RuntimeError("plan_explore_path 需要当前 init pose：请先 set_init_pose(index)")
+        if not self.goal_poses:
+            raise RuntimeError("plan_explore_path 需要 goal pose：请先 compute_goal_pose()")
+
+        import trimesh as _trimesh
+        import gt_gen.compat as _compat  # noqa: F401  warp shim（须在 import curobo 前）
+        _compat.apply_trimesh_shim()
+
+        # compute_goal_pose 的 ES 优化器（num_envs≈800）此时已出作用域；显式回收显存，
+        # 否则同进程接着建 h_truth+h_expl 两个 MotionGen 易 CUDA OOM（小显存卡尤甚）。
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        from gt_gen import curobo_iface as ci
+        from gt_gen.voxmap import build_roi_voxmap
+        from gt_gen.sensor import load_camera_model, load_truth_scene
+        from gt_gen.init_free import set_initial_free_cylinder
+        from gt_gen.main_loop import generate_gt
+        from curobo.geom.types import WorldConfig, Mesh as CuMesh
+        from curobo.geom.sdf.world import CollisionCheckerType
+
+        # —— goal joints：compute_goal_pose 的 joints[variant, goal_index]（形如 (K,B,DOF)） ——
+        res = self.goal_poses[0]
+        jt = res["joints"]
+        joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
+        K, B = joints.shape[:2]
+        vi = max(0, min(int(variant), K - 1))
+        gi = int(goal_index)
+        if not (-B <= gi < B):
+            raise IndexError(f"goal_index 越界：{goal_index}，该序列共 {B} 个观测位姿")
+        goal_joints = np.asarray(joints[vi, gi], float).tolist()
+
+        if device is None:
+            device = str(self.cfg.raw.get("compute_goal_pose", {}).get("device", "cuda"))
+
+        # —— 起点关节角（缺省=self.cur_cfg）；临时覆盖 cfg.retract_config，使 generate_gt 从此起步 ——
+        start = [float(v) for v in (self.cur_cfg if cur_joints is None else cur_joints)]
+        kin = self.cfg.robot_cfg["robot_cfg"]["kinematics"]
+        old_retract = list(kin["cspace"]["retract_config"])
+        kin["cspace"]["retract_config"] = list(start)
+        try:
+            # —— base 系摆放：工件 + 障碍实体（顶点在工件 mesh 系）按 workpiece_pose7 一起摆到 base 系 ——
+            wp_pose7 = np.asarray(self.cur_init_pose.workpiece_pose7, float).tolist()
+            T = np.asarray(self.cur_init_pose.T_workpiece_in_base, float)
+
+            obs_tms = self._obstacle_solid_trimeshes() if include_obstacles else []
+            meshes = [CuMesh(name="workpiece", file_path=self.workpiece_obj, pose=wp_pose7)]
+            if obs_tms:
+                merged = _trimesh.util.concatenate(obs_tms)
+                meshes.append(CuMesh(
+                    name="obstacles",
+                    vertices=np.asarray(merged.vertices, float).tolist(),
+                    faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
+                    pose=wp_pose7))                          # 障碍与工件同 pose → 一并进 base 系
+            world = WorldConfig(mesh=meshes)                 # MESH 真值世界（工件+障碍）
+
+            print(f"[scene] plan_explore_path：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
+            h_truth = ci.init_curobo(self.cfg, world_model=world,
+                                     collision_checker_type=CollisionCheckerType.MESH,
+                                     position_threshold=0.05, rotation_threshold=0.5)
+            print("[scene] plan_explore_path：建 h_expl（VOXEL 三态）...")
+            h_expl = ci.init_curobo(self.cfg)
+
+            # truth_scene（base 系 trimesh）：工件 + 障碍（同一 T 变到 base 系）
+            work_mesh = load_truth_scene(self.workpiece_obj, mesh_pose=wp_pose7)
+            tms = [work_mesh]
+            for tm in obs_tms:
+                tmc = tm.copy()
+                tmc.apply_transform(T)                       # 工件 mesh 系 → base 系（与工件同一 T）
+                tms.append(tmc)
+            truth_scene = _trimesh.util.concatenate(tms) if len(tms) > 1 else work_mesh
+
+            # goal_pose：FK(goal_joints) → base 系末端 standoff 目标（可达且自洽）
+            eep, eeq, _ = ci.fk(h_truth, goal_joints)
+            goal_pose = (eep.tolist(), eeq.tolist())
+            print(f"[scene] goal=FK(观测位姿#{gi}/{B} 变体#{vi}/{K}) pos={np.round(eep, 3)}")
+
+            cam = load_camera_model(self.cfg)
+            vm = build_roi_voxmap(self.cfg)
+            n_free = set_initial_free_cylinder(h_truth, vm, config=self.cfg)  # 起点末端周围罩 FREE
+            print(f"[scene] 初始 FREE 体素={n_free}；开跑 generate_gt 主循环（边走边看）...")
+
+            # world_plan=world：backend=stomp 时步② 规划 P* 需要 MESH 世界（真实尺寸，无 buffer）
+            GT, status, info = generate_gt(h_truth, h_expl, vm, truth_scene, goal_pose,
+                                           camera_model=cam, world_plan=world)
+        finally:
+            kin["cspace"]["retract_config"] = old_retract    # 还原，避免污染后续调用
+
+        positions = np.asarray([np.asarray(q, float) for q in GT])
+        entry = dict(positions=positions, status=status, goal_index=gi, variant=vi,
+                     cur_joints=np.asarray(start, float), goal_pose=goal_pose, info=info)
+        self.trajectories.append(entry)
+        print(f"[scene] plan_explore_path 完成：status={status} 路点={len(positions)} "
+              f"（第 {len(self.trajectories)} 条轨迹）")
+        return entry
 
     def _inject_obstacles_into_scenepose2(self, scene2):
         """把当前障碍实体（工件 mesh 系）按 piece->base_link 位姿一起并进 ScenePose2 的 cuRobo 碰撞世界。
