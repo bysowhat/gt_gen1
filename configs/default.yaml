@@ -1,10 +1,10 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
 robot:                                  # 决策 B
-  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
-  # usd_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/robot_description_wo_cam_cover.usd"
-  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
-  usd_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/robot_description_wo_cam_cover.usd"
+  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
+  usd_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/robot_description_wo_cam_cover.usd"
+  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
+  # usd_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/robot_description_wo_cam_cover.usd"
   # 新版机械臂(2026-06-26)：base=a1_ground_rail_platform, accessory=No012_TRM651, cable=No001_12ebarket。
   # 由 scripts/build_robot_from_xacro_pkg.py 从 urdf_12e_260626/xiaoyu_description 离线生成(碰撞球 CPU 拟合)。
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
@@ -251,31 +251,55 @@ params:
   swept:
     interp_resolution_m: 0.01           # 扫掠体积插值精度（Step 6）
 
-obstacle_placement:                     # 沿「关键 link 扫掠走廊」自动放障碍（见 docs/障碍物位置.md）
-  # 底层 place_in_corridor 按参数（link/类型/尺寸/角度/位置）放 ≤M 个障碍；上层 search_placement
-  # 失败就改尺寸/角度/位置重试至 N 次。判定「合适」三条件：①默认路径碰撞 ②仍有绕行解 ③绕行明显不同。
-  max_per_scene: 1                      # M：每个场景最多障碍数（先实现 M=1）
-  max_attempts: 20                      # N：单个 (link,type) 放置失败后的最大重试次数
-  detour_max_attempts: 20               # 绕行可行性判定(detour_exists)的 plan 尝试次数。
+obstacle_placement:                     # 障碍物放置参数，按【障碍物类型】分三段（type1/type2/type3）
+  # 层级：obstacle_placement.<type1|type2|type3>。三类障碍互相独立，各自读自己那段：
+  #   type1 = 沿「关键 link 扫掠走廊」自动放障碍（见 docs/障碍物位置.md，gt_gen/obstacle_placement.py）
+  #   type2 = 焊缝旁遮挡板候选（Scene.add_obstacle_type2，示例 scripts/viz_seam_plate_candidates_isaacsim.py）
+  #   type3 = 把焊缝包住的开口障碍（Scene.add_obstacle_type3，示例 scripts/viz_seam_open_box_isaacsim.py）
+
+  type1:                                # 障碍物类型1：走廊自动放障碍（原 obstacle_placement 全部参数原样移入此段）
+    # 底层 place_in_corridor 按参数（link/类型/尺寸/角度/位置）放 ≤M 个障碍；上层 search_placement
+    # 失败就改尺寸/角度/位置重试至 N 次。判定「合适」三条件：①默认路径碰撞 ②仍有绕行解 ③绕行明显不同。
+    max_per_scene: 1                    # M：每个场景最多障碍数（先实现 M=1）
+    max_attempts: 20                    # N：单个 (link,type) 放置失败后的最大重试次数
+    detour_max_attempts: 20             # 绕行可行性判定(detour_exists)的 plan 尝试次数。
                                         # 独立于 planner.max_attempts(=200，那是产最终 GT 用的余量)；
                                         # 这里只判「是否存在绕行解」，无需跑满 → 取小值大幅提速
                                         # （障碍挡死时是最坏情况：ik_return_seeds 个候选 × 此值，全失败才返回）。
-  key_links: ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"]
-  pos_t_window: [0.25, 0.85]            # 选 anchor 的默认轨迹时间窗（避开起点 init_free 段与终点焊缝段）
-  goal_clearance_m: 0.25               # anchor 距 goal 位置的最小距离（不要紧贴焊缝）
-  size_scale_range: [0.6, 1.6]          # 障碍尺寸相对局部走廊管半径的缩放采样区间
-  angle_jitter_deg: 180                  # 角度扰动幅度（度）
-  pos_jitter_m: 0.40                    # 位置扰动幅度（米）
-  detour_min_joint_rad: 0.1            # 条件③：绕行 vs 默认的关节空间最大偏差阈值（rad）
-  detour_max_solutions: 10              # 每个场景收集多少条【互不相同】的绕行解存为多份 GT 候选：
-                                       # 对多 IK 分支各规划，按关节偏差峰值 ≥ detour_min_joint_rad 去重，
-                                       # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
-  detour_ik_position_threshold: 0.1   # 无用，ik目前的goal是写死的，仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
-  detour_ik_rotation_threshold: 0.3    # 用，ik目前的goal是写死的， 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
-  obstacle_buffer_m: 0.1               # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
+    key_links: ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"]
+    pos_t_window: [0.25, 0.85]          # 选 anchor 的默认轨迹时间窗（避开起点 init_free 段与终点焊缝段）
+    goal_clearance_m: 0.25              # anchor 距 goal 位置的最小距离（不要紧贴焊缝）
+    size_scale_range: [0.6, 1.6]        # 障碍尺寸相对局部走廊管半径的缩放采样区间
+    angle_jitter_deg: 180               # 角度扰动幅度（度）
+    pos_jitter_m: 0.40                  # 位置扰动幅度（米）
+    detour_min_joint_rad: 0.1           # 条件③：绕行 vs 默认的关节空间最大偏差阈值（rad）
+    detour_max_solutions: 10            # 每个场景收集多少条【互不相同】的绕行解存为多份 GT 候选：
+                                        # 对多 IK 分支各规划，按关节偏差峰值 ≥ detour_min_joint_rad 去重，
+                                        # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
+    detour_ik_position_threshold: 0.1   # 无用，ik目前的goal是写死的，仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
+    detour_ik_rotation_threshold: 0.3   # 用，ik目前的goal是写死的， 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
+    obstacle_buffer_m: 0.1              # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
                                         # ②③绕行规划用膨胀尺寸→绕行解与真实障碍留 buffer；工件不受影响。0=关闭
-  obstacle_types: []                    # 空=用 obstacles.list_obstacles() 全部 15 种
-  # _shape_for 的尺寸夹紧/采样区间（不写死在代码里，单一来源）
-  span_clip_m: [0.15, 2.2]              # 障碍主跨度 s=clip(span,·) 的[下界,上界]（米）：下界保证大到能横挡走廊，上界防塞满场景无解
-  tube_r_clip_m: [0.04, 0.20]           # 杆/管/梁截面半径 rt=clip(tube_r,·) 的[下界,上界]（米）：下界防细到漏过，上界防单管成大圆柱
-  thickness_range_m: [0.02, 0.05]       # 板/壁厚 th 的随机采样[下界,上界]（米，每次放置在此区间均匀取）
+    obstacle_types: []                  # 空=用 obstacles.list_obstacles() 全部 15 种
+    # _shape_for 的尺寸夹紧/采样区间（不写死在代码里，单一来源）
+    span_clip_m: [0.15, 2.2]            # 障碍主跨度 s=clip(span,·) 的[下界,上界]（米）：下界保证大到能横挡走廊，上界防塞满场景无解
+    tube_r_clip_m: [0.04, 0.20]         # 杆/管/梁截面半径 rt=clip(tube_r,·) 的[下界,上界]（米）：下界防细到漏过，上界防单管成大圆柱
+    thickness_range_m: [0.02, 0.05]     # 板/壁厚 th 的随机采样[下界,上界]（米，每次放置在此区间均匀取）
+
+  type2:                                # 障碍物类型2：焊缝旁遮挡板（固定候选 C1，示例 launch.json:viz_seam_plate_candidates_isaacsim）
+    # Scene.add_obstacle_type2 按本段参数据焊缝几何(切线 t / 两面表面方向 d1,d2 / 角平分线 bis)造遮挡板：
+    #   固定 C1 = 水平板·焊缝正上方对称（∥地面a面、沿壁方向抬高 n_cm、板心在焊缝正上方、宽沿±对称）。
+    shape: plate                        # 板外形：plate=完整矩形 / triangle=角平分线三角 / trapezoid=随机倒角梯形
+    n_cm: 10.0                          # 离焊缝距离 n(cm)：C1 沿壁方向的抬高量
+    width_cm: 30.0                      # 板宽(cm)
+    length_pct: 100.0                   # 板长占焊缝弧长百分比(%)
+    length_min_cm: 3.0                  # 板长下限(cm)：实际板长 = max(length_pct%×焊缝弧长, 此值)
+    thickness_cm: 2.0                   # 板厚(cm)
+    seed: 0                             # trapezoid 随机倒角的种子（可复现；plate/triangle 不用）
+
+  type3:                                # 障碍物类型3：把焊缝包住的开口障碍（示例 launch.json:viz_seam_open_box_isaacsim）
+    # Scene.add_obstacle_type3 用 1 个开口障碍把焊缝那段包住；大小+焊缝在其中的位置由 6 个面到焊缝的
+    # 最近距离 dis 唯一解出。开口面=后(back)，朝焊缝角平分线水平投影方向（bis 从开口穿出）。
+    obstacle: open_box                  # 障碍类型：open_box=开1面的盒 / open_cylinder=开1面的圆筒(圆管杯)
+    dis_cm: [100, 100, 100, 100, 100, 100]  # 焊缝到盒 6 面最近距离(cm)，顺序=上 下 左 右 前 后；后=开口面
+    wall_cm: 2.0                        # 盒壁厚(cm)（open_cylinder 光滑 mesh 时仅占位）

@@ -443,8 +443,17 @@ class Config:
     # ---- 障碍物自动放置（见 docs/障碍物位置.md, gt_gen/obstacle_placement.py） ----
     @property
     def obstacle_placement(self) -> dict:
-        """obstacle_placement 段（单一来源）。缺省给出与 default.yaml 一致的兜底。"""
-        op = dict(self.raw.get("obstacle_placement", {}))
+        """障碍物类型1（走廊自动放障碍）参数段，= obstacle_placement.type1（单一来源）。
+
+        兼容旧结构与外部覆盖：obstacle_placement 顶层若直接写了 type1 参数（如 place_obstacles.py
+        往 cfg.raw['obstacle_placement']['key_links'] 写覆盖），这些顶层键会盖过 type1 段里的同名键。
+        缺省给出与 default.yaml 一致的兜底。"""
+        op_raw = dict(self.raw.get("obstacle_placement", {}))
+        op = dict(op_raw.get("type1", {}))
+        # 顶层直接写的（非 type* 段）参数覆盖 type1（保留 place_obstacles.py 等旧覆盖路径）
+        for k, v in op_raw.items():
+            if k not in ("type1", "type2", "type3"):
+                op[k] = v
         op.setdefault("max_per_scene", 1)
         op.setdefault("max_attempts", 20)
         op.setdefault("detour_max_attempts", 30)
@@ -463,6 +472,32 @@ class Config:
         op.setdefault("tube_r_clip_m", [0.04, 0.20])
         op.setdefault("thickness_range_m", [0.02, 0.05])
         return op
+
+    @property
+    def obstacle_placement_type2(self) -> dict:
+        """障碍物类型2（焊缝旁遮挡板候选）参数段 = obstacle_placement.type2（单一来源）。
+        供 Scene.add_obstacle_type2 读取；缺省与 default.yaml 一致（示例见
+        scripts/viz_seam_plate_candidates_isaacsim.py）。"""
+        p = dict(self.raw.get("obstacle_placement", {}).get("type2", {}))
+        p.setdefault("shape", "plate")
+        p.setdefault("n_cm", 10.0)
+        p.setdefault("width_cm", 30.0)
+        p.setdefault("length_pct", 100.0)
+        p.setdefault("length_min_cm", 3.0)
+        p.setdefault("thickness_cm", 2.0)
+        p.setdefault("seed", 0)
+        return p
+
+    @property
+    def obstacle_placement_type3(self) -> dict:
+        """障碍物类型3（把焊缝包住的开口障碍）参数段 = obstacle_placement.type3（单一来源）。
+        供 Scene.add_obstacle_type3 读取；缺省与 default.yaml 一致（示例见
+        scripts/viz_seam_open_box_isaacsim.py）。"""
+        p = dict(self.raw.get("obstacle_placement", {}).get("type3", {}))
+        p.setdefault("obstacle", "open_box")
+        p.setdefault("dis_cm", [100.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+        p.setdefault("wall_cm", 2.0)
+        return p
 
 
 
