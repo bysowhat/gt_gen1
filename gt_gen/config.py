@@ -501,7 +501,12 @@ class Config:
 
 
 
-def load_config(path: str = DEFAULT_CONFIG) -> Config:
+def load_config(path: "str | Config | None" = DEFAULT_CONFIG) -> Config:
+    """加载配置。path 可为：yaml 路径(str) / 已构造的 Config 实例（原样返回） / None（取默认）。"""
+    if isinstance(path, Config):
+        return path
+    if path is None:
+        path = DEFAULT_CONFIG
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
     with open(raw["robot"]["cfg_path"], "r") as f:

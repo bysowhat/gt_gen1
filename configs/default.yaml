@@ -60,6 +60,23 @@ goal:                                   # 末端目标相对焊缝的摆放（St
                                         # 目的：目标离工件表面够远(>体素膨胀带)，纯 voxel 探索世界不会误判碰撞；
                                         # GT 轨迹终点即停在此 standoff 位姿（不再向表面靠近）。
 
+compute_goal_pose:                      # 观测位姿(goal pose) ES 优化器参数（Scene.compute_goal_pose，包 compute_goal_poses2）
+  # 除下列【方法级】3 键外，本段其余键名须与 stomp_planner/config_pose.ConfigurationPose 的属性【同名】，
+  # Scene.compute_goal_pose 会逐个 setattr 到 ConfigurationPose（未列出的沿用其默认）；num_randoms_all /
+  # num_envs 由 Scene 依 num_batches/num_randoms_* 自动重算，勿在此填。显式传参给方法可覆盖本段。
+  include_obstacles: true               # 【方法级】是否把已放障碍并入 ScenePose2 碰撞世界（避障；open_cylinder 纯视觉跳过）
+  horizontal: 2                         # 【方法级】关节限位选择：0=水平 / 1=垂直 / 其它=all（全范围，最宽松）
+  device: cuda                          # 【方法级】计算设备
+  # —— 进化策略采样规模（⚠ 调太小会触发优化器内部假设崩溃 reshape[0,6]，见 compute_goal_poses2；默认 8×100）——
+  num_batches: 8                        # 并行批数
+  num_randoms_new: 100                  # 每批新采样数（num_envs = num_batches*(num_randoms_new+num_randoms_old)）
+  num_randoms_old: 0                    # 每批保留的旧精英数
+  num_iterations: 100                   # 进化迭代轮数
+  max_iterations: 300                   # 单次 solve 迭代上限
+  max_iterations_refine: 40             # refine 阶段迭代上限
+  num_steps: 5                          # 每个观测位姿覆盖的焊缝细分步数
+  # 代价权重(collision/vision/insides/space/block/orientation…)沿用 ConfigurationPose 默认，需要时按其属性名在此加键覆盖。
+
 init_free:                              # 初始引导 FREE 空间（见 docs/initial-free-space.md）
   # 末端相机初始视野极小，voxmap 全 UNKNOWN 时整臂扫掠必含 UNKNOWN → reach_pt=0，机械臂动不了。
   # 故在 retract（固定安全 home）邻域把"各关节小幅 ±dq 活动"整臂扫过的体素预标 FREE，让其能起步。

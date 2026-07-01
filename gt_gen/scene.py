@@ -39,6 +39,19 @@ def _load_plan_init_pose():
     return plan_init_pose
 
 
+def _load_compute_goal_poses2():
+    """惰性导入 scripts/compute_goal_poses2.py（观测位姿=goal pose 的去 Isaac 优化器）。
+
+    该模块顶层会：① 把 stomp_planner 加进 sys.path；② 注入 scene_pose 轻量 stub 顶掉
+    optimizer_pose 的类型注解 import（避免连带 import isaaclab）；③ import
+    ConfigurationPose / OptimizerPose / ScenePose2。故 import 一次即拿到全套 ES 优化器类，
+    且不启动 Isaac Sim。torch/curobo/warp 都在 ScenePose2/Optimizer 内部惰性初始化。"""
+    if _SCRIPTS_DIR not in sys.path:
+        sys.path.insert(0, _SCRIPTS_DIR)
+    import compute_goal_poses2  # noqa: E402  （scripts/compute_goal_poses2.py）
+    return compute_goal_poses2
+
+
 # ======================================================================
 # 障碍物几何（类型2 遮挡板 / 类型3 开口障碍）
 # ----------------------------------------------------------------------
@@ -308,6 +321,9 @@ class Scene:
 
         # ===== 世界状态（3D）—— 本期占位，后续 API 填实 =====
         self.init_pose_candidates: List[InitPoseCandidate] = []   # plan_init_pose 产出的全部候选（正手在前、反手在后，无数量上限）
+        self.cur_init_pose: Optional[InitPoseCandidate] = None    # 当前选定的 init pose 候选（set_init_pose 设定）——定义工件↔base 摆放
+        self.cur_init_index: Optional[int] = None                 # 当前候选在 init_pose_candidates 中的下标
+        self.goal_poses: list = []           # compute_goal_pose 产出的观测位姿结果（list[dict]，含 cam_pose 等）
         self.obstacles: list = []            # 已放障碍（ObstacleSpec）——后续
         self.truth_scene = None              # 工件+障碍（base 系）trimesh，raycast 几何源——后续
         self.voxmap = None                   # 三态记忆 ThreeStateVoxelMap——后续
@@ -533,6 +549,252 @@ class Scene:
             collision_checker_type=CollisionCheckerType.VOXEL,
             world_collision_checker=solver.world_voxel_coll, tensor_args=solver.tensor_args)
         solver.robot_world = RobotWorld(rwconfig)
+
+    # ------------------------------------------------------------------
+    # 当前 init pose + 观测位姿（goal pose）求解
+    # ------------------------------------------------------------------
+    def set_init_pose(self, index: int) -> InitPoseCandidate:
+        """把 init_pose_candidates 的第 index 个候选设为【当前 init pose】。
+
+        让 Scene「知道当前工件相对机器人怎么摆」：填 self.cur_init_pose / cur_init_index，
+        并把 self.workpiece_pose 设为该候选的 base 系 pose7。后续 compute_goal_pose（求观测位姿）
+        与 Open3DSceneVisualizer.show_scene_isaacsim（画机械臂/工件/goal）都从这个当前 init pose
+        取工件↔base 相对摆放 T_workpiece_in_base。
+
+        前提：先 plan_init_pose() 求出候选。index 越界报错。返回选定的 InitPoseCandidate。
+        """
+        if not self.init_pose_candidates:
+            raise RuntimeError("无候选 init pose：请先调用 Scene.plan_init_pose()")
+        n = len(self.init_pose_candidates)
+        if not (-n <= int(index) < n):
+            raise IndexError(f"init pose 候选下标越界：index={index}，共 {n} 个候选")
+        cand = self.init_pose_candidates[int(index)]
+        self.cur_init_pose = cand
+        self.cur_init_index = int(index) % n
+        self.workpiece_pose = cand.workpiece_pose7          # 工件在 base 系 pose7
+        return cand
+
+    # ------------------------------------------------------------------
+    # 存盘 / 读盘（数据态；供跨进程「算 goal pose → save → 另进程 load → 可视化」）
+    # ------------------------------------------------------------------
+    def save(self, path: str) -> str:
+        """把当前 Scene 的【数据状态】pickle 存盘，供【另一个干净进程】load 后可视化。
+
+        动机：compute_goal_pose 会 import/初始化 warp(1.13)+curobo，污染本进程；而
+        show_scene_isaacsim 的 SimulationApp 必须在【未加载 warp】的干净进程里最先启动，二者
+        不能同进程先后跑（见 scripts/demo_scene.py 说明）。故：进程①算 goal pose 后 save；
+        进程②（新起，未碰 warp）Scene.load 再 show_scene_isaacsim。
+
+        只存可序列化数据：cfg（Config=纯 dict dataclass）、当前焊缝、候选、当前 init pose、障碍、
+        goal_poses（torch 张量转 numpy）、retract 等；**不存** cuRobo/torch 句柄（load 后为惰性 None）。
+        """
+        import os
+        import pickle
+        import numpy as np
+
+        def _to_np(v):
+            return v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
+
+        state = dict(
+            _scene_save_version=1,
+            cfg=self.cfg,                              # Config：raw/robot_cfg 皆 dict，可 pickle
+            workpiece_obj=self.workpiece_obj,
+            weld_json=self.weld_json,
+            seam_id=self.seam_id,
+            seam=getattr(self, "seam", None),          # 当前焊缝 dict（_set_cur_seam 设的）
+            workpiece_pose=self.workpiece_pose,
+            goal_user=self.goal_user,
+            cur_cfg=list(self.cur_cfg),
+            init_pose_candidates=self.init_pose_candidates,   # InitPoseCandidate（dataclass）
+            cur_init_pose=self.cur_init_pose,
+            cur_init_index=self.cur_init_index,
+            obstacles=self.obstacles,                  # ObstacleSpec（dataclass；prims=Box、meshes=dict）
+            goal_poses=[{k: _to_np(v) for k, v in r.items()} for r in self.goal_poses],
+        )
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(state, f)
+        print(f"[scene] 已保存 → {path}（候选 {len(self.init_pose_candidates)}，"
+              f"障碍 {len(self.obstacles)}，goal_poses {len(self.goal_poses)}，"
+              f"当前 init pose={'#%d' % self.cur_init_index if self.cur_init_index is not None else '未设'}）")
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "Scene":
+        """从 save() 的存盘重建 Scene（数据状态）。cuRobo/torch 句柄不恢复（惰性=None），
+        可直接喂 Open3DSceneVisualizer.show_scene_isaacsim 可视化。
+
+        注意：需在【未加载 warp】的干净进程里调用后再启动 SimulationApp（这正是 save/load 的目的）。
+        weld_json 路径须仍可读（__init__ 会重读焊缝，随后用存盘的当前焊缝覆盖）。
+        """
+        import pickle
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        self = cls(cfg=state["cfg"], workpiece_obj=state["workpiece_obj"],
+                   weld_json=state["weld_json"], seam_id=state["seam_id"])
+        if state.get("seam") is not None:
+            self.seam = state["seam"]
+        self.workpiece_pose = state.get("workpiece_pose")
+        self.goal_user = state.get("goal_user")
+        self.cur_cfg = list(state.get("cur_cfg", self.cur_cfg))
+        self.init_pose_candidates = state.get("init_pose_candidates", []) or []
+        self.cur_init_pose = state.get("cur_init_pose")
+        self.cur_init_index = state.get("cur_init_index")
+        self.obstacles = state.get("obstacles", []) or []
+        self.goal_poses = state.get("goal_poses", []) or []
+        print(f"[scene] 已加载 ← {path}（候选 {len(self.init_pose_candidates)}，"
+              f"障碍 {len(self.obstacles)}，goal_poses {len(self.goal_poses)}，"
+              f"当前 init pose={'#%d' % self.cur_init_index if self.cur_init_index is not None else '未设'}）")
+        return self
+
+    def _seam_data_arrays(self, n_seg: int = None):
+        """本焊缝 → 观测位姿优化器要的 (seam_line, seam_tangent, seam_limits)，均在【工件 mesh 系】。
+
+        与 gt_overall per-seam pkl（compute_goal_poses2 的 seam_data）同框同语义：
+          · seam_line   (N,3)   焊缝折线（两端点插值）；
+          · seam_tangent(N,3)   焊缝切线（单位，直缝→逐点相同）；
+          · seam_limits (N,2,3) 两面表面方向 d1/d2（bisector = unit(d1+d2)，与 visionOrientation 口径一致）。
+        n_seg 默认取 cfg.plan_init_pose.n_seg（与 save_seam_pkl 一致，缺省 20）。
+        """
+        if n_seg is None:
+            try:
+                n_seg = int(self.cfg.raw["plan_init_pose"]["n_seg"])
+            except Exception:
+                n_seg = 20
+        mid, t, d1, d2, bis, seam_len, seam_line = self._seam_frame(n_seg=n_seg)
+        N = seam_line.shape[0]
+        seam_tangent = np.tile(_unit(t)[None, :], (N, 1))               # (N,3)
+        seam_limits = np.tile(np.stack([_unit(d1), _unit(d2)], axis=0)[None], (N, 1, 1))  # (N,2,3)
+        return seam_line, seam_tangent, seam_limits
+
+    def compute_goal_pose(self,
+                          include_obstacles: bool = None,
+                          horizontal: int = None,
+                          device: str = None,
+                          **cfg_overrides) -> list:
+        """给定当前 3D 世界（工件 + 障碍）与本焊缝，计算覆盖整条焊缝的【观测位姿序列】(goal pose)。
+
+        忠实复用 scripts/compute_goal_poses2.py 的进化策略优化器（ConfigurationPose / OptimizerPose /
+        ScenePose2，一行不改），只把它的 per-seam 主体包成 Scene 方法：
+          · seam_line/seam_tangent/seam_limits 由本焊缝 self.seam 造（_seam_data_arrays，工件 mesh 系）；
+          · 工件↔机器人相对摆放取【当前 init pose】self.cur_init_pose：piece_pose=identity、
+            robot_pose = base 在工件 mesh 系的 pose7 = pose7(inv(T_workpiece_in_base))；
+          · include_obstacles=True（默认）把已放障碍（类型2遮挡板 / 类型3 open_box 实体）与工件一起
+            update_world 进 ScenePose2 的 cuRobo 碰撞世界（obstacle-aware，open_cylinder 纯视觉跳过），
+            使观测位姿的碰撞过滤把障碍算进去；False 则仅工件。
+
+        **参数来源**：默认全部读 configs/default.yaml 的 `compute_goal_pose` 段——
+          · 方法级 3 键 include_obstacles / horizontal / device（显式传参 > yaml > 内置默认）；
+          · 其余键透传到 ConfigurationPose（凡与其属性同名即 setattr），**cfg_overrides 亦可临时覆盖；
+            num_randoms_all / num_envs 依最终 num_batches/num_randoms_* 自动重算。
+        ⚠ ES 采样规模（num_batches/num_randoms_new）调太小会触发优化器内部假设崩溃（compute_goal_poses2
+          既有行为），默认 8×100 稳定。horizontal：0=水平 / 1=垂直 / 其它=all（全范围）。
+
+        前提：先 set_init_pose(index) 选定当前 init pose（否则报错）。
+        返回：list[dict]（每个 robot_pose 一项，含 cam_pose (K,B,7)/joints/start_pts/end_pts/robot_pose_rel），
+              同时写入 self.goal_poses。无解则该项被跳过（可能返回空列表）。
+        """
+        if self.cur_init_pose is None:
+            raise RuntimeError("compute_goal_pose 需要当前 init pose：请先 set_init_pose(index)")
+        import torch
+
+        # —— 参数：configs/default.yaml 的 compute_goal_pose 段（显式传参/**cfg_overrides 可覆盖）——
+        sec = dict(self.cfg.raw.get("compute_goal_pose", {}) or {})
+        if include_obstacles is None:
+            include_obstacles = bool(sec.get("include_obstacles", True))
+        if horizontal is None:
+            horizontal = int(sec.get("horizontal", 2))
+        if device is None:
+            device = str(sec.get("device", "cuda"))
+
+        cgp = _load_compute_goal_poses2()
+        Configuration = cgp.Configuration
+        Optimizer = cgp.Optimizer
+        ScenePose2 = cgp.Scene
+
+        # —— ES 配置：ConfigurationPose 默认 + 从 yaml 段（及 **cfg_overrides）透传同名字段 ——
+        cfg = Configuration()
+        cfg.usd_path = ""
+        cfg.pc_path = ""
+        _method_keys = {"include_obstacles", "horizontal", "device"}
+        for k, v in {**sec, **cfg_overrides}.items():
+            if k in _method_keys:
+                continue
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+            else:
+                print(f"[scene][warn] compute_goal_pose：ConfigurationPose 无字段 {k!r}，忽略")
+        # 派生量按最终 num_batches/num_randoms_* 重算（口径同 compute_goal_poses2.main）
+        cfg.num_randoms_all = cfg.num_randoms_new + cfg.num_randoms_old + 1
+        cfg.num_envs = cfg.num_batches * (cfg.num_randoms_new + cfg.num_randoms_old)
+
+        # —— 焊缝数据（工件 mesh 系）——
+        seam_line_np, seam_tangent_np, seam_limits_np = self._seam_data_arrays()
+        seam_line = torch.as_tensor(seam_line_np, dtype=torch.float, device=device)
+        seam_tangent = torch.as_tensor(seam_tangent_np, dtype=torch.float, device=device)
+        seam_limits = torch.as_tensor(seam_limits_np, dtype=torch.float, device=device)
+
+        # —— 工件↔机器人相对摆放：piece 在原点(identity)，robot base = 工件系下 inv(T_workpiece_in_base) ——
+        pim = _load_plan_init_pose()
+        T = self.cur_init_pose.T_workpiece_in_base
+        robot_pose7 = np.asarray(pim.mat44_to_pose7(np.linalg.inv(T)), dtype=np.float64)  # base 在 mesh 系
+        piece_pose7 = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        robot_pose_t = torch.as_tensor(robot_pose7, dtype=torch.float, device=device)
+        piece_pose_t = torch.as_tensor(piece_pose7, dtype=torch.float, device=device)
+
+        scene2 = ScenePose2(cfg, num_envs=cfg.num_envs, device=device,
+                            obj_path=self.workpiece_obj, robot_cfg_path=self.cfg.robot_cfg_path)
+
+        want_obs = bool(include_obstacles and self.obstacles)
+        # reset：把工件按 piece->base_link 摆进碰撞世界并选关节限位
+        robot_pose_rel = scene2.reset(robot_pose_t, int(horizontal), piece_pose_t)
+        if want_obs:
+            self._inject_obstacles_into_scenepose2(scene2)     # 障碍与工件同 pose 一起进碰撞世界（避障）
+
+        optimizer = Optimizer(cfg=cfg, scene=scene2, device=device)
+        optimizer.resetSeamData(seam_line, seam_tangent, seam_limits)
+        cam_pose, joints, start_pts, end_pts = optimizer.solve()
+
+        results = []
+        if cam_pose is None:
+            print("[scene] compute_goal_pose：无观测位姿解")
+        else:
+            results.append({
+                "cam_pose": cam_pose.detach().clone(),
+                "joints": joints.detach().clone(),
+                "start_pts": start_pts.detach().clone(),
+                "end_pts": end_pts.detach().clone(),
+                "robot_pose_rel": robot_pose_rel.detach().clone(),
+            })
+            print(f"[scene] compute_goal_pose 成功：cam_pose {tuple(cam_pose.shape)} "
+                  f"joints {tuple(joints.shape)}（障碍并入={want_obs}）")
+        self.goal_poses = results
+        return results
+
+    def _inject_obstacles_into_scenepose2(self, scene2):
+        """把当前障碍实体（工件 mesh 系）按 piece->base_link 位姿一起并进 ScenePose2 的 cuRobo 碰撞世界。
+
+        ScenePose2.reset 已把工件 mesh 摆到 robot_base_inv_pose（piece->base_link）；这里用【同一 pose】
+        把障碍实体（_obstacle_solid_trimeshes：类型2遮挡板 + 类型3 open_box；open_cylinder 纯视觉跳过）
+        合并成一块 Mesh，与工件一起 rw.update_world，使观测位姿碰撞过滤把障碍算进去。不改 scene_pose2.py。
+        """
+        import trimesh as _trimesh
+        obs_tms = self._obstacle_solid_trimeshes()
+        if not obs_tms:
+            print("[scene] compute_goal_pose：无可注入碰撞的障碍（仅工件或仅 open_cylinder）")
+            return
+        merged = _trimesh.util.concatenate(obs_tms)
+        pose = scene2.robot_base_inv_pose[0].detach().cpu().tolist()    # [x,y,z, qw,qx,qy,qz]
+        piece_mesh = scene2._Mesh(name="piece", vertices=scene2._verts_list,
+                                  faces=scene2._faces_list, pose=pose)
+        obs_mesh = scene2._Mesh(name="obstacles",
+                                vertices=np.asarray(merged.vertices, float).tolist(),
+                                faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
+                                pose=pose)
+        scene2.rw.update_world(scene2._WorldConfig(mesh=[piece_mesh, obs_mesh]))
+        print(f"[scene] compute_goal_pose：障碍并入碰撞世界（{len(obs_tms)} 块实体）")
 
     # ------------------------------------------------------------------
     # 障碍物（工件 mesh 系；与 weld_json 的 corrected_p0/p1/bisector 同框）

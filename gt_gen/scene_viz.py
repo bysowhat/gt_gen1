@@ -90,22 +90,49 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         return _factory
 
-    def show_scene_isaacsim(self, headless: bool = False):
-        """用 **isaacsim** 可视化当前 3D 场景：工件网格 + 焊缝红线 + 已添加的障碍物（类型2/3）。
+    def show_scene_isaacsim(self, headless: bool = False, goal_variant: int = 0):
+        """用 **isaacsim** 可视化当前 3D 场景：工件 + 障碍物（如有）+ 机械臂 + goal pose（如有）+ 当前焊缝红线（如有）。
 
-        工件停在自身 mesh 坐标（identity），焊缝与障碍（Scene.add_obstacle_type2/type3 产出）均在同一
-        工件 mesh 系（与 viz_weld_json 同框），故直接叠加即对齐。障碍以 Box 原语（open_box）与棱柱/圆筒
-        mesh（遮挡板 / open_cylinder）两种形态渲染，颜色取各 ObstacleSpec.color。
+        两种坐标系，取决于是否已 Scene.set_init_pose(index) 选定当前 init pose：
+          · 【未设 init pose】—— mesh 系（旧行为）：工件停在自身 mesh 坐标（identity），障碍/焊缝同框直接叠加，
+            **不画机械臂**（无工件↔base 摆放无从摆臂）。供 demo_obstacle_type2/type3 用。
+          · 【已设 init pose】—— base 系：机械臂 base 在原点、按 **retract 起始角** 摆姿；工件按当前候选的
+            T_workpiece_in_base 摆到 base 系；障碍/当前焊缝红线/goal pose 视锥都随同一 T 变换后叠加。
+            goal pose（若已 compute_goal_pose）以相机视锥（青→黄渐变）画出，cam_pose 经 T 从工件系变到 base 系；
+            并在每个 goal pose 处放一个【真实 UsdGeom.Camera】（FOV 匹配视锥，看向焊缝），共 B 个。
 
-        前提：先 Scene.add_obstacle_type2()/add_obstacle_type3() 放好障碍。须在【未初始化 curobo/torch】
-        的干净进程里调用（SimulationApp 要最先启动）。headless=True 时 spawn 后跑几帧即退（自检）。
+        障碍以 Box 原语（open_box）与棱柱/圆筒 mesh（遮挡板 / open_cylinder）两种形态渲染，颜色取各
+        ObstacleSpec.color。须在【未初始化 curobo/torch】的干净进程里调用（SimulationApp 要最先启动）。
+        headless=True 时 spawn 后跑几帧即退（自检）。goal_variant 选 cam_pose 的第几个变体 K（默认 0）。
         """
         import os
+        import sys
         import numpy as np
 
         scene = self.scene
         obstacles = list(scene.obstacles)
-        seam_lines = [ob.seam_line for ob in obstacles if ob.seam_line is not None]
+        cur = scene.cur_init_pose
+        base_frame = cur is not None
+
+        # —— 渲染坐标系变换 T（mesh 系 → 渲染系）：base 系用 T_workpiece_in_base，否则单位阵 ——
+        if base_frame:
+            T = np.asarray(cur.T_workpiece_in_base, float)
+            wp_pose7 = np.asarray(cur.workpiece_pose7, float)      # 工件在 base 系 pose7（wxyz）
+        else:
+            T = np.eye(4)
+            wp_pose7 = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], float)
+        R_T, t_T = T[:3, :3], T[:3, 3]
+
+        def tf_pts(P):
+            return np.asarray(P, float) @ R_T.T + t_T             # (…,3) mesh 系 → 渲染系
+
+        # 当前焊缝折线（mesh 系）→ 渲染系
+        cur_seam_line = None
+        if getattr(scene, "seam", None) is not None:
+            try:
+                cur_seam_line = np.asarray(scene._seam_frame()[6], float)   # (N,3)
+            except Exception as _e:
+                print(f"[viz] 取当前焊缝失败（忽略）: {_e}")
 
         # —— SimulationApp 必须最先启动（在 import omni 之前）——
         try:
@@ -123,6 +150,15 @@ class Open3DSceneVisualizer(SceneVisualizer):
         from pxr import Usd, UsdGeom, UsdPhysics, Gf
         from scipy.spatial.transform import Rotation as Rsp
 
+        def _compose_pose7(pose7):
+            """把 mesh 系 pose7=[x,y,z,qw,qx,qy,qz] 经 T 变到渲染系，返回渲染系 pose7（wxyz）。"""
+            p = np.asarray(pose7, float)
+            Rc = Rsp.from_quat([p[4], p[5], p[6], p[3]])          # wxyz → xyzw
+            Rw = Rsp.from_matrix(R_T) * Rc
+            pos = R_T @ p[:3] + t_T
+            q = Rw.as_quat()                                      # xyzw
+            return np.r_[pos, q[3], q[0], q[1], q[2]]
+
         def spawn_obj_mesh(pth, obj_path):
             import trimesh
             tm = trimesh.load(obj_path, force="mesh")
@@ -135,8 +171,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
             mesh.CreateFaceVertexIndicesAttr(faces.flatten().tolist())
             mesh.CreateDisplayColorAttr([Gf.Vec3f(0.72, 0.72, 0.72)])
 
-        def spawn_workpiece(pth, obj_path):
-            """工件摆在自身 mesh 坐标（identity），关物理当纯视觉。usd 缺失则 trimesh 建 Mesh。"""
+        def spawn_workpiece(pth, obj_path, pose7):
+            """工件摆到渲染系 pose7（关物理当纯视觉）。usd 缺失则 trimesh 建 Mesh。"""
             usd_obj = obj_path.replace("_watertight.obj", ".usd")
             if not os.path.exists(usd_obj):
                 usd_obj = os.path.splitext(obj_path)[0] + ".usd"
@@ -144,8 +180,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 add_reference_to_stage(usd_path=usd_obj, prim_path=pth)
             else:
                 spawn_obj_mesh(pth, obj_path)
-            XFormPrim(pth).set_world_pose(position=[0.0, 0.0, 0.0],
-                                          orientation=[1.0, 0.0, 0.0, 0.0])
+            XFormPrim(pth).set_world_pose(position=np.asarray(pose7[:3], float).tolist(),
+                                          orientation=np.asarray(pose7[3:7], float).tolist())
             stg = omni.usd.get_context().get_stage()
             for pr in Usd.PrimRange(stg.GetPrimAtPath(pth)):
                 if pr.HasAPI(UsdPhysics.CollisionAPI):
@@ -173,21 +209,25 @@ class Open3DSceneVisualizer(SceneVisualizer):
                                  scale=np.array([thick, thick, L]), color=np.asarray(color, float))
 
         def spawn_seam_line(prefix, name0, seam_pts, color=(1.0, 0.0, 0.0), thick=0.01):
+            """seam_pts 已在渲染系。"""
             for si in range(len(seam_pts) - 1):
                 spawn_segment(f"{prefix}/seg{si}", f"{name0}_{si}",
                               seam_pts[si], seam_pts[si + 1], color, thick)
 
         def spawn_box_prim(path, name, prim, color):
+            """Box 原语（mesh 系 pose）经 T 变到渲染系。"""
+            pose7 = _compose_pose7(np.asarray(prim.pose, float))
             _cuboid.VisualCuboid(prim_path=path, name=name,
-                                 position=np.asarray(prim.pose[:3], float),
-                                 orientation=np.asarray(prim.pose[3:7], float),   # wxyz
+                                 position=pose7[:3],
+                                 orientation=pose7[3:7],           # wxyz
                                  size=1.0, scale=np.asarray(prim.dims, float),
                                  color=np.asarray(color, float))
 
         def spawn_mesh(path, mesh):
+            """棱柱/圆筒 mesh（mesh 系 points）经 T 变到渲染系。"""
             stage = omni.usd.get_context().get_stage()
             m = UsdGeom.Mesh.Define(stage, path)
-            pts = np.asarray(mesh["points"], float)
+            pts = tf_pts(np.asarray(mesh["points"], float))
             m.CreatePointsAttr([Gf.Vec3f(float(p[0]), float(p[1]), float(p[2])) for p in pts])
             m.CreateFaceVertexCountsAttr(list(mesh["counts"]))
             m.CreateFaceVertexIndicesAttr(list(mesh["faces"]))
@@ -195,34 +235,141 @@ class Open3DSceneVisualizer(SceneVisualizer):
             m.CreateDisplayColorAttr([Gf.Vec3f(float(col[0]), float(col[1]), float(col[2]))])
             m.CreateDoubleSidedAttr(True)
 
+        # —— goal pose 视锥（scene_pose 同款 FOV 八顶点，+z 朝焊缝）——
+        def _fov_corners():
+            scl, scl_z = 7.0 / 11.0, 9.5 / 11.0
+            near = np.array([[0.135 * scl, -0.20 * 5 / 6 * scl, 0.4],
+                             [-0.135 * scl, -0.20 * 5 / 6 * scl, 0.4],
+                             [-0.135 * scl, 0.20 * 5 / 6 * scl, 0.4],
+                             [0.135 * scl, 0.20 * 5 / 6 * scl, 0.4]], float)
+            dz = 0.140 * scl_z * scl; dy = 0.185 * 5 / 6 * scl_z * scl; z_far = 0.4 * (1 + scl_z)
+            far = np.array([[0.135 * scl + dz, -0.20 * 5 / 6 * scl - dy, z_far],
+                            [-0.135 * scl - dz, -0.20 * 5 / 6 * scl - dy, z_far],
+                            [-0.135 * scl - dz, 0.20 * 5 / 6 * scl + dy, z_far],
+                            [0.135 * scl + dz, 0.20 * 5 / 6 * scl + dy, z_far]], float)
+            return near, far
+
+        def _cam_intrinsics():
+            """与 _fov_corners 同款：由近平面半尺寸给真实相机 FOV/clip 参数。
+            返回 (half_w, half_h, near_z, far_z)——近平面半宽/半高（@z=near_z）与远平面 z。"""
+            scl, scl_z = 7.0 / 11.0, 9.5 / 11.0
+            near_z = 0.4
+            far_z = 0.4 * (1 + scl_z)
+            half_w = 0.135 * scl
+            half_h = 0.20 * 5 / 6 * scl
+            return half_w, half_h, near_z, far_z
+
+        def spawn_camera(path, pos_w, R_w, half_w, half_h, near_z, far_z, focal=24.0):
+            """在 goal pose 处放【真实 UsdGeom.Camera】，FOV 匹配线框视锥。
+            USD 相机看本地 -Z、视锥 +z 朝焊缝 → 姿态绕本地 X 转 180° 对齐；
+            horizontalAperture=2·focal·tan(hFOV/2)=2·focal·half_w/near_z（vertical 同理）；
+            clippingRange 取近/远平面 z 使相机 gizmo 与线框贴合。"""
+            stage = omni.usd.get_context().get_stage()
+            cam = UsdGeom.Camera.Define(stage, path)
+            cam.CreateFocalLengthAttr(float(focal))
+            cam.CreateHorizontalApertureAttr(float(2.0 * focal * half_w / near_z))
+            cam.CreateVerticalApertureAttr(float(2.0 * focal * half_h / near_z))
+            cam.CreateClippingRangeAttr(Gf.Vec2f(float(near_z), float(far_z)))
+            Rx180 = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], float)
+            q = Rsp.from_matrix(np.asarray(R_w, float) @ Rx180).as_quat()   # xyzw
+            XFormPrim(path).set_world_pose(position=np.asarray(pos_w, float).tolist(),
+                                           orientation=np.r_[q[3], q[0], q[1], q[2]].tolist())
+
+        def spawn_frustum(prefix, idx, pos_w, R_w, near, far, color):
+            apex = np.asarray(pos_w, float)
+            nw = apex + near @ R_w.T
+            fw = apex + far @ R_w.T
+            for k in range(4):
+                spawn_segment(f"{prefix}/near{k}", f"g{idx}_near{k}", nw[k], nw[(k + 1) % 4], color, 0.004)
+                spawn_segment(f"{prefix}/far{k}", f"g{idx}_far{k}", fw[k], fw[(k + 1) % 4], color, 0.004)
+                spawn_segment(f"{prefix}/side{k}", f"g{idx}_side{k}", nw[k], fw[k], color, 0.004)
+                spawn_segment(f"{prefix}/apex{k}", f"g{idx}_apex{k}", apex, nw[k], color, 0.004)
+
         print(f"工件     : {scene.workpiece_obj}")
-        print(f"焊缝      : weld_json 第 {scene.seam_id} 条")
+        print(f"当前 init pose : " + ("候选#%d（base 系，含机械臂 retract）" % scene.cur_init_index
+                                       if base_frame else "未设定（mesh 系，不画机械臂）"))
         print(f"障碍      : 共 {len(obstacles)} 个 " +
               ", ".join(f"[{o.otype}:{o.kind}"
                         + (f"/{o.meta['candidate']}" if o.meta and 'candidate' in o.meta else "")
                         + "]" for o in obstacles))
 
         world = World(stage_units_in_meters=1.0)
-        # 地面置于工件/焊缝最低处下方 1m
-        zs = [float(np.asarray(sl, float)[:, 2].min()) for sl in seam_lines] or [0.0]
-        world.scene.add_default_ground_plane(z_position=min(zs) - 1.0)
 
-        spawn_workpiece("/World/workpiece", scene.workpiece_obj)
+        # —— 机械臂（仅 base 系）：base 在原点，稍后 retract 起始角 ——
+        robot = None
+        if base_frame:
+            try:
+                from gt_gen import compat as _compat  # noqa: F401  warp shim（须在 curobo 前）
+                from curobo.util_file import load_yaml
+                CUROBO_ISAAC = "/home/a/Projects/Github/curobo/examples/isaac_sim"
+                if CUROBO_ISAAC not in sys.path:
+                    sys.path.insert(0, CUROBO_ISAAC)
+                from helper import add_robot_to_scene
+                robot_cfg = load_yaml(scene.cfg.robot_cfg_path)["robot_cfg"]
+                robot, _ = add_robot_to_scene(robot_cfg, world)
+            except Exception as e:
+                print(f"[viz] 机械臂 spawn 失败（忽略，仅画工件/障碍/goal）: {e}")
+                robot = None
 
+        # 地面：置于渲染系中焊缝/工件最低处下方 1m
+        obs_seam_lines = [tf_pts(ob.seam_line) for ob in obstacles if ob.seam_line is not None]
+        zpool = []
+        if cur_seam_line is not None:
+            zpool.append(float(tf_pts(cur_seam_line)[:, 2].min()))
+        for sl in obs_seam_lines:
+            zpool.append(float(np.asarray(sl)[:, 2].min()))
+        world.scene.add_default_ground_plane(z_position=(min(zpool) - 1.0) if zpool else -1.0)
+
+        spawn_workpiece("/World/workpiece", scene.workpiece_obj, wp_pose7)
+
+        # 当前焊缝红线（渲染系）
+        if cur_seam_line is not None:
+            spawn_seam_line("/World/seam/cur", "seam_cur", tf_pts(cur_seam_line), color=[1.0, 0.0, 0.0])
+
+        # 障碍（经 T 变到渲染系）
         for oi, ob in enumerate(obstacles):
-            if ob.seam_line is not None:
-                spawn_seam_line(f"/World/seam/o{oi}", f"seam_{oi}", ob.seam_line, color=[1.0, 0.0, 0.0])
             for k, prim in enumerate(ob.prims):
                 spawn_box_prim(f"/World/obs/o{oi}/box{k}", f"obs_{oi}_{k}", prim, ob.color)
             for k, mesh in enumerate(ob.meshes):
                 spawn_mesh(f"/World/obs/o{oi}/mesh{k}", mesh)
 
+        # goal pose 视锥（仅 base 系且已 compute_goal_pose）
+        n_goal = 0
+        if base_frame and scene.goal_poses:
+            near, far = _fov_corners()
+            half_w, half_h, near_z, far_z = _cam_intrinsics()
+            cam_pose = np.asarray(scene.goal_poses[0]["cam_pose"])   # (K,B,7) piece 系 wxyz
+            K = cam_pose.shape[0]
+            vi = max(0, min(int(goal_variant), K - 1))
+            seq = cam_pose[vi]                                        # (B,7)
+            B = seq.shape[0]
+            for i in range(B):
+                p7 = _compose_pose7(seq[i])                          # piece→base
+                R_w = Rsp.from_quat([p7[4], p7[5], p7[6], p7[3]]).as_matrix()
+                t = 0.0 if B <= 1 else i / (B - 1)
+                spawn_frustum(f"/World/goal/c{i}", i, p7[:3], R_w, near, far, [t, 1.0, 1.0 - t])
+                spawn_camera(f"/World/goal/cam{i}", p7[:3], R_w, half_w, half_h, near_z, far_z)
+            n_goal = B
+        print(f"goal pose : " + (f"{n_goal} 个观测视锥（青→黄）+ {n_goal} 个真实相机"
+                                  if n_goal else "无（未 compute_goal_pose 或非 base 系）"))
+
         world.reset()
+
+        # 机械臂 retract 起始角
+        if robot is not None:
+            try:
+                if hasattr(robot, "initialize"):
+                    robot.initialize()
+                idx_list = [robot.get_dof_index(j) for j in scene.cfg.joint_names]
+                robot.set_joint_positions(np.asarray(scene.cur_cfg, float), idx_list)
+            except Exception as e:
+                print(f"[viz] 机械臂设关节角失败（忽略）: {e}")
 
         if headless:
             for _ in range(3):
                 world.step(render=False)
-            print(f"已 spawn 工件 + {len(obstacles)} 个障碍（类型2/3）。")
+            print(f"已 spawn 工件 + {len(obstacles)} 个障碍" +
+                  (f" + 机械臂(retract) + {n_goal} 个 goal 视锥 + {n_goal} 个真实相机" if base_frame else "") + "。")
             print("VIZ_SCENE_DONE")
             simulation_app.close()
             return
@@ -232,7 +379,9 @@ class Open3DSceneVisualizer(SceneVisualizer):
             _set_lighting_mode("Grey Studio")
         except Exception:
             pass
-        print("播放中（关闭窗口结束）。工件 + 焊缝红线 + 障碍物叠加显示在同一 mesh 系。")
+        print("播放中（关闭窗口结束）。" +
+              ("base 系：机械臂 retract + 工件 + 障碍 + 焊缝红线 + goal 视锥。" if base_frame
+               else "mesh 系：工件 + 障碍 + 焊缝红线（未设 init pose，无机械臂）。"))
         while simulation_app.is_running():
             world.step(render=True)
         simulation_app.close()

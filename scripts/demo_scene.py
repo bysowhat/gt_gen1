@@ -81,20 +81,27 @@ def demo_obstacle_type3(args):
 def demo_main(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
-    scene = _make_scene(args)
-    scene._set_cur_seam(9)
-    scene.add_obstacle_type3()
-    scene.plan_init_pose()
+    # scene = _make_scene(args)
+    # scene._set_cur_seam(9)
+    # scene.add_obstacle_type2()
+    # scene.plan_init_pose()
+    # scene.set_init_pose(0)
+    # scene.compute_goal_pose()
+    # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+
+    from gt_gen.scene import Scene
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless)
 
 
-    if not scene.init_pose_candidates:
-        print("[demo] 求解失败：无候选初始位姿")
-        return
-    n_fore = sum(1 for c in scene.init_pose_candidates if c.hand == "forehand")
-    n_back = sum(1 for c in scene.init_pose_candidates if c.hand == "backhand")
-    print(f"[demo] 候选初始位姿 {len(scene.init_pose_candidates)} 个（正手 {n_fore} / 反手 {n_back}）")
+    # if not scene.init_pose_candidates:
+    #     print("[demo] 求解失败：无候选初始位姿")
+    #     return
+    # n_fore = sum(1 for c in scene.init_pose_candidates if c.hand == "forehand")
+    # n_back = sum(1 for c in scene.init_pose_candidates if c.hand == "backhand")
+    # print(f"[demo] 候选初始位姿 {len(scene.init_pose_candidates)} 个（正手 {n_fore} / 反手 {n_back}）")
     
-    Open3DSceneVisualizer(scene).show_init_poses()
+    # Open3DSceneVisualizer(scene).show_init_poses()
 
 
 def main():
