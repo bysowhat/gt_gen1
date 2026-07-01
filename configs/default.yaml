@@ -21,27 +21,42 @@ robot:                                  # 决策 B
 sensor:                                 # 决策 D + E
   mode: "self_raycast"                  # 自己对 mesh raycast，不依赖 Isaac 渲染
   max_depth_m: 3.0                      # raycast 深度上限 3 米（决策 D）
-  camera:                               # 单个相机（无左右目），参数来自 IsaacLab PinholeCameraCfg
-    name: "camera"
-    width: 960
-    height: 540
+  camera:                               # 单目=IsaacLab camera_left_cfg（TiledCameraCfg，Link6/camera_left）
+    name: "camera_left"
+    width: 2208
+    height: 1242
     modalities: ["rgb", "depth"]
-    # 针孔模型原始参数
+    # 针孔模型原始参数（IsaacLab PinholeCameraCfg：camera_left，fov≈92°×60°）
     focal_length: 4.01
     focus_distance: 480.0
-    horizontal_aperture: 8.064
-    vertical_aperture: 4.5365
-    clipping_range: [1.0e-5, 1.0e3]     # 注意：实际 raycast 截断用 max_depth_m=3.0
-    # 推导像素内参 fx = focal_length * width / horizontal_aperture
-    intrinsics: {fx: 477.4, fy: 477.4, cx: 480.0, cy: 270.0}
-    # 安装：相对 Link6（注意不是 ee_link xiaoyu_tip_link）
-    # 【新版机械臂 2026-06-26 标定】相机帧 = T_base_Link6 @ T(extrinsic_pos, extrinsic_quat_wxyz)
-    # 光学约定 OpenCV：+Z=视线朝前、+X 右、+Y 下；不套 USD 的 diag(1,-1,-1) 翻转
+    horizontal_aperture: 8.305
+    vertical_aperture: 4.672
+    clipping_range: [1.0e-5, 1.0e+3]     # 注意：实际 raycast 截断用 max_depth_m=3.0
+    # 推导像素内参 fx=focal*width/h_aperture=4.01*2208/8.305≈1066.1；fy=focal*height/v_aperture≈1066.1；cx=W/2, cy=H/2
+    intrinsics: {fx: 1066.12, fy: 1066.06, cx: 1104.0, cy: 621.0}
+    # 安装：相对 Link6（注意不是 ee_link xiaoyu_tip_link）= camera_left_cfg.offset（convention="ros"）
+    # 【单一真源】此外参既供 sensor raycast，也由 stomp ik_cam_pose 读取（UR12e_t 求观测位姿 IK）——两处必须同一台相机
+    # 相机帧 = T_base_Link6 @ T(extrinsic_pos, extrinsic_quat_wxyz)
+    # 光学约定 OpenCV/ROS：+Z=视线朝前、+X 右、+Y 下；不套 USD 的 diag(1,-1,-1) 翻转
     mount_link: "Link6"
     extrinsic_pos: [0.05018328, 0.09963676, 0.14782703]
     # 此 quat 按 (w,x,y,z) 解释（= cuRobo 约定，无需转换）
     extrinsic_quat_wxyz: [0.02269110, 0.03172106, 0.00070220, -0.99923861]
     reference: "/home/a/Projects/Github/kejian_benchmark/gt_benchmark_pose_fast"  # env/ik_cam.py, gt_math.py
+  camera_right:                           # 右目=IsaacLab camera_right_cfg —— 仅存档记录，当前管线不读（单目 raycast 用上面的 camera）
+    name: "camera_right"
+    width: 2208
+    height: 1242
+    modalities: ["rgb", "depth"]
+    focal_length: 4.01                    # 内参与左目相同（同型相机）
+    focus_distance: 480.0
+    horizontal_aperture: 8.305
+    vertical_aperture: 4.672
+    clipping_range: [1.0e-5, 1.0e+3]
+    intrinsics: {fx: 1066.12, fy: 1066.06, cx: 1104.0, cy: 621.0}
+    mount_link: "Link6"                    # camera_right_cfg.offset（convention="ros"）；旋转与左目一致，仅平移不同
+    extrinsic_pos: [-0.06923272, 0.09421033, 0.14022987]
+    extrinsic_quat_wxyz: [0.02269110, 0.03172106, 0.00070220, -0.99923861]
 
 roi:                                    # 决策 H —— ROI 盒（单一来源；init_curobo 与 build_roi_voxmap 都读这里）
   # 由整臂可达工作空间实测（20000 随机关节角的碰撞球包围盒）+ 余量取整得到，见

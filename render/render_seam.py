@@ -39,21 +39,13 @@ DEFAULT_WAREHOUSE_USD = (
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG = os.path.join(_PROJECT_ROOT, "configs", "default.yaml")
 
-# ======================= 左右目相机外参（相对 Link6，用户标定，ros 约定）=======================
-CAM_LEFT_POS = (0.05018328, 0.09963676, 0.14782703)
-CAM_LEFT_ROT = (0.02269110, 0.03172106, 0.00070220, -0.99923861)   # wxyz
-CAM_RIGHT_POS = (-0.06923272, 0.09421033, 0.14022987)
-CAM_RIGHT_ROT = (0.02269110, 0.03172106, 0.00070220, -0.99923861)  # wxyz
-
-# ======================= 相机内参（用户给的 PinholeCameraCfg）=======================
-CAM_WIDTH = 2208
-CAM_HEIGHT = 1242
-CAM_FOCAL_LENGTH = 4.01
-CAM_FOCUS_DISTANCE = 480.0
-CAM_H_APERTURE = 8.305
-CAM_V_APERTURE = 4.672
-CAM_CLIP = (1e-5, 1e3)
-DEPTH_KEY = "distance_to_image_plane"   # 用户写的 "depth" 的真实键（针孔 z 深度，单位 m）
+# ======================= 左右目相机内外参：单一真源 = configs/default.yaml =======================
+# sensor.camera(左目) + sensor.camera_right(右目)。下列模块级变量在 main() 里由
+# _load_cameras_from_config(--config) 按 default.yaml 覆盖填充（勿在此手改数值——改 default.yaml）。
+CAM_LEFT_POS = CAM_LEFT_ROT = CAM_RIGHT_POS = CAM_RIGHT_ROT = None
+CAM_WIDTH = CAM_HEIGHT = CAM_FOCAL_LENGTH = CAM_FOCUS_DISTANCE = None
+CAM_H_APERTURE = CAM_V_APERTURE = CAM_CLIP = None
+DEPTH_KEY = "distance_to_image_plane"   # 渲染 data-type 键（针孔 z 深度，单位 m；非标定项，固定）
 
 # ======================= 整组离地高度约束 =======================
 # 保持机械臂↔工件相对位姿不变，把整组沿 z 平移，使二者最低点落在地板上方
@@ -140,6 +132,29 @@ def load_robot_cfg(robot_cfg_path):
     urdf_path = kin["urdf_path"]
     cspace = kin["cspace"]
     return urdf_path, list(cspace["joint_names"]), list(cspace["retract_config"])
+
+
+def _load_cameras_from_config(config_path):
+    """从 default.yaml 的 sensor.camera(左目) + sensor.camera_right(右目) 读左右目内外参，
+    覆盖填充模块级相机常量（单一真源）。左右目同型：内参取左目；外参各取各的 extrinsic_pos/quat。
+    缺 camera_right 时右目回退用左目参数。"""
+    global CAM_LEFT_POS, CAM_LEFT_ROT, CAM_RIGHT_POS, CAM_RIGHT_ROT
+    global CAM_WIDTH, CAM_HEIGHT, CAM_FOCAL_LENGTH, CAM_FOCUS_DISTANCE
+    global CAM_H_APERTURE, CAM_V_APERTURE, CAM_CLIP
+    with open(config_path, "r") as f:
+        sensor = yaml.safe_load(f)["sensor"]
+    left = sensor["camera"]
+    right = sensor.get("camera_right", left)
+    CAM_LEFT_POS = tuple(float(v) for v in left["extrinsic_pos"])
+    CAM_LEFT_ROT = tuple(float(v) for v in left["extrinsic_quat_wxyz"])
+    CAM_RIGHT_POS = tuple(float(v) for v in right["extrinsic_pos"])
+    CAM_RIGHT_ROT = tuple(float(v) for v in right["extrinsic_quat_wxyz"])
+    CAM_WIDTH = int(left["width"]); CAM_HEIGHT = int(left["height"])
+    CAM_FOCAL_LENGTH = float(left["focal_length"]); CAM_FOCUS_DISTANCE = float(left["focus_distance"])
+    CAM_H_APERTURE = float(left["horizontal_aperture"]); CAM_V_APERTURE = float(left["vertical_aperture"])
+    CAM_CLIP = tuple(float(v) for v in left["clipping_range"])
+    print(f"[main] 相机内外参 ← {config_path}（{CAM_WIDTH}x{CAM_HEIGHT}，"
+          f"左目 pos={CAM_LEFT_POS}，右目 pos={CAM_RIGHT_POS}）")
 
 
 def load_poses(seam_npy):
@@ -696,6 +711,8 @@ def main():
         raise RuntimeError("default.yaml 的 robot.usd_path 未配置（已改为直接用人工 USD，不再自转）")
     if not os.path.isfile(robot_usd):
         raise FileNotFoundError(f"robot.usd_path 不存在: {robot_usd}")
+    # 左右目相机内外参：单一真源，从同一 default.yaml 读，覆盖模块级相机常量
+    _load_cameras_from_config(args_cli.config)
     urdf_path, joint_names, retract_config = load_robot_cfg(robot_cfg_path)
     print(f"[main] robot cfg : {robot_cfg_path}")
     print(f"[main] robot usd : {robot_usd}（人工制作，直接使用）")

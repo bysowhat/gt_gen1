@@ -10,13 +10,19 @@ import numpy as np
 import opt_math_pose as math
 
 class UR12e_t:
-    def __init__(self, num_envs, device="cuda"):
+    def __init__(self, num_envs, device="cuda", cam_to_link_pos=None, cam_to_link_quat=None):
         self.num_envs = num_envs
         self.device = device
-        camera_to_j6link_pos = torch.tensor((-0.07614382311635252, -0.035416740219402776, 0.16171334688469158), dtype=torch.float64, device=self.device)
-        camera_to_j6link_rot = torch.tensor((0.679148984404206, -0.11969930098925956, -0.2194543927388376, -0.6901220934248131), dtype=torch.float64, device=self.device)
-        # camera_to_j6link_pos = torch.tensor((-0.07712, -0.032, 0.16814), dtype=torch.float64, device=self.device)
-        # camera_to_j6link_rot = torch.tensor((0.679148984404206, -0.11969930098925956, -0.2194543927388376, -0.6901220934248131), dtype=torch.float64, device=self.device)
+        # 手眼外参（相机相对 Link6，wxyz）——【单一真源】默认从 gt_gen 配置 configs/default.yaml
+        # 的 sensor.camera 读取，与 raycast 传感相机完全同一台；显式传参可覆盖。
+        # 旧版曾在此写死 ur12e 相机(-0.076,...)，换机械臂/相机后必须改这里——现改为读 config 避免再次跑偏。
+        if cam_to_link_pos is None or cam_to_link_quat is None:
+            from gt_gen.config import load_config
+            _cam = load_config().camera
+            cam_to_link_pos = _cam["extrinsic_pos"]
+            cam_to_link_quat = _cam["extrinsic_quat_wxyz"]
+        camera_to_j6link_pos = torch.tensor(tuple(float(v) for v in cam_to_link_pos), dtype=torch.float64, device=self.device)
+        camera_to_j6link_rot = torch.tensor(tuple(float(v) for v in cam_to_link_quat), dtype=torch.float64, device=self.device)
         self.cam_to_j6_pose = self.transform(camera_to_j6link_pos, camera_to_j6link_rot)
         self.cam_inv = torch.linalg.inv(self.cam_to_j6_pose)
         self.cam_inv = self.cam_inv.unsqueeze(0).repeat(self.num_envs, 1, 1)
