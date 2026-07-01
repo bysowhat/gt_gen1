@@ -1816,13 +1816,16 @@ def _link_pose_in_base_batch(cfg, q_rows, link_name: str = "Link6"):
     return pos, z
 
 
-def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
+def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5, extra_geoms=None):
     """挨个可视化 kejian2 结果（正手→反手），每 stride 个抽 1 个（取每条手内第 1,1+stride,… 个）。
 
     每个位姿单开一个窗口（窗口标题写清「正手/反手 第 i/N 个」）；按【C 键】切到下一个、相机视角自动沿用
     （open3d 0.19 的 legacy Visualizer 无法对存活窗口改标题，故只能每个换新窗口才能让标题随之变化）；
     直接关窗（不按 C）则退出。几何复用 plan_init_pose.py 风格的 _lookup_solution_geoms（整臂碰撞球
-    @ joint_angles + 工件 mesh @ T_workpiece_in_base + 绿色焊缝线 + standoff 落枪点）；sol 由 result 适配。"""
+    @ joint_angles + 工件 mesh @ T_workpiece_in_base + 绿色焊缝线 + standoff 落枪点）；sol 由 result 适配。
+
+    extra_geoms：可选回调 (R, t) -> list[o3d.geometry]，每个候选窗口按该候选的 T_workpiece_in_base
+    (R,t) 追加额外几何（如随工件一起摆放的障碍物）；缺省 None 时行为与原先完全一致。"""
     import open3d as o3d
     step = max(1, int(stride))
     items = []   # (hand_label, i_1based, N, sol_like, r)
@@ -1872,6 +1875,12 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5):
             vis.add_geometry(g)
         for g in _bisector_axis_geoms(seam_c, bis):   # 蓝色 bisector 轴（正反手判据）
             vis.add_geometry(g)
+        if extra_geoms is not None:                    # 随工件摆放的额外几何（如障碍物）
+            try:
+                for g in extra_geoms(sol["R"], sol["t"]):
+                    vis.add_geometry(g)
+            except Exception as _e:
+                print(f"[viz] extra_geoms 追加失败（忽略）: {_e}")
         if cam["params"] is not None:
             try:
                 vis.get_view_control().convert_from_pinhole_camera_parameters(

@@ -38,6 +38,9 @@ class Open3DSceneVisualizer(SceneVisualizer):
         _show_kejian2_results（正手→反手依次开窗：按 (R,t) 摆放的工件网格 + 焊缝/中点 + standoff 落点
         + 蓝色 bisector 正反手判据轴）；同一窗口按 **C 键**切到下一个候选。
 
+        若 Scene 已放障碍（add_obstacle_type2/type3），障碍随工件一起按各候选的 T_workpiece_in_base
+        摆到 base 系一并显示（经 _show_kejian2_results 的 extra_geoms 钩子；open_cylinder 也含在内）。
+
         stride：每隔几个候选抽 1 个看（默认 1=逐个看全部）。
         """
         scene = self.scene
@@ -47,7 +50,45 @@ class Open3DSceneVisualizer(SceneVisualizer):
         pim = _load_plan_init_pose()
         res = {"forehand": [c.raw for c in scene.init_pose_candidates if c.hand == "forehand"],
                "backhand": [c.raw for c in scene.init_pose_candidates if c.hand == "backhand"]}
-        pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res, stride=stride)
+        extra = self._obstacle_o3d_factory() if scene.obstacles else None
+        pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
+                                  stride=stride, extra_geoms=extra)
+
+    def _obstacle_o3d_factory(self):
+        """返回回调 (R,t)->list[o3d.geometry]：把 scene.obstacles（工件 mesh 系）按 T_workpiece_in_base
+        摆到 base 系。障碍→trimesh 复用 scene 的 _polygon_mesh_to_trimesh / _box_prim_to_trimesh
+        （板 mesh + open_cylinder mesh 走前者，open_box 的 Box 原语走后者），再转 o3d、染 ObstacleSpec.color。"""
+        import numpy as np
+        import open3d as o3d
+        from gt_gen.scene import _polygon_mesh_to_trimesh, _box_prim_to_trimesh
+
+        obstacles = list(self.scene.obstacles)
+
+        def _factory(R, t):
+            T = np.eye(4)
+            T[:3, :3] = np.asarray(R, float)
+            T[:3, 3] = np.asarray(t, float)
+            geoms = []
+            for ob in obstacles:
+                col = list(ob.color) if ob.color else [0.62, 0.64, 0.67]
+                tms = []
+                for mesh in ob.meshes:
+                    tm = _polygon_mesh_to_trimesh(mesh)
+                    if tm is not None:
+                        tms.append(tm)
+                for prim in ob.prims:
+                    tms.append(_box_prim_to_trimesh(prim))
+                for tm in tms:
+                    m = o3d.geometry.TriangleMesh(
+                        o3d.utility.Vector3dVector(np.asarray(tm.vertices, float)),
+                        o3d.utility.Vector3iVector(np.asarray(tm.faces, np.int32)))
+                    m.transform(T)                       # 工件 mesh 系 → base 系（与工件同一 R,t）
+                    m.compute_vertex_normals()
+                    m.paint_uniform_color(col)
+                    geoms.append(m)
+            return geoms
+
+        return _factory
 
     def show_scene_isaacsim(self, headless: bool = False):
         """用 **isaacsim** 可视化当前 3D 场景：工件网格 + 焊缝红线 + 已添加的障碍物（类型2/3）。

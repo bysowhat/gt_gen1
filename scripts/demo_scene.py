@@ -83,7 +83,7 @@ def demo_main(args):
 
     scene = _make_scene(args)
     scene._set_cur_seam(9)
-    scene.add_obstacle_type2()
+    scene.add_obstacle_type3()
     scene.plan_init_pose()
 
 

@@ -300,6 +300,6 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
   type3:                                # 障碍物类型3：把焊缝包住的开口障碍（示例 launch.json:viz_seam_open_box_isaacsim）
     # Scene.add_obstacle_type3 用 1 个开口障碍把焊缝那段包住；大小+焊缝在其中的位置由 6 个面到焊缝的
     # 最近距离 dis 唯一解出。开口面=后(back)，朝焊缝角平分线水平投影方向（bis 从开口穿出）。
-    obstacle: open_box                  # 障碍类型：open_box=开1面的盒 / open_cylinder=开1面的圆筒(圆管杯)
+    obstacle: open_box                  # 障碍类型：open_box=开1面的盒 / open_cylinder=开1面的圆筒(圆管杯) 目前不支持
     dis_cm: [100, 100, 100, 100, 100, 100]  # 焊缝到盒 6 面最近距离(cm)，顺序=上 下 左 右 前 后；后=开口面
     wall_cm: 2.0                        # 盒壁厚(cm)（open_cylinder 光滑 mesh 时仅占位）

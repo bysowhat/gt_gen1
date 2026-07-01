@@ -153,6 +153,38 @@ def _cylinder_mesh(p_open, p_close, y_axis, z_axis, radius, color, nseg: int = 4
     return dict(points=np.asarray(pts, float), counts=counts, faces=faces, color=list(color))
 
 
+def _polygon_mesh_to_trimesh(mesh: dict):
+    """棱柱/多边形 mesh dict(points/counts/faces) → 实体 trimesh（多边形面扇形三角化）。
+
+    供把类型2遮挡板（闭合薄棱柱）合并进碰撞 ESDF。返回 None 表示无有效面。
+    """
+    import trimesh
+    pts = np.asarray(mesh["points"], float)
+    counts = [int(c) for c in mesh["counts"]]
+    idx = [int(i) for i in mesh["faces"]]
+    tris, off = [], 0
+    for c in counts:
+        face = idx[off:off + c]; off += c
+        for k in range(1, c - 1):                # 扇形三角化 (f0,fk,fk+1)
+            tris.append([face[0], face[k], face[k + 1]])
+    if not tris:
+        return None
+    return trimesh.Trimesh(vertices=pts, faces=np.asarray(tris, np.int64), process=False)
+
+
+def _box_prim_to_trimesh(prim):
+    """Box 原语(pose=[x,y,z,qw,qx,qy,qz], dims) → 实体 trimesh box（watertight）。"""
+    import trimesh
+    from scipy.spatial.transform import Rotation as Rsp
+    pose = np.asarray(prim.pose, float)
+    dims = np.asarray(prim.dims, float)
+    q = pose[3:7]                                # wxyz → scipy xyzw
+    T = np.eye(4)
+    T[:3, :3] = Rsp.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    T[:3, 3] = pose[:3]
+    return trimesh.creation.box(extents=dims.tolist(), transform=T)
+
+
 @dataclass
 class ObstacleSpec:
     """一个已放置的障碍物（类型2/3）的可视化 + cuRobo 载荷（工件 mesh 系）。
@@ -292,6 +324,7 @@ class Scene:
         self._camera_model = None
         self._k2ctx = None          # kejian2 工件级求解上下文（solver/ESDF/joint表/允许朝向/底座圆/mesh）
         self._k2ctx_key = None      # workpiece_obj：_k2ctx 复用标识
+        self._k2ctx_injected = False  # solver 碰撞世界当前是否已并入障碍（避障态标记）
         self._dirty: set = set()    # {"worlds","truth_scene","goal"} 缓存失效标记
 
     # ------------------------------------------------------------------
@@ -309,14 +342,17 @@ class Scene:
             return welds
 
     def _set_cur_seam(self, seam_id):
-        self.seam = self.seams[seam_id]    
+        # self._clear_scene()#todo
+        self.seam = self.seams[seam_id]  
     
+
     # ------------------------------------------------------------------
     # 初始位姿求解（包 scripts/plan_init_pose.py 的 kejian2 逻辑，算法/输入输出完全一致）
     # ------------------------------------------------------------------
     def plan_init_pose(self,
                        diagnostic: bool = False,
-                       rebuild: bool = False) -> List[InitPoseCandidate]:
+                       rebuild: bool = False,
+                       include_obstacles: bool = True) -> List[InitPoseCandidate]:
         """计算「工件 ↔ 机械臂」的候选初始位姿（kejian2 逻辑，本焊缝 self.seam）。
 
         与 scripts/plan_init_pose.py 走【完全同一套过滤逻辑】（直接复用其 _kejian2_build_ctx /
@@ -330,9 +366,15 @@ class Scene:
         与脚本【落盘时「每只手最多 15 个」】不同：这里【有多少正反手就返回多少】，不做数量上限挑选。
         全部候选（正手在前、反手在后）写入 self.init_pose_candidates 并返回。
 
+        **避障**：include_obstacles=True（默认）且 self.obstacles 非空时，把已放障碍（类型2遮挡板 /
+        类型3 open_box）合并进工件 mesh 一起重算 signed ESDF，覆盖 solver 的碰撞体素——碰撞过滤链路
+        （_kejian2_solve_weld 内的 lookup）随之把障碍算进去，一行算法不改（见 _inject_obstacles_into_solver）。
+        open_cylinder 为纯视觉、不进碰撞世界。include_obstacles=False 则退回仅工件（若此前注过障碍会自动还原）。
+
         参数：
-          diagnostic: 预留（kejian2 逐焊缝求解暂不细分诊断，当前未使用）。
-          rebuild   : True 强制重建工件级 ctx（换工件 / 改 n_per_dof 等缓存失效时）。
+          diagnostic       : 预留（kejian2 逐焊缝求解暂不细分诊断，当前未使用）。
+          rebuild          : True 强制重建工件级 ctx（换工件 / 改 n_per_dof 等缓存失效时）。
+          include_obstacles: True（默认）把 self.obstacles 并入碰撞世界后再求解（避障）。
 
         返回：候选列表（list[InitPoseCandidate]，可能为空=求解失败/无合格解）。
         """
@@ -345,6 +387,17 @@ class Scene:
         if rebuild or self._k2ctx is None or self._k2ctx_key != self.workpiece_obj:
             self._k2ctx = pim._kejian2_build_ctx(self.workpiece_obj)
             self._k2ctx_key = self.workpiece_obj
+            self._k2ctx_injected = False           # 新 ctx 为仅工件世界
+
+        # —— 障碍物并入 / 还原 solver 碰撞世界（不改 _kejian2_solve_weld 的碰撞算法） ——
+        solver = self._k2ctx["solver"]
+        want_obs = bool(include_obstacles and self.obstacles)
+        if want_obs:
+            self._inject_obstacles_into_solver(solver)   # 每次按当前障碍重算合并 ESDF（覆盖体素）
+            self._k2ctx_injected = True
+        elif self._k2ctx_injected:                       # 之前注过障碍、这次要干净工件世界 → 还原
+            solver._build_robot_world()
+            self._k2ctx_injected = False
 
         res, _prof = pim._kejian2_solve_weld(self._k2ctx, self.seam)
 
@@ -352,6 +405,134 @@ class Scene:
         cands = list(res.get("forehand", [])) + list(res.get("backhand", []))
         self.init_pose_candidates = [InitPoseCandidate.from_kejian2(d) for d in cands]
         return self.init_pose_candidates
+
+    def _obstacle_solid_trimeshes(self):
+        """当前 self.obstacles → 可并入碰撞 ESDF 的【实体 trimesh】列表。
+
+        · 类型2 遮挡板（plate/triangle/trapezoid）：闭合薄棱柱 mesh → 三角化实体；
+        · 类型3 open_box：5 块 Box 墙各建实体 box（保留开口，机械臂可从开口伸入够焊缝）；
+        · open_cylinder：纯视觉、零厚度开口管，不进碰撞世界（跳过）。
+        每块 fix_normals 保证外向法线（供 igl 缠绕数按组件求和纠符号）。返回可能为空列表。
+        """
+        out = []
+        for ob in self.obstacles:
+            if ob.otype == 2:
+                for mesh in ob.meshes:
+                    tm = _polygon_mesh_to_trimesh(mesh)
+                    if tm is not None:
+                        out.append(tm)
+            elif ob.otype == 3 and ob.kind == "open_box":
+                for prim in ob.prims:
+                    out.append(_box_prim_to_trimesh(prim))
+            # open_cylinder：纯视觉，不注入碰撞世界
+        for tm in out:
+            try:
+                tm.fix_normals()
+            except Exception:
+                pass
+        return out
+
+    def _inject_obstacles_into_solver(self, solver):
+        """把当前障碍实体 + 工件 mesh 合并重算 signed ESDF，覆盖 solver 的碰撞体素（避障）。
+
+        镜像 InitPoseLookupSolver._compute_esdf 的体素化 + igl 缠绕数纠符号，但：
+          · 世界含【工件 mesh + 障碍实体】（障碍走 cuRobo Mesh 的 vertices/faces，无需临时文件）；
+          · bbox 取【工件 ∪ 所有障碍】并集（+4 voxel），否则伸出工件范围的障碍会掉出体素网格；
+          · igl sign 用合并后的 (V,F)（多个 watertight 组件缠绕数求和）。
+        随后用新 ESDF 重建 VoxelGrid 并 world_voxel_coll.update_voxel_data —— solve_one_weld_lookup
+        的碰撞查询（robot_world.get_collision_distance）走的正是这张体素，故算法一行不改即自动避障。
+        仅工件（无可注入障碍）时直接返回，不动 solver。
+        """
+        import gt_gen.compat  # noqa: F401  warp shim，须在 import curobo 前
+        import torch
+        import trimesh as _trimesh
+        from curobo.geom.types import WorldConfig, Cuboid, Mesh as CuMesh, VoxelGrid
+        from curobo.geom.sdf.world import CollisionCheckerType, WorldCollisionConfig
+        from curobo.geom.sdf.world_mesh import WorldMeshCollision
+        from curobo.geom.sdf.world_voxel import WorldVoxelCollision
+        from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
+        gt_gen.compat.apply_trimesh_shim()
+
+        obs_tms = self._obstacle_solid_trimeshes()
+        if not obs_tms:
+            print("[scene] 无可注入碰撞世界的障碍（仅工件或仅 open_cylinder）")
+            return
+
+        voxel_size = float(solver.voxel_size)
+
+        # 工件 mesh + 障碍合并 mesh 的顶点/面
+        wp = _trimesh.load(solver.obj_fp, force="mesh", process=False)
+        wp_V = np.asarray(wp.vertices, np.float64)
+        wp_F = np.asarray(wp.faces, np.int64).reshape(-1, 3)
+        obs_merged = _trimesh.util.concatenate(obs_tms)
+        obs_V = np.asarray(obs_merged.vertices, np.float64)
+        obs_F = np.asarray(obs_merged.faces, np.int64).reshape(-1, 3)
+
+        # 并集 bbox（工件 ∪ 障碍）+ 4 voxel 余量
+        allV = np.vstack([wp_V, obs_V])
+        bbox_min = allV.min(axis=0)
+        bbox_max = allV.max(axis=0)
+        center = (bbox_min + bbox_max) / 2.0
+        size = (bbox_max - bbox_min) + 4.0 * voxel_size
+
+        wp_mesh = CuMesh(name="workpiece", pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                         file_path=solver.obj_fp, scale=[1.0, 1.0, 1.0])
+        obs_mesh = CuMesh(name="obstacles", pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                          vertices=obs_V.tolist(), faces=obs_F.tolist())
+        world = WorldConfig(mesh=[wp_mesh, obs_mesh])
+        coll_cfg = WorldCollisionConfig.load_from_dict(
+            {"checker_type": CollisionCheckerType.MESH, "max_distance": 5.0,
+             "n_envs": 1, "cache": {"mesh": 2, "obb": 2}},
+            world, solver.tensor_args)
+        mesh_coll = WorldMeshCollision(coll_cfg)
+
+        bbox_cuboid = Cuboid(
+            name="scene_bbox",
+            pose=[float(center[0]), float(center[1]), float(center[2]), 1.0, 0.0, 0.0, 0.0],
+            dims=size.tolist())
+        esdf = mesh_coll.get_esdf_in_bounding_box(bbox_cuboid, voxel_size=voxel_size)
+
+        # igl 广义缠绕数纠 sign（工件 + 障碍合并 V,F；正=内→碰撞）
+        try:
+            import igl
+            xyzr = esdf.create_xyzr_tensor(transform_to_origin=True, tensor_args=solver.tensor_args)
+            voxel_centers = xyzr[:, :3].cpu().numpy().astype(np.float64)
+            V = np.vstack([wp_V, obs_V])
+            F = np.vstack([wp_F, obs_F + len(wp_V)])
+            wn = igl.fast_winding_number(V, F, voxel_centers)
+            inside_mask = wn > 0.5
+            unsigned = esdf.feature_tensor.abs()
+            inside_t = torch.from_numpy(inside_mask).to(unsigned.device)
+            sign = torch.where(inside_t, torch.ones_like(unsigned), -torch.ones_like(unsigned))
+            esdf.feature_tensor = sign * unsigned
+            n_in = int(inside_mask.sum()); n_tot = inside_mask.size
+            print(f"[scene] 障碍并入 ESDF：{len(obs_tms)} 块实体，igl inside "
+                  f"{n_in}/{n_tot} voxels（{100.0 * n_in / max(n_tot, 1):.1f}%）")
+        except ImportError:
+            print("[scene][warn] libigl 未安装，障碍 ESDF sign 沿用 cuRobo 默认")
+        except Exception as e:
+            print(f"[scene][warn] igl winding number 失败: {e}；用 cuRobo 默认 sign")
+
+        # 覆盖 solver 的碰撞体素并【重建】world_voxel_coll + robot_world（并集 bbox 比工件-only 大，
+        # update_voxel_data 只能原地更新同尺寸网格，故这里整体重建；镜像 _build_robot_world 的建法）。
+        solver._esdf_feature = esdf.feature_tensor.clone()
+        solver._esdf_dims = list(esdf.dims)
+        solver._esdf_center_world = center.copy()
+        new_voxel = VoxelGrid(
+            name="workpiece", dims=solver._esdf_dims,
+            pose=[float(center[0]), float(center[1]), float(center[2]), 1.0, 0.0, 0.0, 0.0],
+            voxel_size=voxel_size, feature_tensor=solver._esdf_feature)
+        world_voxel = WorldConfig(voxel=[new_voxel])
+        voxel_cfg = WorldCollisionConfig.load_from_dict(
+            {"checker_type": CollisionCheckerType.VOXEL, "max_distance": 5.0, "n_envs": 1},
+            world_voxel, solver.tensor_args)
+        solver.world_voxel_coll = WorldVoxelCollision(voxel_cfg)
+        solver.world_voxel_coll.update_voxel_data(new_voxel)
+        rwconfig = RobotWorldConfig.load_from_config(
+            solver.robot_cfg, None, collision_activation_distance=0.0,
+            collision_checker_type=CollisionCheckerType.VOXEL,
+            world_collision_checker=solver.world_voxel_coll, tensor_args=solver.tensor_args)
+        solver.robot_world = RobotWorld(rwconfig)
 
     # ------------------------------------------------------------------
     # 障碍物（工件 mesh 系；与 weld_json 的 corrected_p0/p1/bisector 同框）
