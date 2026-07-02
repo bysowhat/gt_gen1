@@ -1434,17 +1434,64 @@ def main():
 
 
 
-def lay_flat(obj_fp, viz) -> np.ndarray:
+def _dominant_seam_points(obj_fp, long_len, weld_json=None, seam_ratio=0.9):
+    """读 obj 同目录同前缀的 <stem>_weld_angle3.json，返回「最长那批焊缝」的所有端点 (M,3)。
+
+    仅当【最长焊缝 > 工件最长轴长度的一半】时才启用焊缝逻辑（否则返回 None，交回质心兜底）；
+    启用时取长度 ≥ seam_ratio·最长 的那批「差不多长」焊缝的全部端点。
+    坐标为工件 mesh 系（corrected_p0/p1，与 obj 顶点同系）。
+    返回 (端点(M,3) 或 None, 用到的 json 路径 或 None, 最长焊缝长度)。
+    """
+    import json
+    fp = weld_json
+    if fp is None:                                              # 自动定位：同目录同前缀
+        d = os.path.dirname(obj_fp); base = os.path.basename(obj_fp)
+        for suf in ("_part_watertight.obj", ".obj"):
+            if base.endswith(suf):
+                cand = os.path.join(d, base[:-len(suf)] + "_weld_angle3.json")
+                if os.path.isfile(cand):
+                    fp = cand
+                    break
+    if not fp or not os.path.isfile(fp):
+        return None, None, 0.0
+    try:
+        with open(fp, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None, fp, 0.0
+    segs = []
+    for w in data:
+        try:
+            p0 = np.asarray(w["corrected_p0"], dtype=np.float64)
+            p1 = np.asarray(w["corrected_p1"], dtype=np.float64)
+        except Exception:
+            continue
+        if p0.shape == (3,) and p1.shape == (3,):
+            segs.append((p0, p1))
+    if not segs:
+        return None, fp, 0.0
+    lens = np.array([np.linalg.norm(p1 - p0) for p0, p1 in segs])
+    max_seam = float(lens.max())
+    if max_seam <= 0.5 * float(long_len):                       # 最长焊缝没过最长轴一半 → 不用焊缝逻辑
+        return None, fp, max_seam
+    keep = lens >= seam_ratio * max_seam                        # 「差不多长」的那批
+    pts = np.array([p for (p0, p1), k in zip(segs, keep) if k for p in (p0, p1)])
+    return pts, fp, max_seam
+
+
+def lay_flat(obj_fp, viz, weld_json=None, seam_ratio=0.9) -> np.ndarray:
     """把工件「摆平」放到 z=0 地面上，返回 4×4 变换 T（p_world = T · p_obj）。
 
     硬约束：相对 origin 的旋转 **必须是「绕 x/y/z 轴 90° 整数倍」的组合**——
-    即 R 只能取立方体旋转群的 24 个有符号置换矩阵（det=+1）之一，
+    即 R 只能取立方体旋转群的有符号置换矩阵（det=+1）之一，
     绝不允许出现 45° 之类的任意滚转角（旧方案B 用凸包支撑边外法向定滚转，会破坏这一点）。
 
     做法：
       ① 在 mesh 自身坐标系里量各轴包围盒长度，最长者为「长轴」；
       ② 把长轴对到世界 +X（长轴水平），只剩「绕 +X 滚转 90° 整倍」4 种朝向；
-      ③ 从这 4 种里取「落地后质心最低（最稳/最平）」者；
+      ③ 选滚转：若同目录 _weld_angle3.json 里存在「长度 > 最长轴一半」的长焊缝，
+         则取最长那批焊缝、让它们尽量共处一个水平面（端点世界 z 跨度最小）；
+         否则（无此长焊缝 / 无 json / 4 者难分）退回「落地质心最低」；
       ④ 平移使 min z = 0 贴地、xy 居中。
     长轴稳定落在世界 +X（下游 _kejian_orientations 依赖此约定）；长轴/滚转都恰好 90° 整倍，
     故 L/工字/槽型梁也停在真实平面上。
@@ -1476,9 +1523,15 @@ def lay_flat(obj_fp, viz) -> np.ndarray:
     if np.linalg.det(R0) < 0:
         R0[:, b] = (0.0, 0.0, -1.0)                             # 翻一轴符号 → det=+1（右手系）
 
-    # ③ 长轴恒沿 +X，仅剩「绕 +X 滚转 90° 整倍」4 种朝向；取落地质心最低者（稳定优先）
+    # ③ 长轴恒沿 +X，仅剩「绕 +X 滚转 90° 整倍」4 种朝向。
+    #    有「超过最长轴一半」的长焊缝 → 让最长那批焊缝尽量共处一个水平面（端点 z 跨度最小）；
+    #    否则（含无焊缝、4 者 z 跨度难分）退回「落地质心最低」。
+    dom_pts, used_json, max_seam = _dominant_seam_points(
+        obj_fp, ext_mesh[i_long], weld_json, seam_ratio)
+    z_tol = max(1e-4, 0.01 * float(np.linalg.norm(ext_mesh)))   # z 跨度差 < 1% 对角线视为不可区分
+
     Rx90 = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
-    best = None  # (stable, -com_h, R)
+    best = None  # (stable, -zkey(焊缝 z 跨度桶，越小越好), -com_h, R, zspread)
     Rk = R0
     for _ in range(4):
         Vw = (Rk @ V.T).T
@@ -1487,11 +1540,17 @@ def lay_flat(obj_fp, viz) -> np.ndarray:
         com_h = float(cw[2] - mn[2])                            # 落地后质心高度（越低越平/越稳）
         stable = (mn[0] - 1e-9 <= cw[0] <= mx[0] + 1e-9 and
                   mn[1] - 1e-9 <= cw[1] <= mx[1] + 1e-9)        # 质心 xy 落在底面投影内
-        cand = (1 if stable else 0, -com_h, Rk)
-        if best is None or cand[:2] > best[:2]:
+        if dom_pts is not None:
+            zc = (Rk @ dom_pts.T).T[:, 2]
+            zspread = float(zc.max() - zc.min())                # 最长那批焊缝端点的世界 z 跨度
+        else:
+            zspread = 0.0
+        zkey = int(round(zspread / z_tol))                      # 量化：跨度相近者同桶 → 交给质心兜底
+        cand = (1 if stable else 0, -zkey, -com_h, Rk, zspread)
+        if best is None or cand[:3] > best[:3]:
             best = cand
         Rk = Rx90 @ Rk                                          # 绕 +X 再滚 90°
-    R = best[2]
+    R = best[3]
 
     # ④ 平移：min z = 0 贴地，xy 居中（用 bbox 中心）
     Vw = (R @ V.T).T
@@ -1499,9 +1558,14 @@ def lay_flat(obj_fp, viz) -> np.ndarray:
     t = np.array([-(mn[0] + mx[0]) / 2.0, -(mn[1] + mx[1]) / 2.0, -mn[2]])
     T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
 
-    print(f"[lay_flat] mesh 三轴长(米): {ext_mesh.round(4)}  最长轴#{i_long}")
+    mode = ("焊缝面水平" if dom_pts is not None
+            else ("焊缝≤半长→质心" if used_json else "无焊缝json→质心"))
+    print(f"[lay_flat] mesh 三轴长(米): {ext_mesh.round(4)}  最长轴#{i_long}  依据={mode}")
     print(f"[lay_flat] 选中 90°-整倍旋转 R(行)= {R[0].astype(int)} {R[1].astype(int)} {R[2].astype(int)}")
-    print(f"[lay_flat] 落地后质心高={-best[1]:.4f} 稳定={bool(best[0])}")
+    if dom_pts is not None:
+        print(f"[lay_flat] 最长焊缝={max_seam:.4f}(>半长{0.5*float(ext_mesh[i_long]):.4f}) "
+              f"参与端点={len(dom_pts)} 选中焊缝 z 跨度={best[4]:.4f}")
+    print(f"[lay_flat] 落地后质心高={-best[2]:.4f} 稳定={bool(best[0])}")
     print(f"[lay_flat] 摆平后包围盒(米): 长×宽×高 = "
           f"{(mx-mn)[0]:.4f} × {(mx-mn)[1]:.4f} × {(mx-mn)[2]:.4f}")
 
