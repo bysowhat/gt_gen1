@@ -396,8 +396,7 @@ class InitPoseLookupSolver:
 
     def __init__(self, cfg, obj_fp: Optional[str],
                  collision_tolerance: float = 0.03, voxel_size: float = 0.02,
-                 n_per_dof: int = 7, clearance_inflate: float = 0.0,
-                 tip_spheres: Optional[dict] = None):
+                 n_per_dof: int = 7, clearance_inflate: float = 0.0):
         import gt_gen.compat  # noqa: F401  warp shim，须在 import curobo 前
         from curobo.types.base import TensorDeviceType
 
@@ -406,12 +405,9 @@ class InitPoseLookupSolver:
         self.obj_fp = obj_fp
         self.collision_tolerance = collision_tolerance
         self.voxel_size = voxel_size
-        self.n_per_dof = n_per_dof
-        # 间隙膨胀：手臂本体球半径 +clearance_inflate 再判碰（焊枪尖端 tip_spheres 排除），
-        # 等效要求手臂离工件留间隙。inflate_mask 在首次 solve 时按 tip_spheres 懒构造。
+        # 间隙膨胀：所有碰撞球半径 +clearance_inflate 再判碰，等效要求整臂离工件留间隙；0=关闭。
         self.clearance_inflate = float(clearance_inflate)
-        self.tip_spheres_cfg = dict(tip_spheres or {})
-        self.inflate_mask = None
+        self.n_per_dof = n_per_dof
 
         self._load_robot()
         self.robot_world = None
@@ -740,57 +736,6 @@ class InitPoseLookupSolver:
         return True
 
     # ---- 在线求解 ----
-    def _build_inflate_mask(self):
-        """构造碰撞球半径膨胀 mask (K,)：焊枪尖端球（tip_spheres_cfg）置 0（不膨胀），其余置 1。
-
-        间隙膨胀（clearance_inflate>0）时，手臂本体球半径 +clearance、尖端球保持原半径——
-        既让整臂离工件留间隙，又不妨碍焊枪尖端贴到焊缝 standoff 点。
-        尖端球靠【link 局部系 center】匹配 robot cfg collision_spheres 定义来定位（不写死球索引）：
-          get_sphere_index_from_link_name(link) 给出该 link 全部球的全局索引（顺序=定义顺序），
-          再用 yaml centers 在该 link 的 collision_spheres 定义里按 center 匹配出局部序号 → 全局索引。
-        匹配数必须等于 centers 数，否则报错（避免静默排错球）。"""
-        import torch
-        K = int(self.K_link)
-        mask = torch.ones(K, device=self.tensor_args.device, dtype=self.tensor_args.dtype)
-        cfg_tip = self.tip_spheres_cfg or {}
-        centers = cfg_tip.get("centers") or []
-        if self.clearance_inflate <= 0.0 or not centers:
-            self.inflate_mask = mask
-            self.n_tip_excluded = 0
-            return
-
-        link = cfg_tip.get("link")
-        tol = float(cfg_tip.get("match_tol_m", 0.0005))
-        kc = self.robot_cfg.kinematics.kinematics_config
-        gidx = kc.get_sphere_index_from_link_name(link)
-        gidx = gidx.tolist() if hasattr(gidx, "tolist") else list(gidx)
-        defs = self.robot_cfg_dict["kinematics"]["collision_spheres"][link]
-        if len(gidx) != len(defs):
-            raise ValueError(
-                f"[间隙膨胀] {link} 全局球数 {len(gidx)} != collision_spheres 定义数 {len(defs)}，"
-                f"无法用定义顺序定位尖端球")
-        excluded = []
-        for c in centers:
-            cc = np.asarray(c, dtype=np.float64)
-            hit = None
-            for j, sph in enumerate(defs):
-                if np.linalg.norm(np.asarray(sph["center"], dtype=np.float64) - cc) <= tol:
-                    hit = j
-                    break
-            if hit is None:
-                raise ValueError(
-                    f"[间隙膨胀] tip_spheres center {cc.tolist()} 在 {link} 的 collision_spheres "
-                    f"里没匹配到（match_tol_m={tol}）")
-            excluded.append(int(gidx[hit]))
-        if len(set(excluded)) != len(centers):
-            raise ValueError(f"[间隙膨胀] tip_spheres 匹配到重复球：{excluded}")
-        for gi in excluded:
-            mask[gi] = 0.0
-        self.inflate_mask = mask
-        self.n_tip_excluded = len(excluded)
-        print(f"[kejian2] 间隙膨胀 clearance={self.clearance_inflate * 100:.1f}cm："
-              f"排除焊枪尖端球 {len(excluded)}/{K}（{link}），其余 {K - len(excluded)} 球半径 +clearance")
-
     def solve_one_weld_lookup(self, weld: Dict,
                               rot_x_deg: Tuple[float, ...] = (0.0,),
                               rot_y_deg: Tuple[float, ...] = (0.0,),
@@ -807,10 +752,6 @@ class InitPoseLookupSolver:
         import torch
         device = self.tensor_args.device
         dtype = self.tensor_args.dtype
-
-        # 间隙膨胀 mask（焊枪尖端球排除）懒构造一次；clearance<=0 时为全 1（不改变行为）。
-        if self.inflate_mask is None:
-            self._build_inflate_mask()
 
         mid = torch.tensor(weld["mid_world"], device=device, dtype=dtype)
         bisector = torch.tensor(weld["bisector_world"], device=device, dtype=dtype)
@@ -932,12 +873,10 @@ class InitPoseLookupSolver:
                         link_r_b = self.link_spheres_t[..., 3]
                         ret_xyz_b = self.retract_spheres_t[:, :3]
                         ret_r = self.retract_spheres_t[:, 3]
-                        # 间隙膨胀：手臂本体球半径 +clearance（inflate_mask 已把焊枪尖端球置 0 → 不膨胀）。
-                        # retract 球半径与候选无关、循环外加一次；link 球半径在 chunk 内对子集加（省显存）。
-                        add_r = None
+                        # 间隙膨胀：所有碰撞球半径 +clearance（整臂本体 + retract，无尖端例外）。
                         if self.clearance_inflate > 0.0:
-                            add_r = self.clearance_inflate * self.inflate_mask   # (K,)
-                            ret_r = ret_r + add_r
+                            link_r_b = link_r_b + self.clearance_inflate
+                            ret_r = ret_r + self.clearance_inflate
 
                         BIG = 1.0e6
                         d_link = torch.full((N,), BIG, device=device, dtype=dtype)
@@ -952,8 +891,6 @@ class InitPoseLookupSolver:
                             m = R_c.shape[0]
                             # 整臂连杆球（每条候选用各自 q 的 link_spheres + 该 R,t 反变到 mesh world）
                             link_r_c = link_r_b[sub]                  # (c,K)
-                            if add_r is not None:
-                                link_r_c = link_r_c + add_r[None, :]
                             deltas_link_c = link_xyz_b[sub] - t_c[:, None, :]
                             link_xyz_w_c = torch.einsum("nji,nkj->nki", R_c, deltas_link_c)
                             link_spheres_w_c = torch.cat(
@@ -1500,18 +1437,21 @@ def main():
 def lay_flat(obj_fp, viz) -> np.ndarray:
     """把工件「摆平」放到 z=0 地面上，返回 4×4 变换 T（p_world = T · p_obj）。
 
-    方案 B（横截面 2D 凸包稳定支撑边）：
-      ① trimesh OBB 求最长轴 u_long（设为世界 +X，水平）；
-      ② 把所有顶点投影到 ⟂u_long 的平面得 2D 轮廓，取 2D 凸包；
-      ③ 遍历凸包每条边，把该边贴地（其外法向朝 -Z），仅保留「3D 质心投影落在该边区间内」
-         的稳定支撑边，在其中取质心最低者 → 定出绕 u_long 的滚转角；
-      ④ 合成旋转 R = M^T，再平移使 min z = 0 贴地、xy 居中。
-    长轴沿世界 X；剩两轴哪个垂直由真实截面 + 质心判稳决定（非纯包围盒长短，故 L/工字/槽型梁皆正确）。
+    硬约束：相对 origin 的旋转 **必须是「绕 x/y/z 轴 90° 整数倍」的组合**——
+    即 R 只能取立方体旋转群的有符号置换矩阵（det=+1）之一，
+    绝不允许出现 45° 之类的任意滚转角（旧方案B 用凸包支撑边外法向定滚转，会破坏这一点）。
+
+    做法：
+      ① 在 mesh 自身坐标系里量各轴包围盒长度，最长者为「长轴」；
+      ② 把长轴对到世界 +X（长轴水平），只剩「绕 +X 滚转 90° 整倍」4 种朝向；
+      ③ 从这 4 种里取「落地后质心最低（最稳/最平）」者；
+      ④ 平移使 min z = 0 贴地、xy 居中。
+    长轴稳定落在世界 +X（下游 _kejian_orientations 依赖此约定）；长轴/滚转都恰好 90° 整倍，
+    故 L/工字/槽型梁也停在真实平面上。
 
     viz=True 时用 open3d 显示摆平后的工件 + z=0 地面 + base 坐标架。
     """
     import trimesh as _trimesh
-    from scipy.spatial import ConvexHull
 
     tm = _trimesh.load(obj_fp, force="mesh", process=False)
     V = np.asarray(tm.vertices, dtype=np.float64)                # (N,3)
@@ -1523,69 +1463,45 @@ def lay_flat(obj_fp, viz) -> np.ndarray:
     except Exception:
         com = V.mean(axis=0)
 
-    # ① OBB → 最长轴 u_long + 另两轴 e1,e2（张成 ⟂u_long 平面）
-    obb = tm.bounding_box_oriented
-    R_obb = np.asarray(obb.primitive.transform, dtype=np.float64)[:3, :3]  # 列=OBB 轴
-    ext = np.asarray(obb.primitive.extents, dtype=np.float64)             # 三轴长
-    i_long = int(np.argmax(ext))
-    others = [k for k in range(3) if k != i_long]
-    u_long = R_obb[:, i_long]; u_long = u_long / np.linalg.norm(u_long)
-    e1 = R_obb[:, others[0]]; e1 = e1 / np.linalg.norm(e1)
-    e2 = R_obb[:, others[1]]; e2 = e2 / np.linalg.norm(e2)
+    # ① mesh 系各轴包围盒长度 → 最长轴（origin 已轴对齐，故长轴必是某条 mesh 轴）
+    ext_mesh = V.max(axis=0) - V.min(axis=0)
+    i_long = int(np.argmax(ext_mesh))
 
-    # ② 投影到 ⟂u_long 平面（基 e1,e2）→ 2D 点 + 2D 凸包
-    P = np.stack([V @ e1, V @ e2], axis=1)                       # (N,2)
-    c2 = np.array([com @ e1, com @ e2])                          # 质心 2D 投影
-    hull = ConvexHull(P)
-    hv = P[hull.vertices]                                        # 凸包顶点（有序）
-    hull_centroid = hv.mean(axis=0)
-    m = len(hv)
+    # ② 长轴（mesh 第 i_long 轴）→ 世界 +X，其余两轴放 Y/Z，构一个 det=+1 的基准旋转 R0
+    a, b = [k for k in range(3) if k != i_long]
+    R0 = np.zeros((3, 3))
+    R0[:, i_long] = (1.0, 0.0, 0.0)
+    R0[:, a] = (0.0, 1.0, 0.0)
+    R0[:, b] = (0.0, 0.0, 1.0)
+    if np.linalg.det(R0) < 0:
+        R0[:, b] = (0.0, 0.0, -1.0)                             # 翻一轴符号 → det=+1（右手系）
 
-    # ③ 遍历凸包边，挑「稳定 + 质心最低」的支撑边
-    best = None  # (com_h, n_down_2d, edge_idx, stable)
-    for k in range(m):
-        pi = hv[k]; pj = hv[(k + 1) % m]
-        d = pj - pi; L = float(np.linalg.norm(d))
-        if L < 1e-9:
-            continue
-        d = d / L
-        # 外法向（指向凸包外侧 = 贴地后朝下方向）
-        n = np.array([d[1], -d[0]])
-        if n @ (0.5 * (pi + pj) - hull_centroid) < 0:
-            n = -n
-        # 稳定性：质心沿边的投影是否落在 [0,L] 内
-        t_along = float((c2 - pi) @ d)
-        stable = (-1e-9 <= t_along <= L + 1e-9)
-        # 贴地后质心高度 = 质心到该边线、沿 -n（向上）的距离
-        com_h = float((c2 - pi) @ (-n))
-        cand = (com_h, n.copy(), k, stable)
-        # 优先稳定边；同稳定性时取质心更低者
-        if best is None or (cand[3], -cand[0]) > (best[3], -best[0]):
+    # ③ 长轴恒沿 +X，仅剩「绕 +X 滚转 90° 整倍」4 种朝向；取落地质心最低者（稳定优先）
+    Rx90 = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+    best = None  # (stable, -com_h, R)
+    Rk = R0
+    for _ in range(4):
+        Vw = (Rk @ V.T).T
+        cw = Rk @ com
+        mn = Vw.min(axis=0); mx = Vw.max(axis=0)
+        com_h = float(cw[2] - mn[2])                            # 落地后质心高度（越低越平/越稳）
+        stable = (mn[0] - 1e-9 <= cw[0] <= mx[0] + 1e-9 and
+                  mn[1] - 1e-9 <= cw[1] <= mx[1] + 1e-9)        # 质心 xy 落在底面投影内
+        cand = (1 if stable else 0, -com_h, Rk)
+        if best is None or cand[:2] > best[:2]:
             best = cand
-    com_h, n_down_2d, edge_idx, stable = best
+        Rk = Rx90 @ Rk                                          # 绕 +X 再滚 90°
+    R = best[2]
 
-    # ④ 合成旋转：u_long→+X，外法向(贴地朝下)→-Z
-    w_down = n_down_2d[0] * e1 + n_down_2d[1] * e2               # 3D 贴地朝下方向（mesh 系）
-    w_down = w_down / np.linalg.norm(w_down)
-    col1 = u_long                                                # → X
-    col3 = -w_down                                               # 向上 → Z
-    col3 = col3 - (col3 @ col1) * col1                           # 数值再正交化
-    col3 = col3 / np.linalg.norm(col3)
-    col2 = np.cross(col3, col1); col2 = col2 / np.linalg.norm(col2)   # → Y（右手）
-    M = np.stack([col1, col2, col3], axis=1)                     # 列=mesh 轴
-    R = M.T                                                      # p_world = R · p_obj
-
-    # 平移：min z = 0 贴地，xy 居中（用 bbox 中心）
+    # ④ 平移：min z = 0 贴地，xy 居中（用 bbox 中心）
     Vw = (R @ V.T).T
     mn = Vw.min(axis=0); mx = Vw.max(axis=0)
     t = np.array([-(mn[0] + mx[0]) / 2.0, -(mn[1] + mx[1]) / 2.0, -mn[2]])
     T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
 
-    # 诊断（含与「纯包围盒最短轴垂直」朴素法的对照）
-    i_short = others[int(np.argmin([ext[others[0]], ext[others[1]]]))]
-    print(f"[lay_flat] OBB 三轴长(米): {ext.round(4)}  最长轴#{i_long}(→X) 长={ext[i_long]:.4f}")
-    print(f"[lay_flat] 方案B 选中凸包边#{edge_idx} 稳定={stable} 质心高={com_h:.4f}")
-    print(f"[lay_flat] (对照 朴素法: 最短轴#{i_short} 长={ext[i_short]:.4f} 垂直)")
+    print(f"[lay_flat] mesh 三轴长(米): {ext_mesh.round(4)}  最长轴#{i_long}")
+    print(f"[lay_flat] 选中 90°-整倍旋转 R(行)= {R[0].astype(int)} {R[1].astype(int)} {R[2].astype(int)}")
+    print(f"[lay_flat] 落地后质心高={-best[1]:.4f} 稳定={bool(best[0])}")
     print(f"[lay_flat] 摆平后包围盒(米): 长×宽×高 = "
           f"{(mx-mn)[0]:.4f} × {(mx-mn)[1]:.4f} × {(mx-mn)[2]:.4f}")
 
@@ -2091,8 +2007,7 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
         collision_tolerance=cfg.plan_init_kejian2_collision_tolerance,
         voxel_size=cfg.plan_init_kejian2_voxel_size,
         n_per_dof=cfg.plan_init_kejian2_n_per_dof,
-        clearance_inflate=cfg.plan_init_kejian2_clearance_inflate,
-        tip_spheres=cfg.plan_init_kejian2_tip_spheres)
+        clearance_inflate=cfg.plan_init_kejian2_clearance_inflate)
     _sync()
     prof_setup["②solver初始化(含工件ESDF体素化)"] = _time.time() - _t
 
