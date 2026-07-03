@@ -403,6 +403,14 @@ def _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_d
       no_reachable_candidate —— 有 B 但无可达候选(常是 stuck 主因)：B 全画橙(没有候选能看它)，标题示意转兜底。
       scene_infeasible       —— P* 不存在：仅底图，标题示意场景不可行。
 
+    一屏最多三个不同颜色的整臂，各是一个不同的关节构型：
+      绿臂  cur_cfg          —— 当前整臂：机械臂这一轮实际所在的构型（底图）。
+      黄臂  P[reach_idx]     —— reach_pt 构型：沿真值最优路 P* 走到「被 UNKNOWN 挡住、走不下去」
+                               的那个路点的整臂（仅 P* 存在时画）。
+      青臂  r.cfg            —— 选中的下一视点整臂：NBV 这一轮 argmax 挑出的候选构型（把相机移到这看 B），
+                               仅 status==ok 时画。
+    一句话：绿=现在在哪，黄=沿最优路卡在哪，青=下一步打算把相机移到哪。
+
     依赖 verify_step8 的 open3d 工具（需显示器 + open3d）。
     """
     import os
@@ -589,7 +597,7 @@ def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene
 
 def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 camera_model=None, params=None, h_truth_plan=None, p_star_init=None,
-                world_plan=None):
+                world_plan=None, goal_cfg=None, start_cfg=None):
     """完整 ①~⑦ 主循环（goal 已含 standoff 后退）。
 
     入参：
@@ -597,7 +605,12 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
       h_expl      : VOXEL 探索 handle（纯三态，无 mesh）——①/⑤ 的实际无碰撞规划。
       voxmap      : 三态体素图，调用方已建好并罩好初始 FREE（圆柱法）。
       truth_scene : base 系 trimesh，raycast 几何源。
-      goal_pose   : 末端 standoff 目标位姿 ((x,y,z),(qw,qx,qy,qz))。
+      goal_pose   : 末端 standoff 目标位姿 ((x,y,z),(qw,qx,qy,qz))。goal_cfg 给定且此参为 None
+                    时，由 FK(goal_cfg) 求出（与关节目标自洽），仅供 NBV/curobo 后端用。
+      goal_cfg    : 可选【关节空间目标】(长度=dof)。给定则 STOMP 后端的步①(直达)与步②(P*)改走
+                    plan_joint_single——直接规划到该关节角，不再解 IK / 走位姿目标（见对话确认：
+                    place_obstacles_to_gt2 用 compute_goal_pose 的 joints 变体当目标）。curobo 后端
+                    忽略此参、仍用 goal_pose。
       camera_model: None → load_camera_model(h_truth.config)。
       params      : None → h_truth.config.params。
       h_truth_plan: 可选 MESH 真值 handle，仅用于步② 规划 P*——其【放置的障碍已外扩 buffer、
@@ -606,11 +619,14 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     注意：碰撞/NBV/raycast 仍用 h_truth（真实尺寸），buffer 只影响 P* 的走向。
       p_star_init : 可选 (T,dof) 预规划轨迹（= --scene npz 里 place_obstacles 已成功规划好的绕行轨迹）。
                     传入则【第一轮(rnd==0)直接拿它当 P*，不再重新规划】——绕开「同一空间这里 plan 却
-                    失败」的随机性/位姿差异，用全知阶段已验证可行的那条路起步。其起点须 = retract_config
-                    （place_obstacles 也从 retract 规划，故一致）。仅第一轮用；之后臂已移动，照常重新规划。
+                    失败」的随机性/位姿差异，用全知阶段已验证可行的那条路起步。其起点须 = 实际起点
+                    （start_cfg 给定则为它，否则 retract_config；place_obstacles 也从 retract 规划，故一致）。
+                    仅第一轮用；之后臂已移动，照常重新规划。
       world_plan  : 可选 cuRobo WorldConfig（= h_plan 对应的 MESH 世界，工件+膨胀障碍）。仅当
                     cfg.planner_backend=='stomp' 时步② 需要它（STOMP 把 world 作参数直接传入）；
                     curobo 后端忽略此参数（用 h_plan 内部世界）。None 时 stomp 步② 无法规划 P*。
+      start_cfg   : 可选起始关节角(长度=dof)。给定则主循环从它起步；None → 用 cfg.retract_config
+                    （保持原行为）。供 place_obstacles_to_gt2 传入 scene.cur_cfg，免去覆盖 retract_config 的 hack。
 
     返回 (GT, status, info)：
       GT     : (T, dof) np.float64 关节角序列（含起点 retract）。
@@ -629,13 +645,20 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
         camera_model = load_camera_model(cfg)
     if params is None:
         params = cfg.params
+    # goal_cfg（关节空间目标）：STOMP 步①/步② 直接规划到该关节角（plan_joint_single）；goal_pose
+    # 缺省则由 FK(goal_cfg) 求出，供 NBV（plan_on_truth 兜底）/curobo 后端使用，与关节目标自洽。
+    if goal_cfg is not None:
+        goal_cfg = [float(v) for v in goal_cfg]
+        if goal_pose is None:
+            eep, eeq, _ = ci.fk(h_truth, goal_cfg)
+            goal_pose = (list(map(float, eep)), list(map(float, eeq)))
     loop_p = params.get("loop", {})
     max_rounds = int(loop_p.get("max_rounds", 200))
     stuck_rounds = int(loop_p.get("stuck_rounds", 5))
     every_n = int(loop_p.get("observe_every_n", 10))
     max_depth = cfg.max_depth_m
 
-    cur_cfg = list(cfg.retract_config)
+    cur_cfg = [float(v) for v in start_cfg] if start_cfg is not None else list(cfg.retract_config)
     GT = [np.asarray(cur_cfg, dtype=np.float64)]
     metric = ci.free_pose_metric(h_truth, free_rot=(0,))     # 放开焊枪绕接近轴 roll
     h_plan = h_truth_plan if h_truth_plan is not None else h_truth  # 步② P* 规划用（带障碍 buffer / 退回 h_truth）
@@ -660,11 +683,14 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
 
         # 步①：试在已确认自由区直接规划到 goal（h_expl，UNKNOWN 已当障碍）
         if cfg.planner_backend == "stomp":
-            # STOMP：把当前 voxmap 非 FREE 区转 mesh，直接规划到 goal 位姿。
+            # STOMP：把当前 voxmap 非 FREE 区转 mesh；goal_cfg 给定→直接规划到目标关节角，否则规划到 goal 位姿。
             from gt_gen import stomp_iface as si
             _w1, _ck1 = si.world_from_voxmap_auto(cfg, voxmap)
             # _debug_viz_w1(_w1, h_expl, voxmap, cur_cfg, truth_scene, goal_pose, rnd=rnd)  # 看 _w1（mesh/cuboid）+ 当前整臂（每轮弹窗；只看首轮改 if rnd==0）
-            seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
+            if goal_cfg is not None:
+                seg = si.plan_joint_single(cfg, _w1, cur_cfg, goal_cfg, checker_type=_ck1)
+            else:
+                seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
             reached_direct = seg is not None
         else:
             res = ci.plan_to_pose(h_expl, cur_cfg, goal_pose,
@@ -692,7 +718,11 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 print(f"[step② P*失败 R{rnd}] backend=stomp 但未传 world_plan → 无法规划 P*")
                 P = None
             else:
-                P = si.plan_pose_single(cfg, world_plan, cur_cfg, goal_pose)
+                # goal_cfg 给定→规划到目标关节角（plan_joint_single，无 IK），否则规划到 goal 位姿。
+                if goal_cfg is not None:
+                    P = si.plan_joint_single(cfg, world_plan, cur_cfg, goal_cfg)
+                else:
+                    P = si.plan_pose_single(cfg, world_plan, cur_cfg, goal_pose)
                 if P is None:
                     print(f"[step② P*失败 R{rnd}] STOMP 在 world_plan 上未找到到 goal 的合格轨迹")
         else:
@@ -716,8 +746,8 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
         r = best_next_view_using_oracle(h_truth, cur_cfg, voxmap, truth_scene, goal_pose,
                                         params=params, camera_model=camera_model,
                                         pose_cost_metric=metric, p_star=P)
-        # _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
-        # _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
+        _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
+        _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
         info["status_seq"].append(r.status)
         info["n_B"].append(int(r.n_B))#r.n_B:本轮阻塞段B的体素个数
         if P is not None and info["P_len"] is None:

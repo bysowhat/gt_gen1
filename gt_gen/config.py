@@ -121,6 +121,21 @@ class Config:
         return list(self.raw.get("init_free", {}).get("box_max_m", [2.5, 1.3, 1.7]))
 
     @property
+    def init_free_method_for_init(self) -> str:
+        """机械臂初始 FREE 空间方案：'cylinder'=圆柱(cyl_*) | 'box'=立方体(box_*_for_init)。见 default.yaml init_free.method_for_init。"""
+        return str(self.raw.get("init_free", {}).get("method_for_init", "cylinder")).lower()
+
+    @property
+    def init_free_box_min_for_init(self) -> list:
+        """机械臂初始 FREE 空间（立方体法）：AABB 盒下界角点（米，base_link 系）。见 default.yaml init_free.box_min_m_for_init。"""
+        return list(self.raw.get("init_free", {}).get("box_min_m_for_init", [-2.5, -1.3, -0.5]))
+
+    @property
+    def init_free_box_max_for_init(self) -> list:
+        """机械臂初始 FREE 空间（立方体法）：AABB 盒上界角点（米，base_link 系）。见 default.yaml init_free.box_max_m_for_init。"""
+        return list(self.raw.get("init_free", {}).get("box_max_m_for_init", [0.6, 1.3, 1.7]))
+
+    @property
     def init_free_swept_path(self) -> str:
         """初始引导 FREE 空间（预存扫掠法）：预计算的整臂扫掠体素中心(.npz)路径。
         相对路径按项目根解析。见 default.yaml init_free.swept_path 与 scripts/viz_joints_open3d.py --save-init-free。"""
@@ -216,6 +231,12 @@ class Config:
         （相交=机械臂底座压在工件下/工件盖在底座上，丢弃该候选）。true=做该过滤（默认）；false=关闭。
         见 default.yaml plan_init_pose.base_overlap_filter。"""
         return bool(self.raw.get("plan_init_pose", {}).get("base_overlap_filter", True))
+
+    @property
+    def plan_init_workpiece_x_min(self) -> float:
+        """工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量的下限（米）：须 > 此值否则丢弃
+        （工件离底座 x 向太近/在底座后方）。见 default.yaml plan_init_pose.workpiece_x_min_m。"""
+        return float(self.raw.get("plan_init_pose", {}).get("workpiece_x_min_m", 0.3))
 
     # ---- plan_init_pose_kejian（新逻辑：固定朝向 + 平移网格 + STOMP 可达，见 scripts/plan_init_pose_kejian.py） ----
     @property

@@ -2082,19 +2082,21 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
     R_valid_list = _kejian_orientations(obj_fp)
     prof_setup["②b朝向集合(lay_flat)"] = _time.time() - _t
 
-    # —— ③' 固定底座 vs 工件 base-xy 投影相交过滤的预备（底座圆 q 无关 + 工件顶点/三角形，均一次）；
-    #        由 plan_init_pose.base_overlap_filter 开关控制：关闭则全置 None → solve 时自然跳过该过滤 ——
+    # —— ③' 「工件距 base 欧氏最近点 x」+「固定底座 vs 工件 base-xy 投影相交」两过滤的预备 ——
+    #   工件顶点/三角形【始终加载】：最近点 x 过滤必需；底座相交过滤也复用同一份顶点 xy。
+    #   底座圆则由 plan_init_pose.base_overlap_filter 开关控制：关闭则置 None → solve 时自然跳过相交过滤。
+    mesh_v, mesh_f = _load_mesh_vf(obj_fp)
+    if mesh_v is None:
+        print("[kejian2] 警告：读不到工件顶点，无法做「工件距 base 欧氏最近点 x」过滤（该候选不因此过滤）")
     if cfg.plan_init_base_overlap_filter:
         base_circles = _fixed_base_xy_circles(cfg)
         bc_cc, bc_rr, bc_umin, bc_umax = _base_circles_to_arrays(base_circles)
-        mesh_v, mesh_f = _load_mesh_vf(obj_fp)
         if not base_circles:
             print("[kejian2] 警告：取不到固定底座碰撞球，跳过「底座-工件 XY 相交」过滤")
         if mesh_v is None or mesh_f is None:
             print("[kejian2] 警告：读不到工件顶点/三角形，跳过「底座-工件 XY 相交」过滤")
     else:
         bc_cc = bc_rr = bc_umin = bc_umax = None
-        mesh_v = mesh_f = None
         print("[kejian2] base_overlap_filter=false：已关闭「底座-工件 XY 相交」过滤")
 
     return {
@@ -2108,6 +2110,7 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
         "standoff": cfg.plan_init_standoff,
         "ee_xy_range": [float(v) for v in cfg.plan_init_ee_xy_range],
         "ee_z_range": [float(v) for v in cfg.plan_init_ee_z_range],
+        "workpiece_x_min": float(cfg.plan_init_workpiece_x_min),
         "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
         "mesh_v": mesh_v, "mesh_f": mesh_f,
         "prof_setup": prof_setup,
@@ -2133,6 +2136,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     standoff = ctx["standoff"]
     xy_lo, xy_hi = ctx["ee_xy_range"]
     z_lo, z_hi = ctx["ee_z_range"]
+    wp_x_min = ctx["workpiece_x_min"]
     bc_cc, bc_rr, bc_umin, bc_umax = ctx["bc_cc"], ctx["bc_rr"], ctx["bc_umin"], ctx["bc_umax"]
     mesh_v, mesh_f = ctx["mesh_v"], ctx["mesh_f"]
 
@@ -2164,6 +2168,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     n_hit = 0          # 朝向 snap 命中数
     n_back = 0         # 因「焊缝在背面」(bisector base-z<0) 丢弃
     n_xneg = 0         # 因「焊缝中心点 base-x<=0」丢弃
+    n_wpx = 0          # 因「工件距 base 欧氏最近点 base-x <= workpiece_x_min」丢弃
     n_overlap = 0      # 因「固定底座与工件在 base-xy 投影相交」丢弃
     seen = set()
 
@@ -2202,9 +2207,9 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     # （req）焊缝中心点在 base 必须 x>0
     mask_xneg_drop = mask_front & (seam_center_all[:, 0] <= 0.0)
     n_xneg = int(mask_xneg_drop.sum())
-    mask_survive = mask_front & ~mask_xneg_drop          # 进入 overlap/去重/组装的候选
+    mask_survive = mask_front & ~mask_xneg_drop          # 进入 最近点x/overlap/去重/组装的候选
 
-    # 仅对幸存者按【原始候选顺序】循环：底座-工件相交 + 轻去重 + 组装（去重需保序，与逐个版一致）
+    # 仅对幸存者按【原始候选顺序】循环：工件最近点x + 底座-工件相交 + 轻去重 + 组装（去重需保序，与逐个版一致）
     for i in np.nonzero(mask_survive)[0].tolist():
         oid = int(oid_best[i]); Rv = Rv_arr[oid]
         sol = cands[i]
@@ -2213,11 +2218,20 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
         bis_base = bis_all[i]
         seam_center_base = seam_center_all[i]
 
+        # 工件顶点变换到 base 系（供「工件距 base 欧氏最近点 x」与「底座-工件 XY 相交」共用，只算一次）
+        v_base = (mesh_v @ Rv.T + t_new) if mesh_v is not None else None   # (V,3) base 系
+
+        # （req）工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量须 > workpiece_x_min，否则丢弃。
+        if v_base is not None:
+            i_near = int(np.argmin(np.einsum("vi,vi->v", v_base, v_base)))   # argmin |p|^2（省 sqrt）
+            if float(v_base[i_near, 0]) <= wp_x_min:
+                n_wpx += 1
+                continue
+
         # （req）固定底座与工件在 base-xy 平面投影不能相交：相交 ⇒ 机械臂压在工件下/工件盖在底座上，丢弃。
         # 用工件【三角形投影并集】精确判定（不再用凸包近似，凹形工件也准确）；底座 AABB 粗筛保证速度。
-        if bc_cc is not None and mesh_v is not None and mesh_f is not None:
-            v_base_xy = (mesh_v @ Rv.T)[:, :2] + t_new[:2]   # 工件顶点变换到 base 系后取 xy
-            if _base_overlaps_workpiece_tris(bc_cc, bc_rr, bc_umin, bc_umax, v_base_xy, mesh_f):
+        if bc_cc is not None and v_base is not None and mesh_f is not None:
+            if _base_overlaps_workpiece_tris(bc_cc, bc_rr, bc_umin, bc_umax, v_base[:, :2], mesh_f):
                 n_overlap += 1
                 continue
 
@@ -2251,7 +2265,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     back = [r for r in results if r["hand"] == "backhand"]
     prof["⑤snap+正反手分类(CPU遍历候选)"] = _time.time() - _t
     print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 背面丢 {n_back} / x<=0 丢 {n_xneg} "
-          f"/ 底座-工件XY相交丢 {n_overlap} → 去重后合格 {len(results)}"
+          f"/ 工件最近点x<={wp_x_min} 丢 {n_wpx} / 底座-工件XY相交丢 {n_overlap} → 去重后合格 {len(results)}"
           f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
     return {"forehand": fore, "backhand": back}, prof
 

@@ -19,6 +19,99 @@ from __future__ import annotations
 from gt_gen.scene import Scene, _load_plan_init_pose
 
 
+def _goal_arm_collision(scene, goal_joints, wp_pose7, T):
+    """到达 goal 观测位姿的关节角 goal_joints 的三分碰撞检测：自碰撞 / 碰工件 / 碰障碍。
+
+    沿用 scripts/viz_collision_isaacsim.py 套路：curobo CudaRobotModel 做 FK，得每颗碰撞球在 base 系的
+    球心+半径（球定义取 robot yml 的 collision_spheres），再：
+      · 自碰撞：球心距 < r_i+r_j（跳过同一 link 内球对 + self_collision_ignore 里成对的相邻 link）；
+      · 工件/障碍：trimesh ProximityQuery.signed_distance(球心)+半径 > 0 即球体入网格。
+    工件/障碍 mesh 均按 base 系摆放（工件用 wp_pose7、障碍实体各 apply T），与 FK 球同框
+    （robot base 在原点，故 base 系=渲染系）。须在 SimulationApp 启动【之后】调用（curobo import 顺序）。
+    返回 dict(self, workpiece, obstacle: bool; n_self, n_work, n_obs: int)。
+    """
+    import numpy as np
+    import trimesh
+    from gt_gen import compat as _compat
+    _compat.apply_trimesh_shim()                        # warp/trimesh shim（须在 curobo 前）
+    import torch
+    from curobo.types.base import TensorDeviceType
+    from curobo.types.robot import RobotConfig
+    from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
+    from curobo.util_file import load_yaml
+    from gt_gen.sensor import load_truth_scene
+
+    def _quat_wxyz_to_R(q):
+        w, x, y, z = [float(v) for v in q]
+        n = (w * w + x * x + y * y + z * z) ** 0.5 or 1.0
+        w, x, y, z = w / n, x / n, y / n, z / n
+        return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], float)
+
+    # —— FK 碰撞球（base 系）——
+    rd = load_yaml(scene.cfg.robot_cfg_path)
+    kin = rd["robot_cfg"]["kinematics"]
+    coll_links = list(kin["collision_link_names"])
+    spheres_def = kin["collision_spheres"]
+    kin["link_names"] = coll_links                       # 让 FK 输出所有碰撞 link 的位姿
+    ta = TensorDeviceType()
+    model = CudaRobotModel(RobotConfig.from_dict(rd["robot_cfg"], ta).kinematics)
+    st = model.get_state(torch.tensor([list(goal_joints)], dtype=torch.float32, device=ta.device))
+
+    centers, radii, links = [], [], []
+    for ln in coll_links:
+        if ln not in spheres_def:
+            continue
+        pos = st.link_pose[ln].position[0].detach().cpu().numpy()
+        R = _quat_wxyz_to_R(st.link_pose[ln].quaternion[0].detach().cpu().numpy())
+        for s in spheres_def[ln]:
+            r = float(s["radius"])
+            if r <= 1e-4:
+                continue
+            centers.append(R @ np.asarray(s["center"], float) + pos)
+            radii.append(r); links.append(ln)
+    centers = np.asarray(centers, float)
+    radii = np.asarray(radii, float)
+    n = len(centers)
+
+    # —— 自碰撞：球-球，跳过同 link + self_collision_ignore 相邻 link（对称）——
+    ignore = set()
+    for a, nbrs in (kin.get("self_collision_ignore") or {}).items():
+        for b in nbrs:
+            ignore.add(frozenset((a, b)))
+    n_self = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if links[i] == links[j] or frozenset((links[i], links[j])) in ignore:
+                continue
+            if float(np.linalg.norm(centers[i] - centers[j])) < radii[i] + radii[j]:
+                n_self += 1
+
+    # —— 工件 / 障碍：trimesh signed_distance（网格内为正）——
+    def _n_hits(mesh):
+        if mesh is None or n == 0:
+            return 0
+        sd = trimesh.proximity.ProximityQuery(mesh).signed_distance(centers)
+        return int(np.count_nonzero(sd + radii > 0))
+
+    n_work = _n_hits(load_truth_scene(scene.workpiece_obj, mesh_pose=wp_pose7))
+
+    obs_tms = scene._obstacle_solid_trimeshes()          # open_cylinder 纯视觉，已自动跳过
+    obs_mesh = None
+    if obs_tms:
+        tms = [tm.copy() for tm in obs_tms]
+        for tm in tms:
+            tm.apply_transform(np.asarray(T, float))     # 工件 mesh 系 → base 系（与工件同一 T）
+        obs_mesh = trimesh.util.concatenate(tms) if len(tms) > 1 else tms[0]
+    n_obs = _n_hits(obs_mesh)
+
+    return {"self": n_self > 0, "workpiece": n_work > 0, "obstacle": n_obs > 0,
+            "n_self": n_self, "n_work": n_work, "n_obs": n_obs}
+
+
+
+
 class SceneVisualizer:
     """Scene 可视化基类：持有 Scene，具体渲染由后端子类实现。"""
 
@@ -44,12 +137,13 @@ class Open3DSceneVisualizer(SceneVisualizer):
         stride：每隔几个候选抽 1 个看（默认 1=逐个看全部）。
         """
         scene = self.scene
-        if not scene.init_pose_candidates:
+        cands = scene.init_pose_candidates
+        if not cands or not (cands.get("forehand") or cands.get("backhand")):
             raise RuntimeError(
                 "无候选初始位姿可视化：请先调用 Scene.plan_init_pose()（且求解成功）")
         pim = _load_plan_init_pose()
-        res = {"forehand": [c.raw for c in scene.init_pose_candidates if c.hand == "forehand"],
-               "backhand": [c.raw for c in scene.init_pose_candidates if c.hand == "backhand"]}
+        res = {"forehand": [c.raw for c in cands.get("forehand", [])],
+               "backhand": [c.raw for c in cands.get("backhand", [])]}
         extra = self._obstacle_o3d_factory() if scene.obstacles else None
         pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
                                   stride=stride, extra_geoms=extra)
@@ -91,10 +185,10 @@ class Open3DSceneVisualizer(SceneVisualizer):
         return _factory
 
     def show_scene_isaacsim(self, headless: bool = False, goal_variant: int = 0,
-                            trajectory=None, fps: int = 30):
+                            trajectory=None, fps: int = 30, goal_arm_index: list = None):
         """用 **isaacsim** 可视化当前 3D 场景：工件 + 障碍物（如有）+ 机械臂 + goal pose（如有）+ 当前焊缝红线（如有）。
 
-        两种坐标系，取决于是否已 Scene.set_init_pose(index) 选定当前 init pose：
+        两种坐标系，取决于是否已 Scene.set_init_pose(hand, index) 选定当前 init pose：
           · 【未设 init pose】—— mesh 系（旧行为）：工件停在自身 mesh 坐标（identity），障碍/焊缝同框直接叠加，
             **不画机械臂**（无工件↔base 摆放无从摆臂）。供 demo_obstacle_type2/type3 用。
           · 【已设 init pose】—— base 系：机械臂 base 在原点、按 **retract 起始角** 摆姿；工件按当前候选的
@@ -108,7 +202,16 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         障碍以 Box 原语（open_box）与棱柱/圆筒 mesh（遮挡板 / open_cylinder）两种形态渲染，颜色取各
         ObstacleSpec.color。须在【未初始化 curobo/torch】的干净进程里调用（SimulationApp 要最先启动）。
-        headless=True 时 spawn 后跑几帧即退（自检）。goal_variant 选 cam_pose 的第几个变体 K（默认 0）。
+        headless=True 时 spawn 后跑几帧即退（自检）。goal_variant 选 cam_pose 的第几个变体 K（默认 0；
+        仅在 goal_arm_index=None 时生效，给了 goal_arm_index 则由其 n 覆盖）。
+
+        goal_arm_index（可选，`[m, n]`，仅 base 系且已 compute_goal_pose）：
+          · m —— 选 **scene.goal_poses[m]**（哪一条 goal / robot_pose）。
+          · n —— 选该项 joints/cam_pose 第一维 **K**（变体）的索引，即 (160,1,6) 里 160 的下标。
+          给定时把机械臂关节角从 retract 改成 **goal_poses[m]["joints"][n, 0]**（B=0 首观测位姿，无需 IK），
+          同时 goal 视锥也画 goal_poses[m] 的第 n 个变体；并打印其三分碰撞：自碰撞 / 碰工件 / 碰障碍
+          （curobo FK 碰撞球 + trimesh signed_distance，见 _goal_arm_collision）。越界则夹取。
+          兼容旧标量写法（视作 m，n 退回 goal_variant）。None（默认）时机械臂仍摆 retract，行为同旧版。
         """
         import os
         import sys
@@ -118,6 +221,17 @@ class Open3DSceneVisualizer(SceneVisualizer):
         obstacles = list(scene.obstacles)
         cur = scene.cur_init_pose
         base_frame = cur is not None
+
+        # —— 解析 goal_arm_index=[m, n]：m 选 scene.goal_poses[m]（哪条 goal），
+        #    n 选该项 joints/cam_pose 第一维 K（如 (160,1,6) 的 160）变体索引。
+        #    兼容旧标量写法（视作 m，n 退回 goal_variant）。默认 m=0、n=goal_variant。——
+        gm, gk = 0, int(goal_variant)
+        if goal_arm_index is not None:
+            if isinstance(goal_arm_index, (list, tuple)):
+                gm = int(goal_arm_index[0])
+                gk = int(goal_arm_index[1]) if len(goal_arm_index) > 1 else int(goal_variant)
+            else:
+                gm = int(goal_arm_index)
 
         # —— 渲染坐标系变换 T（mesh 系 → 渲染系）：base 系用 T_workpiece_in_base，否则单位阵 ——
         if base_frame:
@@ -302,6 +416,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         # —— 机械臂（仅 base 系）：base 在原点，稍后 retract 起始角 ——
         robot = None
+        goal_joints = None         # 该 goal 位姿的关节角（joints[vi,gi]，无需 IK）
+        goal_label = ""            # 打印用标签，如 "goal#0/7(变体#0)"
         if base_frame:
             try:
                 from gt_gen import compat as _compat  # noqa: F401  warp shim（须在 curobo 前）
@@ -318,6 +434,21 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 from helper import add_robot_to_scene
                 robot_cfg = load_yaml(scene.cfg.robot_cfg_path)["robot_cfg"]
                 robot, _ = add_robot_to_scene(robot_cfg, world)
+                # goal_arm_index 给定：解析该 goal 观测位姿的关节角（已存于 goal_poses，无需 IK），
+                # 稍后把这条唯一的机械臂摆到该关节角（而非 retract），并打印其三分碰撞。
+                if goal_arm_index is not None and scene.goal_poses:
+                    G = len(scene.goal_poses)
+                    if not (-G <= gm < G):
+                        print(f"[viz] goal_arm_index 的 m={gm} 越界（共 {G} 条 goal_poses），跳过第二条臂")
+                    else:
+                        jt = scene.goal_poses[gm]["joints"]
+                        jt = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
+                        Kj, Bj = jt.shape[:2]                  # (K 变体, B 观测位姿, DOF)
+                        vi = max(0, min(gk, Kj - 1))           # n → K 变体索引（越界则夹取）
+                        goal_joints = [float(v) for v in jt[vi, 0]]   # 机械臂摆到首观测位姿 B=0
+                        goal_label = f"goal_poses#{gm % G}/K#{vi}(共{Kj}变体,B={Bj})"
+                elif goal_arm_index is not None:
+                    print("[viz] 无 goal_poses（未 compute_goal_pose），跳过第二条臂")
             except Exception as e:
                 print(f"[viz] 机械臂 spawn 失败（忽略，仅画工件/障碍/goal）: {e}")
                 robot = None
@@ -344,14 +475,15 @@ class Open3DSceneVisualizer(SceneVisualizer):
             for k, mesh in enumerate(ob.meshes):
                 spawn_mesh(f"/World/obs/o{oi}/mesh{k}", mesh)
 
-        # goal pose 视锥（仅 base 系且已 compute_goal_pose）
+        # goal pose 视锥（仅 base 系且已 compute_goal_pose）：用 gm 选 goal_poses[gm]、gk 选 K 变体
         n_goal = 0
         if base_frame and scene.goal_poses:
             near, far = _fov_corners()
             half_w, half_h, near_z, far_z = _cam_intrinsics()
-            cam_pose = np.asarray(scene.goal_poses[0]["cam_pose"])   # (K,B,7) piece 系 wxyz
+            gmc = gm % len(scene.goal_poses)                          # 夹到合法范围
+            cam_pose = np.asarray(scene.goal_poses[gmc]["cam_pose"])  # (K,B,7) piece 系 wxyz
             K = cam_pose.shape[0]
-            vi = max(0, min(int(goal_variant), K - 1))
+            vi = max(0, min(gk, K - 1))
             seq = cam_pose[vi]                                        # (B,7)
             B = seq.shape[0]
             for i in range(B):
@@ -364,9 +496,28 @@ class Open3DSceneVisualizer(SceneVisualizer):
         print(f"goal pose : " + (f"{n_goal} 个观测视锥（青→黄）+ {n_goal} 个真实相机"
                                   if n_goal else "无（未 compute_goal_pose 或非 base 系）"))
 
+        # goal_arm_index 给定时：打印这条 goal 关节角的三分碰撞（自碰撞/工件/障碍）；
+        # 不新画第二条臂，而是把下面唯一那条臂直接摆到 goal 关节角（见 set_joint_positions 处）。
+        if goal_joints is not None:
+            try:
+                c = _goal_arm_collision(scene, goal_joints, wp_pose7, T)
+                msg = (f"[goal-arm] {goal_label}: 自碰撞={c['self']} 碰工件={c['workpiece']} 碰障碍={c['obstacle']}"
+                       f"（命中球 self={c['n_self']} work={c['n_work']} obs={c['n_obs']}）")
+                print(msg)
+                try:                                     # Isaac 接管 stdout 后 print 可能不可见，落一份文件便于核对
+                    with open("/tmp/goal_arm_check.txt", "w") as _f:
+                        _f.write(msg + "\n")
+                except Exception:
+                    pass
+            except Exception as e:
+                import traceback
+                print(f"[goal-arm] 碰撞检测失败（忽略）: {e}")
+                traceback.print_exc()
+
         world.reset()
 
-        # 机械臂起始角：给了 trajectory 用其首帧，否则 retract 起始角（idx_list 供回放复用）
+        # 机械臂关节角：给了 goal_arm_index 则摆到 goal 关节角；否则给了 trajectory 用其首帧，
+        # 再否则 retract 起始角（idx_list 供回放复用）。
         n_dof = len(scene.cfg.joint_names)
         traj = None if trajectory is None else np.asarray(trajectory, float).reshape(-1, n_dof)
         idx_list = None
@@ -375,7 +526,12 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 if hasattr(robot, "initialize"):
                     robot.initialize()
                 idx_list = [robot.get_dof_index(j) for j in scene.cfg.joint_names]
-                q0 = traj[0] if traj is not None else np.asarray(scene.cur_cfg, float)
+                if goal_joints is not None:
+                    q0 = np.asarray(goal_joints, float)
+                elif traj is not None:
+                    q0 = traj[0]
+                else:
+                    q0 = np.asarray(scene.cur_cfg, float)
                 robot.set_joint_positions(q0, idx_list)
             except Exception as e:
                 print(f"[viz] 机械臂设关节角失败（忽略）: {e}")

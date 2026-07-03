@@ -44,12 +44,12 @@ def demo_init_pose(args):
 
     scene.plan_init_pose()
 
-    if not scene.init_pose_candidates:
+    cands = scene.init_pose_candidates
+    n_fore, n_back = len(cands["forehand"]), len(cands["backhand"])
+    if n_fore + n_back == 0:
         print("[demo] 求解失败：无候选初始位姿")
         return
-    n_fore = sum(1 for c in scene.init_pose_candidates if c.hand == "forehand")
-    n_back = sum(1 for c in scene.init_pose_candidates if c.hand == "backhand")
-    print(f"[demo] 候选初始位姿 {len(scene.init_pose_candidates)} 个（正手 {n_fore} / 反手 {n_back}）")
+    print(f"[demo] 候选初始位姿 {n_fore + n_back} 个（正手 {n_fore} / 反手 {n_back}）")
 
     # Open3DSceneVisualizer(scene).show_init_poses()
 
@@ -80,21 +80,25 @@ def demo_obstacle_type3(args):
 def demo_main(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
-    scene = _make_scene(args)
-    scene._set_cur_seam(9)
-    scene.add_obstacle_type2()
-    scene.plan_init_pose()
-    scene.set_init_pose(0)
-    scene.compute_goal_pose()
-    # scene.plan_explore_path(goal_index=0)     # 边走边看规划到 goal pose[0]（起点=当前关节角，缺省 retract）
-    # scene.save('/kpfs_dataset_ssd/tempt/scene2.pkl')
-    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    # scene = _make_scene(args)
+    # scene._set_cur_seam(9)
+    # scene.add_obstacle_type2()
+    # scene.plan_init_pose()
+    # for hand in ("forehand", "backhand"):
+    #     for init_pose_idx in range(len(scene.init_pose_candidates[hand])):
+    #         scene.set_init_pose(hand, init_pose_idx)
+    #         scene.compute_goal_pose()
+    #         if len(scene.goal_poses) == 0:
+    #             continue
+    #         # scene.plan_explore_path(goal_index=0)     # 边走边看规划到 goal pose[0]（起点=当前关节角，缺省 retract）
+    #         # scene.save('/kpfs_dataset_ssd/tempt/scene2.pkl')
+    #         scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    #         exit()
 
-    # from gt_gen.scene import Scene
-    # # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # scene = Scene.load('/media/a/新加卷/tempt/4/1/scene1.pkl')
+    from gt_gen.scene import Scene
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
     # # scene = Scene.load('/kpfs_dataset_ssd/tempt/scene1.pkl')
-    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless)
+    Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
     # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(headless=args.headless)
 
 
@@ -103,6 +107,8 @@ def main():
     ap.add_argument("--obj", default=DEFAULT_OBJ, help="工件 mesh（_part.obj / _watertight.obj）")
     ap.add_argument("--weld-json", default=DEFAULT_WELD_JSON, help="焊缝 _weld_angle3.json")
     ap.add_argument("--headless", action="store_true", help="无显示器自检：spawn 后跑几帧即退")
+    ap.add_argument("--goal-index", type=int, default=None,
+                    help="再画一条到达第几个 goal 观测位姿的机械臂，并打印其三分碰撞（自碰撞/工件/障碍）")
     args = ap.parse_args()
 
     # 默认跑障碍物类型2；想看别的换成下面对应调用（勿与本调用同进程先后跑，见模块 docstring）
