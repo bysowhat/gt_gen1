@@ -194,6 +194,12 @@ class Config:
         return float(self.raw.get("plan_init_pose", {}).get("voxel_size_m", 0.02))
 
     @property
+    def seam_min_length_m(self) -> float:
+        """焊缝长度过滤阈值（米）：corrected_p0↔p1 直线距离小于此值的焊缝在 Scene._load_seam 丢弃。
+        见 default.yaml seam.min_length_cm。"""
+        return float(self.raw.get("seam", {}).get("min_length_cm", 3.0)) / 100.0
+
+    @property
     def plan_init_n_seg(self) -> int:
         """save_seam_pkl 的 seam_line 插值点数。见 default.yaml plan_init_pose.n_seg。"""
         return int(self.raw.get("plan_init_pose", {}).get("n_seg", 20))

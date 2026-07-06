@@ -42,11 +42,11 @@ DEFAULT_SCENE = "/media/a/新加卷/tempt/4/scene1.pkl"
 def goal_joints_from_scene(scene, variant, goal_index, goal_index_seq):
     """从 compute_goal_pose 的结果里直接取【关节角目标】joints[variant, goal_index]（不再算 goal pose）。
 
-    scene.goal_poses[0]['joints'] 形如 (K,B,DOF)：K=候选变体、B=观测位姿、DOF=6。
+    scene.goal_poses[seam_id][goal_index_seq]['joints'] 形如 (K,B,DOF)：K=候选变体、B=观测位姿、DOF=6。
     返回 (goal_joints, dbg)：goal_joints=长度 DOF 的 list（base 系关节角，直接当 generate_gt 的 goal_cfg）；
     dbg 记 variant/goal_index/K/B 供打印。
     """
-    res = scene.goal_poses[goal_index_seq]
+    res = scene.goal_poses[scene.seam_id][goal_index_seq]
     jt = np.asarray(res["joints"])                           # (K,B,DOF)
     K, B = jt.shape[:2]
     goal_joints = np.asarray(jt[variant, goal_index], float).tolist()
@@ -120,7 +120,7 @@ def run(args):
     scene = Scene.load(args.scene)
     if scene.cur_init_pose is None:
         raise RuntimeError("pkl 未设当前 init pose（需 set_init_pose 后再 save）")
-    if not scene.goal_poses:
+    if not scene.goal_poses.get(scene.seam_id):
         raise RuntimeError("pkl 无 goal pose（需 compute_goal_pose 后再 save）")
 
     W = build_worlds(scene, include_obstacles=not args.no_obstacles)
@@ -147,7 +147,7 @@ def run(args):
                  variant=dbg["variant"], cur_joints=np.asarray(start, float),
                  goal_joints=np.asarray(goal_joints, float), goal_source="joint_target_K_variant",
                  info=info)
-    scene.trajectories.append(entry)
+    scene.trajectories.setdefault(scene.seam_id, []).append(entry)
     out = args.out or (os.path.splitext(args.scene)[0] + "_gt.pkl")
     scene.save(out)
     print(f"\nPLACE_OBSTACLES_TO_GT2_{'OK' if status == 'reached' else 'PARTIAL'} "

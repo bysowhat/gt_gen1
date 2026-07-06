@@ -44,7 +44,7 @@ def demo_init_pose(args):
 
     scene.plan_init_pose()
 
-    cands = scene.init_pose_candidates
+    cands = scene.init_pose_candidates.get(scene.seam_id, {"forehand": [], "backhand": []})
     n_fore, n_back = len(cands["forehand"]), len(cands["backhand"])
     if n_fore + n_back == 0:
         print("[demo] 求解失败：无候选初始位姿")
@@ -81,26 +81,27 @@ def demo_main(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
     # scene = _make_scene(args)
-    # scene._set_cur_seam(9)
+    # scene._set_cur_seam(2)
     # scene.add_obstacle_type2()
     # scene.plan_init_pose()
-    # for hand in ("forehand", "backhand"):
-    #     for init_pose_idx in range(len(scene.init_pose_candidates[hand])):
-    #         scene.set_init_pose(hand, init_pose_idx)
-    #         scene.compute_goal_pose()
-    #         if len(scene.goal_poses) == 0:
-    #             continue
-    #         # scene.plan_explore_path(goal_index=0)     # 边走边看规划到 goal pose[0]（起点=当前关节角，缺省 retract）
-    #         # scene.save('/kpfs_dataset_ssd/tempt/scene2.pkl')
-    #         scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    #         exit()
+    # # scene.seam_ids_by_length()
+    # flag = scene.compute_pose_and_plan_path(hand="forehand")
+    # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    # flag = scene.compute_pose_and_plan_path(hand="backhand")
+    # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+
+
+
+    # from gt_gen.scene import Scene
+    # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    # scene.plan_explore_path(goal_index=0, variant=0, goal_index_seq=0)
+    # scene.save('/media/a/新加卷/tempt/4/scene1_gt2.pkl')
+
 
     from gt_gen.scene import Scene
-    # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1_gt.pkl')
-    # # scene = Scene.load('/kpfs_dataset_ssd/tempt/scene1.pkl')
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
     # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(headless=args.headless)
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=1, headless=args.headless)
 
 
 def main():

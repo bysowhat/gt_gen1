@@ -137,14 +137,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
         stride：每隔几个候选抽 1 个看（默认 1=逐个看全部）。
         """
         scene = self.scene
-        cands = scene.init_pose_candidates
+        cands = scene.init_pose_candidates.get(scene.seam_id, {})
         if not cands or not (cands.get("forehand") or cands.get("backhand")):
             raise RuntimeError(
                 "无候选初始位姿可视化：请先调用 Scene.plan_init_pose()（且求解成功）")
         pim = _load_plan_init_pose()
         res = {"forehand": [c.raw for c in cands.get("forehand", [])],
                "backhand": [c.raw for c in cands.get("backhand", [])]}
-        extra = self._obstacle_o3d_factory() if scene.obstacles else None
+        extra = self._obstacle_o3d_factory() if scene.obstacles.get(scene.seam_id) else None
         pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
                                   stride=stride, extra_geoms=extra)
 
@@ -156,7 +156,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         import open3d as o3d
         from gt_gen.scene import _polygon_mesh_to_trimesh, _box_prim_to_trimesh
 
-        obstacles = list(self.scene.obstacles)
+        obstacles = list(self.scene.obstacles.get(self.scene.seam_id, []))
 
         def _factory(R, t):
             T = np.eye(4)
@@ -218,7 +218,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         import numpy as np
 
         scene = self.scene
-        obstacles = list(scene.obstacles)
+        obstacles = list(scene.obstacles.get(scene.seam_id, []))
         cur = scene.cur_init_pose
         base_frame = cur is not None
 
@@ -436,12 +436,13 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 robot, _ = add_robot_to_scene(robot_cfg, world)
                 # goal_arm_index 给定：解析该 goal 观测位姿的关节角（已存于 goal_poses，无需 IK），
                 # 稍后把这条唯一的机械臂摆到该关节角（而非 retract），并打印其三分碰撞。
-                if goal_arm_index is not None and scene.goal_poses:
-                    G = len(scene.goal_poses)
+                if goal_arm_index is not None and scene.goal_poses.get(scene.seam_id):
+                    seq = scene.goal_poses[scene.seam_id]
+                    G = len(seq)
                     if not (-G <= gm < G):
-                        print(f"[viz] goal_arm_index 的 m={gm} 越界（共 {G} 条 goal_poses），跳过第二条臂")
+                        print(f"[viz] goal_arm_index 的 m={gm} 越界（当前焊缝共 {G} 条 goal_poses），跳过第二条臂")
                     else:
-                        jt = scene.goal_poses[gm]["joints"]
+                        jt = seq[gm]["joints"]
                         jt = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
                         Kj, Bj = jt.shape[:2]                  # (K 变体, B 观测位姿, DOF)
                         vi = max(0, min(gk, Kj - 1))           # n → K 变体索引（越界则夹取）
@@ -477,11 +478,12 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         # goal pose 视锥（仅 base 系且已 compute_goal_pose）：用 gm 选 goal_poses[gm]、gk 选 K 变体
         n_goal = 0
-        if base_frame and scene.goal_poses:
+        if base_frame and scene.goal_poses.get(scene.seam_id):
+            seq = scene.goal_poses[scene.seam_id]
             near, far = _fov_corners()
             half_w, half_h, near_z, far_z = _cam_intrinsics()
-            gmc = gm % len(scene.goal_poses)                          # 夹到合法范围
-            cam_pose = np.asarray(scene.goal_poses[gmc]["cam_pose"])  # (K,B,7) piece 系 wxyz
+            gmc = gm % len(seq)                                      # 夹到合法范围
+            cam_pose = np.asarray(seq[gmc]["cam_pose"])              # (K,B,7) piece 系 wxyz
             K = cam_pose.shape[0]
             vi = max(0, min(gk, K - 1))
             seq = cam_pose[vi]                                        # (B,7)
@@ -599,7 +601,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         """
         import numpy as np
 
-        trajs = list(getattr(self.scene, "trajectories", []) or [])
+        trajs = list(self.scene.trajectories.get(self.scene.seam_id, []))
         if not trajs:
             raise RuntimeError("无可回放轨迹：请先 Scene.plan_explore_path()")
         n = len(trajs)

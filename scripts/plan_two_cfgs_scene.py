@@ -87,7 +87,7 @@ def _launch_viz_subprocess(scene, traj, cur_cfg, target_cfg, scene_out, headless
     entry = dict(positions=positions, status="reached",
                  cur_joints=np.asarray(cur_cfg, float), goal_joints=np.asarray(target_cfg, float),
                  goal_source="plan_two_cfgs_scene", goal_index=0, variant=0)
-    scene.trajectories.append(entry)
+    scene.trajectories.setdefault(scene.seam_id, []).append(entry)
     scene.save(scene_out)
     print(f"轨迹已追加进 scene 并存盘：{scene_out}（{len(positions)} 点）")
 
@@ -121,7 +121,7 @@ def run_plan(args):
     # 或 --target-from-scene 改用 goal pose 的关节角当终点
     cur_cfg = list(CUR_CFG)
     if args.target_from_scene:
-        if not scene.goal_poses:
+        if not scene.goal_poses.get(scene.seam_id):
             raise RuntimeError("pkl 无 goal pose（--target-from-scene 需先 compute_goal_pose）")
         target_cfg, dbg = goal_joints_from_scene(scene, args.variant, args.goal_index, args.goal_index_seq)
         print(f"[scene] 目标=goal pose 关节角#变体{dbg['variant']}/{dbg['K']} 位姿{dbg['goal_index']}/{dbg['B']}")
