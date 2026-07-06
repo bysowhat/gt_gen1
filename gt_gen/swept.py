@@ -48,6 +48,25 @@ def _moving_sphere_mask(handle):
     return mask
 
 
+def link_sphere_mask(handle, link_name):
+    """指定 link 的碰撞球掩码 (S,) bool：只保留属于 link_name 的球。
+    结果按 (handle, link_name) 缓存（kinematics 不变）。取不到映射时返回 None。"""
+    cache = getattr(handle, "_link_sphere_mask_cache", None)
+    if cache is None:
+        cache = handle._link_sphere_mask_cache = {}
+    if link_name in cache:
+        return cache[link_name]
+    try:
+        kc = handle.mg.kinematics.kinematics_config
+        idx_map = kc.link_sphere_idx_map.detach().cpu().numpy()       # (S,) 每球所属 link 下标
+        name_to_idx = kc.link_name_to_idx_map
+        mask = (idx_map == name_to_idx[link_name])
+    except Exception:
+        mask = None
+    cache[link_name] = mask
+    return mask
+
+
 def voxelize_spheres(voxmap, spheres) -> np.ndarray:
     """把一组碰撞球 (M,4 xyz+r) 体素化到 voxmap：返回真正与球相交的体素下标 (M,3)（去重、在界内）。
 

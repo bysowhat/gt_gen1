@@ -267,6 +267,7 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
     from gt_gen import curobo_iface as ci
     from gt_gen.sensor import camera_pose_from_config
     from gt_gen.swept import motion_stays_in_free
+    from gt_gen.joint_wrap import wrap_goal_near_start
 
     nbv = handle.config.params.get("nbv", {})
     if standoff_d is None:
@@ -289,6 +290,13 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
 
     T_cam_ee = _cam_to_ee_transform(handle, camera_model)
     anchor = flange_origin(handle, cur_cfg)                  # 半球轴锚点：当前 flange 原点
+    # 关节限位：供把 IK 解的目标构型归一到「离 cur_cfg 最近的 ±2π 等价支」（旋转关节避免巻绕远支）。
+    # 取法同 plan_to_config；取不到则跳过归一（不阻断候选生成）。
+    try:
+        jl = handle.mg.kinematics.get_joint_limits().position.detach().cpu().numpy()  # (2,dof)
+    except Exception as e:  # noqa: BLE001
+        print(f"[wrap/candidate][warn] 取关节限位失败，跳过目标 2π 归一：{e}")
+        jl = None
     out: List[Candidate] = []
     for T in targets:
         for cam_pose in standoff_poses_looking_at(T, voxmap, camera_model, anchor=anchor,
@@ -299,6 +307,12 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
             ik = ci.solve_ik(handle, (ee_pos, ee_quat), return_seeds=handle.config.ik_num_seeds)
             cfgs = ci.ik_configs(handle, ik)[:ik_per_pose]
             for cfg, perr in cfgs:
+                # IK 解可能落在「巻绕远支」（某旋转关节差 2π），先归一到离 cur_cfg 最近的等价支：
+                # 物理位姿不变(±2π 同姿态)，但避免它被存为候选 / 当下一步起点时逼出整圈退绕
+                # （否则如 J3=6.2776 这类目标会让后续从该支出发的规划被迫扫 ~288° 而中途碰撞，见 joint_wrap）。
+                # 归一在②看向校验/③可达性/存储之前完成，使这三步与 plan_to_config 实际规划的分支一致。
+                if jl is not None:
+                    cfg = wrap_goal_near_start(cur_cfg, cfg, jl[0], jl[1], tag="wrap/candidate")
                 # ② 看向校验：实际相机光轴 vs (T - 相机位置) 的夹角
                 Tc = camera_pose_from_config(handle, cfg, camera_model)
                 axis = Tc[:3, 2]

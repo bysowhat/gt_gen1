@@ -97,12 +97,17 @@ def _cells_mesh(vm, centers):
     return m
 
 
-def _arm_mesh(handle, q):
-    """构型 q 的整臂碰撞球（绿）。"""
+def _arm_mesh(handle, q, link_name=None):
+    """构型 q 的整臂碰撞球（绿）。link_name 给定时只画该 link 的球（取不到映射则退化为整臂）。"""
     import open3d as o3d
-    from gt_gen.swept import fk_spheres_batch
+    from gt_gen.swept import fk_spheres_batch, link_sphere_mask
+    spheres = fk_spheres_batch(handle, [q])[0]
+    if link_name is not None:
+        mask = link_sphere_mask(handle, link_name)
+        if mask is not None:
+            spheres = spheres[mask]
     arm = o3d.geometry.TriangleMesh()
-    for s in fk_spheres_batch(handle, [q])[0]:
+    for s in spheres:
         if float(s[3]) <= 1e-4:
             continue
         b = o3d.geometry.TriangleMesh.create_sphere(radius=float(s[3]), resolution=8)

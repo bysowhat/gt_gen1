@@ -104,8 +104,8 @@ def verify_score_and_argmax(ctx, B, cands, gains, viz=False):
     print(f"  lambda_cost(default.yaml)={lam}")
     rows = []                                                # (gain, path_cost, score, reveal)
     for c in cands:
-        g, s, reveal = nbv.score_candidate(vm, c, B, scene, cam, cur, lambda_cost=lam)
-        pc = float(np.linalg.norm(np.asarray(c.config, float) - np.asarray(cur, float)))
+        g, s, reveal = nbv.score_candidate(vm, c, B, scene, cam, cur, h, lambda_cost=lam)
+        pc = nbv._gun_translation_cost(h, cur, c.config)
         rows.append((g, pc, s, reveal))
     g_arr = np.array([r[0] for r in rows]); s_arr = np.array([r[2] for r in rows])
     best_i = int(np.argmax(s_arr))

@@ -123,6 +123,7 @@ class CollisionOracle:
 
         self.ta = TensorDeviceType()
         self.device = self.ta.device
+        self.robot_yml = robot_yml   # 供上层惰性建 FK 模型取 link 姿态（如焊枪旋转代价）
         rd = load_yaml(robot_yml)
         n_cub = max(50, len(getattr(world_config, "cuboid", []) or []) + 5)
         n_mesh = max(50, len(getattr(world_config, "mesh", []) or []) + 5)

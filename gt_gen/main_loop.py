@@ -389,6 +389,120 @@ def _debug_viz_pstar(h_truth, voxmap, cur_cfg, P, truth_scene, goal_pose=None, r
     _draw(geoms, f"{tag}main_loop P*({n_tag}): 黑=flange折线 青→品红=沿路整臂 绿=当前臂 灰=工件")
 
 
+def _debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose=None, rnd=None,
+                   every_n: int = 20):
+    """调试用【执行段轨迹 seg】：可视化 _move_to 规划出、即将接进 GT 的这一段插值轨迹。
+
+    底图同 _debug_viz_pstar：工件(灰) + 当前整臂@cur_cfg(绿) + voxmap FREE(蓝半透明)/OCCUPIED(红)
+    + ROI/base；叠加：seg 的 flange 原点折线(橙) + 沿 seg 每 every_n 个路点的整臂(青→品红渐变，含
+    起点/终点) + goal 位置(品红球)。seg 为 (t,dof) 关节轨迹。依赖 verify_step8 的 open3d 工具
+    （需显示器 + open3d）。
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    from verify_step8 import _arm_mesh, _work_mesh, _cells_mesh, _draw, _roi_and_base, _lines, _ball
+    from gt_gen.voxmap import FREE, OCCUPIED
+    from gt_gen.candidates import flange_origin
+
+    tag = f"R{rnd} " if rnd is not None else ""
+    S = np.asarray(seg, dtype=float) if seg is not None else None
+
+    geoms = [("work", _work_mesh(truth_scene), "lit", None),
+             ("arm", _arm_mesh(h_truth, list(cur_cfg)), "lit", None)]
+    fc = voxmap.state_centers(FREE)
+    if int(fc.shape[0]):
+        geoms.append(("free", _cells_mesh(voxmap, fc), "fill", [0.20, 0.45, 0.95, 0.10]))
+    oc = voxmap.state_centers(OCCUPIED)
+    if int(oc.shape[0]):
+        om = _cells_mesh(voxmap, oc); om.paint_uniform_color([0.92, 0.12, 0.12])
+        geoms.append(("occ", om, "lit", None))
+
+    n_arms = 0
+    if S is not None and len(S):
+        step = max(1, len(S) // 60)
+        fo = np.asarray([flange_origin(h_truth, list(S[i])) for i in range(0, len(S), step)])
+        if fo.shape[0] >= 2:
+            segs = [(fo[i], fo[i + 1]) for i in range(fo.shape[0] - 1)]
+            geoms.append(("seg", _lines(segs, [1.0, 0.55, 0.0]), "line", None))     # seg flange 折线（橙）
+        # 沿 seg 每 every_n 个路点画整臂（含起点与终点）；颜色青→品红线性渐变示意先后
+        n = max(1, int(every_n))
+        idxs = sorted(set(list(range(0, len(S), n)) + [len(S) - 1]))
+        m = max(1, len(idxs) - 1)
+        for j, i in enumerate(idxs):
+            t = j / m
+            col = [0.0 + 0.85 * t, 0.75 - 0.65 * t, 0.85]                            # 青(起)→品红(终)
+            a = _arm_mesh(h_truth, list(S[i]), link_name="xiaoyu_accessory_link"); a.paint_uniform_color(col)
+            geoms.append((f"S{i}", a, "lit", None))
+        n_arms = len(idxs)
+    if goal_pose is not None:
+        geoms.append(("goal", _ball(np.asarray(goal_pose[0], float), 0.03, [0.85, 0.10, 0.85]), "lit", None))
+    geoms += _roi_and_base(voxmap)
+
+    n_tag = f"{0 if S is None else len(S)}点(每{max(1, int(every_n))}步画臂×{n_arms})"
+    _draw(geoms, f"{tag}main_loop seg({n_tag}): 橙=flange折线 青→品红=沿段整臂 绿=当前臂 灰=工件")
+
+
+def _seg_dump_path(path=None):
+    """执行段落盘文件路径：显式 path > 环境变量 GT_SEG_DUMP > 默认 configs/_seg_dump_isaacsim.pkl。"""
+    import os
+    if path:
+        return path
+    return os.environ.get("GT_SEG_DUMP") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs", "_seg_dump_isaacsim.pkl")
+
+
+def _dump_seg_isaacsim(cur_cfg, seg, rnd=None, path=None, reset=False):
+    """与 _debug_viz_seg 对应的【isaacsim 版】：不在本进程弹窗，而是把【执行段 seg】的关节轨迹落盘，
+    交给独立干净进程用 isaacsim 回放这段移动——工件 + 障碍物 + 机械臂，**不含 voxmap**。
+    回放脚本见 scripts/viz_seg_isaacsim.py。
+
+    为何落盘而非直接画：show_scene_isaacsim 的 SimulationApp 必须在【未加载 warp】的干净进程里最先
+    启动，不能与跑 generate_gt(warp/curobo) 的本进程同框（同 Scene.save/load 的动机）。故这里只存
+    轨迹，可视化另起进程。
+
+    落盘格式：pickle 一个 list，每元素 {"rnd": int|None, "positions": (T,dof) np.float64}。
+    positions 在段首补回 cur_cfg（_move_to 返回的 seg 已去掉与上一段重复的首点），使拼接回放连续。
+
+    参数：
+      reset=True —— 清空/新建落盘（generate_gt 开跑时调一次，免得累加上一轮 run 的段）；此时 cur_cfg/seg 忽略。
+      否则把本段 (rnd, [cur_cfg]+seg) 追加进列表；seg 为 None/空则跳过。
+      path=None 时取 _seg_dump_path()（环境变量 GT_SEG_DUMP 或默认 configs 下）。
+    """
+    import os
+    import pickle
+
+    path = _seg_dump_path(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if reset:
+        with open(path, "wb") as f:
+            pickle.dump([], f)
+        print(f"[seg-dump] 清空 → {path}")
+        return path
+
+    if seg is None:
+        return path
+    S = np.asarray(seg, dtype=np.float64)
+    if S.ndim != 2 or len(S) == 0:
+        return path
+    positions = np.vstack([np.asarray(cur_cfg, dtype=np.float64)[None, :], S])   # 补回段首起点
+
+    data = []
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+        except Exception:
+            data = []
+    data.append({"rnd": rnd, "positions": positions})
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+    print(f"[seg-dump] R{rnd} 追加段 {positions.shape[0]} 点 → {path}（累计 {len(data)} 段）")
+    return path
+
+
 def _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params,
                    rnd=None):
     """调试用③【一轮 NBV 结果】：可视化 best_next_view_using_oracle 返回的 r（参考 verify_step9 的
@@ -501,17 +615,20 @@ def _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_d
     _draw(geoms, title + f"  [FREE={n_free} OCC={n_occ} 绿=当前臂 黑线=P* 黄臂=reach_pt构型]")
 
 
-def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth,
+def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, r_list, camera_model, truth_scene, max_depth,
                           params, rnd=None):
     """调试用④【逐候选 + 各自分数】：这一轮 NBV 的【每一个候选】各弹一窗、画全（参考 verify_step9
     的 score 窗口，一候选一窗）。默认不调用，需手动取消注释。
 
-    复用 r.P_star/r.reach_idx（避免重规划），重算 B + 候选 + 逐候选打分（NBVResult 只带最优解，
-    候选全集需重算 generate_candidates + score_candidate，与 best_next_view_using_oracle 内部同逻辑）。
-    控制台先打印逐候选 gain/path_cost/score 表（★标 argmax）；随后【每个候选一窗】，每窗画该候选的
-    整臂(青，真摆成看 B 的姿态) + 相机帧 + FOV视锥(远面过 T) + 视线 p→T(红) + 目标 T(品红球)，
-    底图含工件灰 + 当前整臂@cur_cfg绿 + FREE蓝半透明 + OCCUPIED红 + B橙；标题写该候选 i/N、
-    gain/path_cost/score、是否 ★argmax。
+    直接复用 best_next_view_using_oracle 返回的 r_list（已按 score 降序的 NBVResult 列表，
+    每项自带 cfg/cam_pose/target/gain/score），【不再重算 generate_candidates + score_candidate】——
+    这样窗口里画的就是本轮 NBV 真正评估过的那批候选，避免重算时 IK 多种子随机抖动画出与实际
+    决策不一致的候选。仅 B（橙阻塞集底图）仍按 r.P_star/r.reach_idx 重算（NBVResult 不带 B 体素、
+    且这不算候选）；path_cost 用焊枪平移代价即时算出仅供显示。
+    控制台先打印逐候选 gain/path_cost/score 表（★标 argmax=score 最高，即 r_list[0]）；随后
+    【每个候选一窗】，每窗画该候选的整臂(青，真摆成看 B 的姿态) + 相机帧 + FOV视锥(远面过 T) +
+    视线 p→T(红) + 目标 T(品红球)，底图含工件灰 + 当前整臂@cur_cfg绿 + FREE蓝半透明 + OCCUPIED红
+    + B橙；标题写该候选 i/N、gain/path_cost/score、是否 ★argmax。
     """
     import os
     import sys
@@ -522,7 +639,6 @@ def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene
                               _ball, _lines, _fov_frustum)
     from gt_gen.voxmap import FREE, OCCUPIED
     from gt_gen.reach_b import compute_blocking_B
-    from gt_gen.candidates import generate_candidates
     from gt_gen import nbv as _nbv
 
     tag = f"R{rnd} " if rnd is not None else ""
@@ -530,17 +646,16 @@ def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene
     k = int(nbv_p.get("k_lookahead", 6))
     lam = float(nbv_p.get("lambda_cost", 0.0))
 
-    # —— 重算 B + 候选 + 打分 ——
+    # —— B（橙底图）仍按 P*/reach_idx 重算；候选直接用 r_list（不重算 generate_candidates/score）——
     P = r.P_star
     B = (compute_blocking_B(h_truth, voxmap, P, r.reach_idx, k)
          if P is not None and r.status in ("ok", "no_reachable_candidate")
          else np.empty((0, 3), dtype=np.int64))
-    cands = generate_candidates(h_truth, voxmap, B, camera_model, cur_cfg) if B.shape[0] else []
+    cands = list(r_list)                                               # 本轮 NBV 已评估过的候选（NBVResult，含 cfg/cam_pose/target/gain/score）
     rows = []                                                          # (gain, path_cost, score)
     for c in cands:
-        g, s, _ = _nbv.score_candidate(voxmap, c, B, truth_scene, camera_model, cur_cfg, lambda_cost=lam)
-        pc = float(np.linalg.norm(np.asarray(c.config, float) - np.asarray(cur_cfg, float)))
-        rows.append((g, pc, s))
+        pc = _nbv._gun_translation_cost(h_truth, cur_cfg, c.cfg)       # 仅显示用；非重算候选
+        rows.append((c.gain, pc, c.score))
 
     print(f"\n== _debug_viz_candidates {tag}status={r.status} |B|={B.shape[0]} 候选={len(cands)} "
           f"lambda_cost={lam} ==")
@@ -576,7 +691,7 @@ def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene
     for i, c in enumerate(cands):
         g, pc, s = rows[i]
         geoms = base_geoms()
-        am = _arm_mesh(h_truth, list(c.config)); am.paint_uniform_color([0.10, 0.75, 0.80])
+        am = _arm_mesh(h_truth, list(c.cfg)); am.paint_uniform_color([0.10, 0.75, 0.80])
         geoms.append(("arm_cand", am, "lit", None))                   # 该候选构型整臂（真摆成看 B）
         eye = np.asarray(c.cam_pose)[:3, 3]; T = np.asarray(c.target)
         depth = float(np.linalg.norm(T - eye)) or max_depth
@@ -660,6 +775,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
 
     cur_cfg = [float(v) for v in start_cfg] if start_cfg is not None else list(cfg.retract_config)
     GT = [np.asarray(cur_cfg, dtype=np.float64)]
+    # _dump_seg_isaacsim(None, None, reset=True)               # 清空执行段落盘（供 viz_seg_isaacsim.py 干净进程回放）
     metric = ci.free_pose_metric(h_truth, free_rot=(0,))     # 放开焊枪绕接近轴 roll
     h_plan = h_truth_plan if h_truth_plan is not None else h_truth  # 步② P* 规划用（带障碍 buffer / 退回 h_truth）
 
@@ -702,6 +818,8 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             GT.extend(seg[1:])
             status = "reached"
             info["rounds"] = rnd + 1
+            # _debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)  # 步① 直达目标段 seg 路径
+            # _dump_seg_isaacsim(cur_cfg, seg[1:], rnd=rnd)    # 同段落盘（isaacsim 回放：工件+障碍+臂，无 voxmap）
             break
 
         # 步②：真值上的全知最优路 P*（挡住的只可能是 UNKNOWN）；h_plan 的障碍已含 buffer（若调用方传入）。
@@ -723,6 +841,8 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     P = si.plan_joint_single(cfg, world_plan, cur_cfg, goal_cfg)
                 else:
                     P = si.plan_pose_single(cfg, world_plan, cur_cfg, goal_pose)
+                    # [1.2627240419387817, -2.024371862411499, 6.27759313583374, -0.5791741609573364, -1.5592968463897705, 3.2276997566223145]
+                    # [-0.13571767508983612, -0.9203471541404724, 1.2579456567764282, -1.0674389600753784, -0.9313104748725891, -2.814171075820923]
                 if P is None:
                     print(f"[step② P*失败 R{rnd}] STOMP 在 world_plan 上未找到到 goal 的合格轨迹")
         else:
@@ -743,11 +863,11 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                           f"{ci.explain_endpoints(h_plan, cur_cfg, _cands[0][0])}")
         # _debug_viz_pstar(h_truth, voxmap, cur_cfg, P, truth_scene, goal_pose, rnd=rnd)  # 看真值最优路 P*（注释此行可关）
         # 步③④：一轮特权 NBV（P* → reach_pt/B → 候选 → 假设性 raycast 打分 → argmax）
-        r = best_next_view_using_oracle(h_truth, cur_cfg, voxmap, truth_scene, goal_pose,
+        r, r_list = best_next_view_using_oracle(h_truth, cur_cfg, voxmap, truth_scene, goal_pose,
                                         params=params, camera_model=camera_model,
                                         pose_cost_metric=metric, p_star=P)
-        _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
-        _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
+        # _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, r_list, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
+        # _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
         info["status_seq"].append(r.status)
         info["n_B"].append(int(r.n_B))#r.n_B:本轮阻塞段B的体素个数
         if P is not None and info["P_len"] is None:
@@ -759,11 +879,19 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             info["rounds"] = rnd + 1
             break
         elif r.status == "ok":                               # 正常探索一步
-            seg = _move_to(h_expl, voxmap, cur_cfg, r.cfg, camera_model, truth_scene,
-                           max_depth, every_n=every_n)
-            if seg is not None:
-                GT.extend(seg)
-                cur_cfg = list(r.cfg)
+            for cand_idx, cand in enumerate(r_list):                              # 按 score 降序逐个试，第一个能走通(seg 非 None)的就用
+                seg = _move_to(h_expl, voxmap, cur_cfg, cand.cfg, camera_model, truth_scene,
+                               max_depth, every_n=every_n)
+                if seg is not None:
+                    # _debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)  # 收尾段 seg 路径
+                    # _dump_seg_isaacsim(cur_cfg, seg, rnd=rnd)    # 同段落盘（isaacsim 回放：工件+障碍+臂，无 voxmap）
+                    GT.extend(seg)
+                    cur_cfg = list(cand.cfg)
+                    print(f'cand_idx: {cand_idx}')
+                    break
+                # [2.6993298530578613, -3.7917306423187256, 1.969797968864441, -1.7160824537277222, -1.9512810707092285, -3.3656280040740967]
+                else:
+                    print(f'cand {cand_idx} is invalid')
         elif r.status == "corridor_confirmed":               # B 空但 ① 没成 → 沿 P* 推进已确认段
             reach_idx = r.reach_idx
             if reach_idx >= len(P) - 1:                       # 整条 P* 已落在 FREE → 直接收尾

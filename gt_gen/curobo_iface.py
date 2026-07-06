@@ -101,7 +101,7 @@ def init_curobo(
     ta = TensorDeviceType()
     rd = load_yaml(config.robot_cfg_path)
     kin = rd["robot_cfg"]["kinematics"]
-    kin["link_names"] = ["Link6", "xiaoyu_flange_link"]  # Link6 供相机 FK；flange 供 Step8 半球轴锚点
+    kin["link_names"] = ["Link6", "xiaoyu_flange_link", "xiaoyu_accessory_link"]  # Link6 供相机 FK；flange 供 Step8 半球轴锚点；accessory 供 NBV 焊枪角度代价(Step9)
 
     if drop_collision_links:
         drop = set(drop_collision_links)
@@ -369,6 +369,16 @@ def plan_to_config(handle: CuroboHandle, start_cfg, goal_cfg, max_attempts: int 
         enable_graph = handle.config.enable_graph
     if time_dilation_factor is None:
         time_dilation_factor = handle.config.time_dilation_factor
+
+    # 目标角相对起点做 2π 分支归一：旋转关节（如 J6 腕部 roll）若目标落在差 2π 的远端支，
+    # 规划器会为到达同一末端位姿而把该关节转近整圈（焊枪自转 360°）。归一到近端等价支后位姿不变。
+    try:
+        from gt_gen.joint_wrap import wrap_goal_near_start
+        jl = handle.mg.kinematics.get_joint_limits().position.detach().cpu().numpy()  # (2,dof)
+        goal_cfg = wrap_goal_near_start(start_cfg, goal_cfg, jl[0], jl[1], tag="wrap/curobo")
+    except Exception as e:  # noqa: BLE001  归一化失败不应阻断规划
+        print(f"[wrap/curobo][warn] 目标角 2π 归一化跳过：{e}")
+
     return handle.mg.plan_single_js(
         _js(handle, start_cfg),
         _js(handle, goal_cfg),

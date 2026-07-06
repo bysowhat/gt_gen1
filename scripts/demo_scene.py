@@ -96,10 +96,11 @@ def demo_main(args):
     #         exit()
 
     from gt_gen.scene import Scene
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1_gt.pkl')
     # # scene = Scene.load('/kpfs_dataset_ssd/tempt/scene1.pkl')
-    Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
-    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(headless=args.headless)
+    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(headless=args.headless)
 
 
 def main():

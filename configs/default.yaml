@@ -217,7 +217,7 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
   ik_return_seeds: 200                  # plan_to_pose 取回的候选解数(多解轮询)，须 ≤ ik_num_seeds
   position_threshold: 0.05              # 位置收敛门限（米）；init_curobo 不传时用此值
   rotation_threshold: 0.5               # 朝向收敛门限（四元数测度 sin(θ/2)，≈60°）；同上
-  max_attempts: 200                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
+  max_attempts: 20                      # plan_on_truth / plan_to_pose 最大规划尝试次数（单一来源）
   drop_collision_links: []  # 从碰撞检查剔除的 link（单一来源：init_curobo 不传时读这里）。空=不剔除任何 link，焊枪也参与避障
   voxel_inflate_voxels: 0   # sync_collision_world 把「非 FREE」障碍向 FREE 膨胀的体素层数。
                             # cuRobo voxel 规划只保证球心避障，而保守判据 motion_stays_in_free 对整臂扫掠
@@ -247,7 +247,7 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
                             #   两后端在同一个 world（默认=仅工件 / 绕行=障碍已膨胀）里规划，只换规划器
     voxel_world: cuboid     # 探索世界 voxmap→STOMP 世界的转法：mesh=marching-cubes 网格化全 ROI 自由泡边界；
                             #   cuboid=仅 base 原点为心 ±local_box_m 盒内的非 FREE 体素→贪心合并成大盒(PRIMITIVE)
-    local_box_m: 2          # cuboid 模式：以 base 原点(0,0,0)为心、半边长 n=此值(米) 的盒 [−n,n]³ 内才转换；
+    local_box_m: 2.5          # cuboid 模式：以 base 原点(0,0,0)为心、半边长 n=此值(米) 的盒 [−n,n]³ 内才转换；
                             #   盒外 UNKNOWN 当 FREE 可穿行（放宽保守性换速度）。盒内占据会贪心合并成少量大盒
 
 # 以下参数留待对应步骤填实（先放占位/默认）
@@ -261,7 +261,8 @@ params:
       max: 3                            # 最多簇数（超出则保留最大的簇心 + 全部点重指派到最近簇心覆盖）
       link_dist_m: 0.15                 # 距离阈值（fcluster criterion='distance' 的 t）：簇内最近邻间距 ≤ 此值归一簇
       method: "single"                  # linkage 连接法：single(链式,适合连通体素块)/complete/average/ward
-    lambda_cost: 0.1                    # 增益 vs 路径代价权重（Step 9）
+    lambda_cost: 10                    # score_candidate fun 增益 vs 焊枪平移代价(m)权重（Step 9）
+    lambda_angle: 5                    # score_candidate fun 增益 vs 焊枪朝向变化代价(rad,测地角)权重（Step 9，0=关）
     version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
   loop:
     max_rounds: 200                     # 主循环最大轮次（Step 10）

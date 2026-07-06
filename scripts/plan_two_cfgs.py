@@ -43,9 +43,13 @@
   建议：不动 enable_graph，把 time_dilation_factor 降到 0.1~0.2，或在 _move_to 那次
   plan_to_config 上单独传更小的 time_dilation_factor。
 
+规划后端 / 初始 FREE 空间均从 default.yaml 读取（不再写死）：
+  - planner.backend            : curobo(MotionGen) | stomp(stomp_planner)，与 main_loop._move_to 同分派；
+  - init_free.method_for_init  : box(box_*_m_for_init) | cylinder(cyl_*)，与 place_obstacles_to_gt2 同分派。
+
 运行：conda run -n env_isaaclab --no-capture-output python -u scripts/plan_two_cfgs.py
       规划成功后【自动拉起 Isaac Sim 回放该轨迹】（同一文件、子进程模式：--viz-only）；
-      --no-viz 关可视化、--headless 无头自检、--max-attempts N 调尝试次数。
+      --no-viz 关可视化、--headless 无头自检、--max-attempts N 调 curobo 尝试次数（stomp 旋钮见 yaml）。
 诊断脚本：scripts/diag_plan_two_cfgs.py（全自由世界 + 旋钮扫扫，复现上表）
 """
 import argparse
@@ -60,10 +64,9 @@ sys.path.insert(0, ROOT)                       # 让 gt_gen 可导入（规划/�
 CUROBO_ISAAC = os.environ.get("CUROBO_ISAAC",
                               "/home/a/Projects/Github/curobo/examples/isaac_sim")
 
-CUR_CFG = [1.5707824230194092, -2.0071660480894984, 1.3613484541522425,
-           -0.9599629205516357, -1.570770565663473, 0.0]
-TARGET_CFG = [3.442432165145874, -2.472576379776001, 1.4129290580749512,
-              -0.4071854054927826, -2.634472131729126, -3.2598252296447754]
+CUR_CFG = [1.5707824230194092, -2.617993878, 1.3613484541522425,
+        -1.021018, -1.5707963267948966, 3.14159]
+TARGET_CFG = [2.6993298530578613, -3.7917306423187256, 1.969797968864441, -1.7160824537277222, -1.9512810707092285, -3.3656280040740967]
 
 
 def _parse_args():
@@ -162,7 +165,7 @@ def run_plan(args):
     from gt_gen.config import load_config
     from gt_gen import curobo_iface as ci
     from gt_gen.voxmap import build_roi_voxmap, FREE  # noqa: F401
-    from gt_gen.init_free import set_initial_free_cylinder
+    from gt_gen.init_free import set_initial_free_cylinder, set_initial_free_box
     from gt_gen.collision_sync import sync_collision_world
     from curobo.util_file import load_yaml
 
@@ -173,12 +176,20 @@ def run_plan(args):
 
     vm = build_roi_voxmap(cfg)
 
-    # n = set_initial_free_cylinder(h_expl, vm, config=cfg)   # 圆柱法不做 FK，handle 仅占位
-    n = set_initial_free_cylinder(h_expl, vm, config=cfg, radius=10.6, height=11.8, z_min=-10.02)   # 圆柱法不做 FK，handle 仅占位
-    print(f"初始圆柱 FREE 体素={n} (R={cfg.init_free_cyl_radius}m h={cfg.init_free_cyl_height}m "
-          f"z_min={cfg.init_free_cyl_z_min}m)")
+    # 初始 FREE 空间：方案由 default.yaml 的 init_free.method_for_init 决定（box | cylinder），
+    # 与 place_obstacles_to_gt2.build_worlds / main_loop 同一套分派（勿再写死尺寸）。
+    method = cfg.init_free_method_for_init            # cylinder | box
+    if method == "box":
+        box_min, box_max = cfg.init_free_box_min_for_init, cfg.init_free_box_max_for_init
+        n = set_initial_free_box(h_expl, vm, config=cfg, box_min=box_min, box_max=box_max)
+        print(f"初始 FREE 空间=box {box_min}~{box_max} 体素={n}")
+    else:
+        n = set_initial_free_cylinder(h_expl, vm, config=cfg)   # 圆柱法不做 FK，handle 仅占位
+        print(f"初始 FREE 空间=圆柱 体素={n} (R={cfg.init_free_cyl_radius}m "
+              f"h={cfg.init_free_cyl_height}m z_min={cfg.init_free_cyl_z_min}m)")
 
-    # sync：把「非 FREE」(圆柱外全 UNKNOWN) 灌成 cuRobo 障碍 → 机械臂起步时的真实碰撞世界
+    # sync：把「非 FREE」(FREE 空间外全 UNKNOWN) 灌成 cuRobo 障碍 → 机械臂起步时的真实碰撞世界。
+    # 供 check_state 端点诊断用（碰撞判定恒用 cuRobo handle，与规划后端无关）。
     sync_collision_world(h_expl, vm)
     print(f"sync 完成（voxel_inflate_voxels={cfg.voxel_inflate_voxels}）；UNKNOWN 已当障碍\n")
 
@@ -189,20 +200,34 @@ def run_plan(args):
     print(f"check_state target_cfg: feasible={tf} constraint={tc:.4f}")
     print(f"explain_endpoints     : {ci.explain_endpoints(h_expl, CUR_CFG, TARGET_CFG)}\n")
 
-    # 2) 规划 cur → target（与 _move_to 第 53 行一致）
-    res = ci.plan_to_config(h_expl, CUR_CFG, TARGET_CFG, max_attempts=200, enable_graph=False)
-    ok = res is not None and bool(res.success.item())
+    # 2) 规划 cur → target：后端由 default.yaml 的 planner.backend 决定（curobo | stomp），
+    #    与 main_loop._move_to 同一套分派。两后端均产出 (T,dof) numpy 轨迹，复用同一回放。
+    backend = cfg.planner_backend
+    print(f"规划后端：{backend}（planner.backend）")
+    if backend == "stomp":
+        from gt_gen import stomp_iface as si
+        # 把 voxmap 非 FREE 区转 STOMP 世界（mesh 或 cuboid，见 planner.stomp.voxel_world）
+        world, ck = si.world_from_voxmap_auto(cfg, vm)
+        traj = si.plan_joint_single(cfg, world=world, cur_cfg=CUR_CFG, target_cfg=TARGET_CFG,
+                                    checker_type=ck)
+        ok = traj is not None
+    else:
+        res = ci.plan_to_config(h_expl, CUR_CFG, TARGET_CFG, max_attempts=args.max_attempts)
+        ok = res is not None and bool(res.success.item())
+        traj = res.get_interpolated_plan().position.detach().cpu().numpy() if ok else None
+        if not ok:
+            status = getattr(res, "status", None) if res is not None else "res=None"
+            print(f"plan_to_config 失败：status={status}")
+
     if ok:
-        traj = res.get_interpolated_plan().position.detach().cpu().numpy()
-        print(f"plan_to_config 成功：轨迹 {traj.shape[0]} 点")
+        print(f"规划成功：轨迹 {traj.shape[0]} 点")
         print("PLAN_TWO_CFGS_OK [reached]")
         # 规划成功 → 调 Isaac Sim 可视化这条轨迹（纯机器人回放；--no-viz 可关）
         if not args.no_viz:
             joint_names = load_yaml(cfg.robot_cfg_path)["robot_cfg"]["kinematics"]["cspace"]["joint_names"]
             _launch_viz_subprocess(traj, joint_names, args.traj_out, args.headless, args.fps)
     else:
-        status = getattr(res, "status", None) if res is not None else "res=None"
-        print(f"plan_to_config 失败：status={status}")
+        print(f"规划失败（backend={backend}）")
         print(f"  成因诊断：{ci.explain_endpoints(h_expl, CUR_CFG, TARGET_CFG)}")
         print("PLAN_TWO_CFGS_FAIL")
 

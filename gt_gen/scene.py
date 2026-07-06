@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -291,8 +291,8 @@ class Scene:
             workpiece_obj="/.../BEAM_..._part_watertight.obj",
             weld_json="/.../BEAM_..._weld_angle3.json",
             seam_id=0)
-        cands = scene.plan_init_pose()      # 候选初始位姿（工件↔臂相对 pose，正反手全返回）
-        scene.init_pose_candidates          # = cands（全部候选，无数量上限）
+        cands = scene.plan_init_pose()      # 候选初始位姿（工件↔臂相对 pose），按手别分组返回
+        scene.init_pose_candidates          # = cands = {"forehand":[...], "backhand":[...]}（各组按 xyz 差异降序）
 
     cfg 接受 Config 实例 / yaml 路径 / None（None→load_config() 取默认）。
     """
@@ -318,9 +318,12 @@ class Scene:
         self.goal_user: Optional[tuple] = goal_user
 
         # ===== 世界状态（3D）—— 本期占位，后续 API 填实 =====
-        self.init_pose_candidates: List[InitPoseCandidate] = []   # plan_init_pose 产出的全部候选（正手在前、反手在后，无数量上限）
+        # plan_init_pose 产出的候选：按手别分组的 dict {"forehand":[...], "backhand":[...]}；
+        # 每组各自按【工件平移 xyz 差异】独立分数降序（差异大的排前面），两组互不混排。
+        self.init_pose_candidates: Dict[str, List[InitPoseCandidate]] = {"forehand": [], "backhand": []}
         self.cur_init_pose: Optional[InitPoseCandidate] = None    # 当前选定的 init pose 候选（set_init_pose 设定）——定义工件↔base 摆放
-        self.cur_init_index: Optional[int] = None                 # 当前候选在 init_pose_candidates 中的下标
+        self.cur_init_hand: Optional[str] = None                  # 当前候选所属手别（"forehand"/"backhand"）
+        self.cur_init_index: Optional[int] = None                 # 当前候选在【该手别列表】中的下标
         self.goal_poses: list = []           # compute_goal_pose 产出的观测位姿结果（list[dict]，含 cam_pose 等）
         self.trajectories: list = []         # plan_explore_path 产出的边走边看轨迹（list[dict]，含 positions/status 等）
         self.obstacles: list = []            # 已放障碍（ObstacleSpec）——后续
@@ -368,7 +371,7 @@ class Scene:
     def plan_init_pose(self,
                        diagnostic: bool = False,
                        rebuild: bool = False,
-                       include_obstacles: bool = True) -> List[InitPoseCandidate]:
+                       include_obstacles: bool = True) -> Dict[str, List[InitPoseCandidate]]:
         """计算「工件 ↔ 机械臂」的候选初始位姿（kejian2 逻辑，本焊缝 self.seam）。
 
         与 scripts/plan_init_pose.py 走【完全同一套过滤逻辑】（直接复用其 _kejian2_build_ctx /
@@ -380,7 +383,8 @@ class Scene:
         配置全部读 default.yaml 的 plan_init_pose 段（口径与脚本 --solve-kejian2 一致）。
 
         与脚本【落盘时「每只手最多 15 个」】不同：这里【有多少正反手就返回多少】，不做数量上限挑选。
-        全部候选（正手在前、反手在后）写入 self.init_pose_candidates 并返回。
+        全部候选按手别分组写入 self.init_pose_candidates = {"forehand":[...], "backhand":[...]}，
+        每组各自按【工件平移 xyz 差异】独立分数降序（差异大的排前面），并返回该 dict。
 
         **避障**：include_obstacles=True（默认）且 self.obstacles 非空时，把已放障碍（类型2遮挡板 /
         类型3 open_box）合并进工件 mesh 一起重算 signed ESDF，覆盖 solver 的碰撞体素——碰撞过滤链路
@@ -392,7 +396,7 @@ class Scene:
           rebuild          : True 强制重建工件级 ctx（换工件 / 改 n_per_dof 等缓存失效时）。
           include_obstacles: True（默认）把 self.obstacles 并入碰撞世界后再求解（避障）。
 
-        返回：候选列表（list[InitPoseCandidate]，可能为空=求解失败/无合格解）。
+        返回：候选 dict {"forehand":[...], "backhand":[...]}（各组可能为空=该手别无合格解）。
         """
         if not self.workpiece_obj:
             raise ValueError("plan_init_pose 需要 workpiece_obj（工件 mesh）")
@@ -417,10 +421,32 @@ class Scene:
 
         res, _prof = pim._kejian2_solve_weld(self._k2ctx, self.seam)
 
-        # 有多少正反手都返回（不做 15 个上限挑选）：正手在前、反手在后
-        cands = list(res.get("forehand", [])) + list(res.get("backhand", []))
-        self.init_pose_candidates = [InitPoseCandidate.from_kejian2(d) for d in cands]
+        # 正反手分组返回（不做数量上限挑选）：每组各自按工件平移 xyz 差异独立分数降序
+        fore = [InitPoseCandidate.from_kejian2(d) for d in res.get("forehand", [])]
+        back = [InitPoseCandidate.from_kejian2(d) for d in res.get("backhand", [])]
+        self.init_pose_candidates = {
+            "forehand": self._sort_by_xyz_diversity(fore),
+            "backhand": self._sort_by_xyz_diversity(back),
+        }
         return self.init_pose_candidates
+
+    @staticmethod
+    def _sort_by_xyz_diversity(cands: List["InitPoseCandidate"]) -> List["InitPoseCandidate"]:
+        """把同一手别的候选按【工件平移 xyz 差异】独立分数降序排列（差异大的排前面）。
+
+        每个候选的分数 = 它的平移 t 到本组其余所有候选平移的【平均欧氏距离】（米）；分越高
+        表示越"离群/铺得开"，排在越前。只看 T_workpiece_in_base 的平移 t（不看旋转、不掺手别，
+        因手别已分组）。≤1 个时原样返回。稳定排序（同分保持原相对次序）。
+        """
+        n = len(cands)
+        if n <= 1:
+            return list(cands)
+        ts = np.stack([np.asarray(c.t, dtype=np.float64).reshape(3) for c in cands])   # (n,3)
+        # 两两欧氏距离矩阵 → 每行均值（排除自身：除以 n-1）
+        d = np.linalg.norm(ts[:, None, :] - ts[None, :, :], axis=2)                    # (n,n)
+        score = d.sum(axis=1) / float(n - 1)
+        order = sorted(range(n), key=lambda i: -float(score[i]))                       # 分数降序、稳定
+        return [cands[i] for i in order]
 
     def _obstacle_solid_trimeshes(self):
         """当前 self.obstacles → 可并入碰撞 ESDF 的【实体 trimesh】列表。
@@ -553,23 +579,30 @@ class Scene:
     # ------------------------------------------------------------------
     # 当前 init pose + 观测位姿（goal pose）求解
     # ------------------------------------------------------------------
-    def set_init_pose(self, index: int) -> InitPoseCandidate:
-        """把 init_pose_candidates 的第 index 个候选设为【当前 init pose】。
+    def set_init_pose(self, hand: str, index: int) -> InitPoseCandidate:
+        """把 init_pose_candidates[hand] 的第 index 个候选设为【当前 init pose】。
 
-        让 Scene「知道当前工件相对机器人怎么摆」：填 self.cur_init_pose / cur_init_index，
-        并把 self.workpiece_pose 设为该候选的 base 系 pose7。后续 compute_goal_pose（求观测位姿）
-        与 Open3DSceneVisualizer.show_scene_isaacsim（画机械臂/工件/goal）都从这个当前 init pose
-        取工件↔base 相对摆放 T_workpiece_in_base。
+        让 Scene「知道当前工件相对机器人怎么摆」：填 self.cur_init_pose / cur_init_hand /
+        cur_init_index，并把 self.workpiece_pose 设为该候选的 base 系 pose7。后续 compute_goal_pose
+        （求观测位姿）与 Open3DSceneVisualizer.show_scene_isaacsim（画机械臂/工件/goal）都从这个
+        当前 init pose 取工件↔base 相对摆放 T_workpiece_in_base。
 
-        前提：先 plan_init_pose() 求出候选。index 越界报错。返回选定的 InitPoseCandidate。
+        前提：先 plan_init_pose() 求出候选。hand 须为 "forehand"/"backhand"，index 越界报错。
+        返回选定的 InitPoseCandidate。
         """
-        if not self.init_pose_candidates:
-            raise RuntimeError("无候选 init pose：请先调用 Scene.plan_init_pose()")
-        n = len(self.init_pose_candidates)
+        cands = self.init_pose_candidates
+        if not isinstance(cands, dict) or hand not in cands:
+            raise ValueError(f"hand 须为 'forehand'/'backhand'，收到 {hand!r}；"
+                             f"可用手别 {list(cands) if isinstance(cands, dict) else '无候选'}")
+        lst = cands[hand]
+        n = len(lst)
+        if n == 0:
+            raise RuntimeError(f"手别 {hand!r} 无候选 init pose：请先 plan_init_pose() 或换另一只手")
         if not (-n <= int(index) < n):
-            raise IndexError(f"init pose 候选下标越界：index={index}，共 {n} 个候选")
-        cand = self.init_pose_candidates[int(index)]
+            raise IndexError(f"init pose 候选下标越界：hand={hand} index={index}，该手别共 {n} 个候选")
+        cand = lst[int(index)]
         self.cur_init_pose = cand
+        self.cur_init_hand = hand
         self.cur_init_index = int(index) % n
         self.workpiece_pose = cand.workpiece_pose7          # 工件在 base 系 pose7
         return cand
@@ -605,8 +638,9 @@ class Scene:
             workpiece_pose=self.workpiece_pose,
             goal_user=self.goal_user,
             cur_cfg=list(self.cur_cfg),
-            init_pose_candidates=self.init_pose_candidates,   # InitPoseCandidate（dataclass）
+            init_pose_candidates=self.init_pose_candidates,   # {"forehand":[...],"backhand":[...]}（InitPoseCandidate dataclass）
             cur_init_pose=self.cur_init_pose,
+            cur_init_hand=self.cur_init_hand,
             cur_init_index=self.cur_init_index,
             obstacles=self.obstacles,                  # ObstacleSpec（dataclass；prims=Box、meshes=dict）
             goal_poses=[{k: _to_np(v) for k, v in r.items()} for r in self.goal_poses],
@@ -617,10 +651,14 @@ class Scene:
             os.makedirs(d, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(state, f)
-        print(f"[scene] 已保存 → {path}（候选 {len(self.init_pose_candidates)}，"
+        n_f = len(self.init_pose_candidates.get("forehand", []))
+        n_b = len(self.init_pose_candidates.get("backhand", []))
+        cur = ("%s#%d" % (self.cur_init_hand, self.cur_init_index)
+               if self.cur_init_index is not None else "未设")
+        print(f"[scene] 已保存 → {path}（候选 正手{n_f}/反手{n_b}，"
               f"障碍 {len(self.obstacles)}，goal_poses {len(self.goal_poses)}，"
               f"轨迹 {len(self.trajectories)}，"
-              f"当前 init pose={'#%d' % self.cur_init_index if self.cur_init_index is not None else '未设'}）")
+              f"当前 init pose={cur}）")
         return path
 
     @classmethod
@@ -642,16 +680,31 @@ class Scene:
         self.workpiece_pose = state.get("workpiece_pose")
         self.goal_user = state.get("goal_user")
         self.cur_cfg = list(state.get("cur_cfg", self.cur_cfg))
-        self.init_pose_candidates = state.get("init_pose_candidates", []) or []
+        cands = state.get("init_pose_candidates", None)
+        if isinstance(cands, dict):
+            self.init_pose_candidates = {"forehand": list(cands.get("forehand", [])),
+                                         "backhand": list(cands.get("backhand", []))}
+        elif cands:                                  # 旧 pkl：扁平 list → 按 hand 分组（保持原相对次序）
+            self.init_pose_candidates = {
+                "forehand": [c for c in cands if getattr(c, "hand", None) == "forehand"],
+                "backhand": [c for c in cands if getattr(c, "hand", None) == "backhand"]}
+        else:
+            self.init_pose_candidates = {"forehand": [], "backhand": []}
         self.cur_init_pose = state.get("cur_init_pose")
+        self.cur_init_hand = state.get("cur_init_hand",
+                                       getattr(self.cur_init_pose, "hand", None))
         self.cur_init_index = state.get("cur_init_index")
         self.obstacles = state.get("obstacles", []) or []
         self.goal_poses = state.get("goal_poses", []) or []
         self.trajectories = state.get("trajectories", []) or []   # 旧 pkl 无此键 → 空
-        print(f"[scene] 已加载 ← {path}（候选 {len(self.init_pose_candidates)}，"
+        n_f = len(self.init_pose_candidates.get("forehand", []))
+        n_b = len(self.init_pose_candidates.get("backhand", []))
+        cur = ("%s#%d" % (self.cur_init_hand, self.cur_init_index)
+               if self.cur_init_index is not None else "未设")
+        print(f"[scene] 已加载 ← {path}（候选 正手{n_f}/反手{n_b}，"
               f"障碍 {len(self.obstacles)}，goal_poses {len(self.goal_poses)}，"
               f"轨迹 {len(self.trajectories)}，"
-              f"当前 init pose={'#%d' % self.cur_init_index if self.cur_init_index is not None else '未设'}）")
+              f"当前 init pose={cur}）")
         return self
 
     def _seam_data_arrays(self, n_seg: int = None):
@@ -697,12 +750,26 @@ class Scene:
         ⚠ ES 采样规模（num_batches/num_randoms_new）调太小会触发优化器内部假设崩溃（compute_goal_poses2
           既有行为），默认 8×100 稳定。horizontal：0=水平 / 1=垂直 / 其它=all（全范围）。
 
-        前提：先 set_init_pose(index) 选定当前 init pose（否则报错）。
-        返回：list[dict]（每个 robot_pose 一项，含 cam_pose (K,B,7)/joints/start_pts/end_pts/robot_pose_rel），
-              同时写入 self.goal_poses。无解则该项被跳过（可能返回空列表）。
+        前提：先 set_init_pose(hand, index) 选定当前 init pose（否则报错）。
+        返回：list[dict]（每个 robot_pose 一项，含 cam_pose (K,B,7)/joints (K,B,6)/start_pts/end_pts/
+              robot_pose_rel），同时写入 self.goal_poses。无解则该项被跳过（可能返回空列表）。
+
+        **输出张量三维语义** `(K, B, DOF)`（以 joints (160,1,6) 为例，见 optimizer_pose.py）：
+          · DOF=6：UR12e 6 轴关节角（cam_pose 末维为 7=pos3+quat4）。
+          · B：覆盖整条焊缝所需的观测位姿个数。B=1 表示这条焊缝一个视角即可看完；B>1 则是
+            必须按顺序访问的多视角序列。
+          · K（例中 160）：候选解变体数，**并非** K 个独立最优解，而是「精修快照 × 选出的候选批」：
+              1) ES 优化后 selectOutputs() 从 num_batches(默认 8) 个并行批里挑出「已完成且覆盖位姿数
+                 等于最少值」的 A0 个候选批（stack 成第一维）；
+              2) refine=True 时 refineOutputs() 对这 A0 个候选继续精修 max_iterations_refine(默认 40)
+                 步，每 span(默认 1) 步存一次快照，共 num_snapshots 个；
+              3) 结尾 torch.cat(..., dim=0) 把快照沿第 0 维拼起来 → K = num_snapshots × A0
+                 （例：40 × 4 = 160）。拼接前 list.reverse()，故 dim0 前段是最后（最收敛）的迭代。
+          用的时候第一维 K 通常任取其一（如 0）即可，它们都是收敛后的合格解；start_pts/end_pts 也按
+          同样的 (K, B) 展开，第一维含义一致。
         """
         if self.cur_init_pose is None:
-            raise RuntimeError("compute_goal_pose 需要当前 init pose：请先 set_init_pose(index)")
+            raise RuntimeError("compute_goal_pose 需要当前 init pose：请先 set_init_pose(hand, index)")
         import torch
 
         # —— 参数：configs/default.yaml 的 compute_goal_pose 段（显式传参/**cfg_overrides 可覆盖）——
@@ -797,10 +864,10 @@ class Scene:
         机械臂从 cur_joints（缺省=self.cur_cfg，通常 retract）起步，只敢走「亲眼看过是空的」区域，
         边走边拍、已知区像水面扩大，直到规划到 goal（reached）或触发主循环终止条件。
 
-        实现上把起点喂给 generate_gt 的办法：generate_gt 固定从 cfg.retract_config 起步，这里在
-        调用期间【临时把 cfg 的 retract_config 覆盖为 cur_joints】（结束即还原），不改 main_loop 一行。
+        实现上把起点喂给 generate_gt 的办法：起点 cur_joints 作为 generate_gt 的 start_cfg 参数传入
+        （缺省时 generate_gt 用 cfg.retract_config）。
 
-        前提：先 set_init_pose(index)（定义工件↔base 摆放）+ compute_goal_pose（求 goal 观测位姿序列）。
+        前提：先 set_init_pose(hand, index)（定义工件↔base 摆放）+ compute_goal_pose（求 goal 观测位姿序列）。
         ⚠ 会 import/初始化 warp+curobo，污染本进程；须在【未启动 SimulationApp 的进程】里调用。
           可视化：本方法后 scene.save(path)，另起干净进程 Scene.load 再 show_trajectory_isaacsim。
 
@@ -814,7 +881,7 @@ class Scene:
           {positions(T,DOF), status, goal_index, variant, cur_joints, goal_pose, info}。
         """
         if self.cur_init_pose is None:
-            raise RuntimeError("plan_explore_path 需要当前 init pose：请先 set_init_pose(index)")
+            raise RuntimeError("plan_explore_path 需要当前 init pose：请先 set_init_pose(hand, index)")
         if not self.goal_poses:
             raise RuntimeError("plan_explore_path 需要 goal pose：请先 compute_goal_pose()")
 
@@ -852,58 +919,53 @@ class Scene:
         if device is None:
             device = str(self.cfg.raw.get("compute_goal_pose", {}).get("device", "cuda"))
 
-        # —— 起点关节角（缺省=self.cur_cfg）；临时覆盖 cfg.retract_config，使 generate_gt 从此起步 ——
+        # —— 起点关节角（缺省=self.cur_cfg）；作为 start_cfg 传入 generate_gt（无需覆盖 retract_config）——
         start = [float(v) for v in (self.cur_cfg if cur_joints is None else cur_joints)]
-        kin = self.cfg.robot_cfg["robot_cfg"]["kinematics"]
-        old_retract = list(kin["cspace"]["retract_config"])
-        kin["cspace"]["retract_config"] = list(start)
-        try:
-            # —— base 系摆放：工件 + 障碍实体（顶点在工件 mesh 系）按 workpiece_pose7 一起摆到 base 系 ——
-            wp_pose7 = np.asarray(self.cur_init_pose.workpiece_pose7, float).tolist()
-            T = np.asarray(self.cur_init_pose.T_workpiece_in_base, float)
 
-            obs_tms = self._obstacle_solid_trimeshes() if include_obstacles else []
-            meshes = [CuMesh(name="workpiece", file_path=self.workpiece_obj, pose=wp_pose7)]
-            if obs_tms:
-                merged = _trimesh.util.concatenate(obs_tms)
-                meshes.append(CuMesh(
-                    name="obstacles",
-                    vertices=np.asarray(merged.vertices, float).tolist(),
-                    faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
-                    pose=wp_pose7))                          # 障碍与工件同 pose → 一并进 base 系
-            world = WorldConfig(mesh=meshes)                 # MESH 真值世界（工件+障碍）
+        # —— base 系摆放：工件 + 障碍实体（顶点在工件 mesh 系）按 workpiece_pose7 一起摆到 base 系 ——
+        wp_pose7 = np.asarray(self.cur_init_pose.workpiece_pose7, float).tolist()
+        T = np.asarray(self.cur_init_pose.T_workpiece_in_base, float)
 
-            print(f"[scene] plan_explore_path：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
-            h_truth = ci.init_curobo(self.cfg, world_model=world,
-                                     collision_checker_type=CollisionCheckerType.MESH,
-                                     position_threshold=0.05, rotation_threshold=0.5)
-            print("[scene] plan_explore_path：建 h_expl（VOXEL 三态）...")
-            h_expl = ci.init_curobo(self.cfg)
+        obs_tms = self._obstacle_solid_trimeshes() if include_obstacles else []
+        meshes = [CuMesh(name="workpiece", file_path=self.workpiece_obj, pose=wp_pose7)]
+        if obs_tms:
+            merged = _trimesh.util.concatenate(obs_tms)
+            meshes.append(CuMesh(
+                name="obstacles",
+                vertices=np.asarray(merged.vertices, float).tolist(),
+                faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
+                pose=wp_pose7))                          # 障碍与工件同 pose → 一并进 base 系
+        world = WorldConfig(mesh=meshes)                 # MESH 真值世界（工件+障碍）
 
-            # truth_scene（base 系 trimesh）：工件 + 障碍（同一 T 变到 base 系）
-            work_mesh = load_truth_scene(self.workpiece_obj, mesh_pose=wp_pose7)
-            tms = [work_mesh]
-            for tm in obs_tms:
-                tmc = tm.copy()
-                tmc.apply_transform(T)                       # 工件 mesh 系 → base 系（与工件同一 T）
-                tms.append(tmc)
-            truth_scene = _trimesh.util.concatenate(tms) if len(tms) > 1 else work_mesh
+        print(f"[scene] plan_explore_path：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
+        h_truth = ci.init_curobo(self.cfg, world_model=world,
+                                 collision_checker_type=CollisionCheckerType.MESH,
+                                 position_threshold=0.05, rotation_threshold=0.5)
+        print("[scene] plan_explore_path：建 h_expl（VOXEL 三态）...")
+        h_expl = ci.init_curobo(self.cfg)
 
-            # goal_pose：FK(goal_joints) → base 系末端 standoff 目标（可达且自洽）
-            eep, eeq, _ = ci.fk(h_truth, goal_joints)
-            goal_pose = (eep.tolist(), eeq.tolist())
-            print(f"[scene] goal=FK(观测位姿#{gi}/{B} 变体#{vi}/{K}) pos={np.round(eep, 3)}")
+        # truth_scene（base 系 trimesh）：工件 + 障碍（同一 T 变到 base 系）
+        work_mesh = load_truth_scene(self.workpiece_obj, mesh_pose=wp_pose7)
+        tms = [work_mesh]
+        for tm in obs_tms:
+            tmc = tm.copy()
+            tmc.apply_transform(T)                       # 工件 mesh 系 → base 系（与工件同一 T）
+            tms.append(tmc)
+        truth_scene = _trimesh.util.concatenate(tms) if len(tms) > 1 else work_mesh
 
-            cam = load_camera_model(self.cfg)
-            vm = build_roi_voxmap(self.cfg)
-            n_free = set_initial_free_cylinder(h_truth, vm, config=self.cfg)  # 起点末端周围罩 FREE
-            print(f"[scene] 初始 FREE 体素={n_free}；开跑 generate_gt 主循环（边走边看）...")
+        # goal_pose：FK(goal_joints) → base 系末端 standoff 目标（可达且自洽）
+        eep, eeq, _ = ci.fk(h_truth, goal_joints)
+        goal_pose = (eep.tolist(), eeq.tolist())
+        print(f"[scene] goal=FK(观测位姿#{gi}/{B} 变体#{vi}/{K}) pos={np.round(eep, 3)}")
 
-            # world_plan=world：backend=stomp 时步② 规划 P* 需要 MESH 世界（真实尺寸，无 buffer）
-            GT, status, info = generate_gt(h_truth, h_expl, vm, truth_scene, goal_pose,
-                                           camera_model=cam, world_plan=world)
-        finally:
-            kin["cspace"]["retract_config"] = old_retract    # 还原，避免污染后续调用
+        cam = load_camera_model(self.cfg)
+        vm = build_roi_voxmap(self.cfg)
+        n_free = set_initial_free_cylinder(h_truth, vm, config=self.cfg)  # 起点末端周围罩 FREE
+        print(f"[scene] 初始 FREE 体素={n_free}；开跑 generate_gt 主循环（边走边看）...")
+
+        # world_plan=world：backend=stomp 时步② 规划 P* 需要 MESH 世界（真实尺寸，无 buffer）
+        GT, status, info = generate_gt(h_truth, h_expl, vm, truth_scene, goal_pose,
+                                       camera_model=cam, world_plan=world, start_cfg=start)
 
         positions = np.asarray([np.asarray(q, float) for q in GT])
         entry = dict(positions=positions, status=status, goal_index=gi, variant=vi,
