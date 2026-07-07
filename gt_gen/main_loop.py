@@ -845,6 +845,10 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     # [-0.13571767508983612, -0.9203471541404724, 1.2579456567764282, -1.0674389600753784, -0.9313104748725891, -2.814171075820923]
                 if P is None:
                     print(f"[step② P*失败 R{rnd}] STOMP 在 world_plan 上未找到到 goal 的合格轨迹")
+                    # STOMP 规划不出 P* → 本场景不可行，直接失败退出 generate_gt（不再进 NBV/后续轮）
+                    info["rounds"] = rnd + 1
+                    status = "infeasible"
+                    return np.asarray(GT, dtype=np.float64), status, info
         else:
             # 改走 plan_to_pose_all（= place_obstacles.detour_exists 那条成功路径）：对多条 IK 分支逐个 plan，
             # 取第 0 条（IK 误差最小的成功解）。与 plan_to_pose 同核，但显式跑满 IK 多解、对随机失败更稳。

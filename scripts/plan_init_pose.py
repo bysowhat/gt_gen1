@@ -556,6 +556,39 @@ class InitPoseLookupSolver:
         d = self.robot_world.get_collision_distance(x_sph, env_query_idx=None)
         return d.squeeze(-1)
 
+    def recheck_retract_collision_snapped(self, R_wp, t_wp, chunk: int = 2048):
+        """snap 后姿态复检：给定候选工件位姿 (R_wp (M,3,3), t_wp (M,3), = T_workpiece_in_base)，
+        只用【retract 固定 home 姿态的整臂碰撞球】反变到工件 mesh world 查 ESDF，返回 safe 掩码 (M,) bool
+        （True=不撞）。判据与 solve_one_weld_lookup 的碰撞过滤一致（含 clearance_inflate、
+        d<=collision_tolerance），区别仅在用 snap 后 (Rv,t_new) 而非 solve 时 (R,t)，且只查 retract、
+        不查目标构型 q 的整臂球（retract 球与 q 无关，故无需 q 索引）。"""
+        import torch
+        device, dtype = self.tensor_args.device, self.tensor_args.dtype
+        M = int(np.asarray(R_wp).shape[0])
+        safe = torch.zeros(M, dtype=torch.bool, device=device)
+        if M == 0:
+            return safe
+        self._ensure_voxel_pose_set()
+        R_t = torch.as_tensor(np.asarray(R_wp, dtype=np.float64), device=device, dtype=dtype)  # (M,3,3)
+        t_t = torch.as_tensor(np.asarray(t_wp, dtype=np.float64), device=device, dtype=dtype)  # (M,3)
+        ret_xyz = self.retract_spheres_t[:, :3]                 # (K,3) retract 球心（base 系）
+        ret_r = self.retract_spheres_t[:, 3]                    # (K,)
+        if self.clearance_inflate > 0.0:                        # 间隙膨胀：与 solve 判据一致
+            ret_r = ret_r + self.clearance_inflate
+        with torch.no_grad():
+            for i in range(0, M, chunk):
+                R_c = R_t[i:i + chunk]                          # (c,3,3)
+                t_c = t_t[i:i + chunk]                          # (c,3)
+                c = R_c.shape[0]
+                # retract 球反变到 mesh_world：p_world = R^T @ (p_base - t)（einsum 同 solve 的整臂/retract 变换）
+                deltas = ret_xyz[None, :, :].expand(c, -1, -1) - t_c[:, None, :]     # (c,K,3)
+                ret_xyz_w = torch.einsum("nji,nkj->nki", R_c, deltas)                # (c,K,3)
+                ret_spheres_w = torch.cat(
+                    [ret_xyz_w, ret_r[None, :].expand(c, -1).unsqueeze(-1)], dim=-1)  # (c,K,4)
+                d_ret = self._voxel_collision_distance_batch(ret_spheres_w)          # (c,)
+                safe[i:i + chunk] = d_ret <= self.collision_tolerance
+        return safe
+
     # ---- 离线预计算 ----
     def precompute_joint_table(self):
         """6 关节限位等距 n^6 采样 → 逐块 batch FK 算 (ee_pos, ee_x, link_spheres) 并【当场过滤】。
@@ -2111,6 +2144,7 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
         "ee_xy_range": [float(v) for v in cfg.plan_init_ee_xy_range],
         "ee_z_range": [float(v) for v in cfg.plan_init_ee_z_range],
         "workpiece_x_min": float(cfg.plan_init_workpiece_x_min),
+        "arm_collision_recheck": bool(cfg.plan_init_arm_collision_recheck),
         "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
         "mesh_v": mesh_v, "mesh_f": mesh_f,
         "prof_setup": prof_setup,
@@ -2137,6 +2171,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     xy_lo, xy_hi = ctx["ee_xy_range"]
     z_lo, z_hi = ctx["ee_z_range"]
     wp_x_min = ctx["workpiece_x_min"]
+    arm_recheck = ctx["arm_collision_recheck"]
     bc_cc, bc_rr, bc_umin, bc_umax = ctx["bc_cc"], ctx["bc_rr"], ctx["bc_umin"], ctx["bc_umax"]
     mesh_v, mesh_f = ctx["mesh_v"], ctx["mesh_f"]
 
@@ -2170,6 +2205,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     n_xneg = 0         # 因「焊缝中心点 base-x<=0」丢弃
     n_wpx = 0          # 因「工件距 base 欧氏最近点 base-x <= workpiece_x_min」丢弃
     n_overlap = 0      # 因「固定底座与工件在 base-xy 投影相交」丢弃
+    n_arm_collide = 0  # 因「snap 后 retract 姿态整臂 vs 工件碰撞」丢弃（最后一步复检）
     seen = set()
 
     # —— 向量化预筛（批量替代逐候选 scipy/几何；与逐个版逐位等价，仅 overlap+去重+组装仍按原始顺序循环）——
@@ -2263,9 +2299,21 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
 
     fore = [r for r in results if r["hand"] == "forehand"]
     back = [r for r in results if r["hand"] == "backhand"]
+    # —— 最后一步：snap 后姿态复检。候选 R snap 到 90°整倍朝向、重算 t 会改变工件姿态，
+    #   ④ 里 snap 前的碰撞过滤在此姿态下已失效；这里对最终 (Rv,t_new) 只用 retract 姿态整臂碰撞球
+    #   再查一次工件 ESDF，撞则丢弃（判据同 ④：含 clearance_inflate、d<=collision_tolerance）。
+    if arm_recheck and results:
+        R_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, :3] for r in results])
+        t_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, 3] for r in results])
+        safe = solver.recheck_retract_collision_snapped(R_res, t_res).detach().cpu().numpy()
+        n_arm_collide = int((~safe).sum())
+        results = [r for r, s in zip(results, safe.tolist()) if s]
+        fore = [r for r in results if r["hand"] == "forehand"]
+        back = [r for r in results if r["hand"] == "backhand"]
     prof["⑤snap+正反手分类(CPU遍历候选)"] = _time.time() - _t
     print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 背面丢 {n_back} / x<=0 丢 {n_xneg} "
-          f"/ 工件最近点x<={wp_x_min} 丢 {n_wpx} / 底座-工件XY相交丢 {n_overlap} → 去重后合格 {len(results)}"
+          f"/ 工件最近点x<={wp_x_min} 丢 {n_wpx} / 底座-工件XY相交丢 {n_overlap} "
+          f"/ snap后retract-工件碰撞丢 {n_arm_collide} → 合格 {len(results)}"
           f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
     return {"forehand": fore, "backhand": back}, prof
 

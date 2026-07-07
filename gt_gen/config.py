@@ -244,6 +244,14 @@ class Config:
         （工件离底座 x 向太近/在底座后方）。见 default.yaml plan_init_pose.workpiece_x_min_m。"""
         return float(self.raw.get("plan_init_pose", {}).get("workpiece_x_min_m", 0.3))
 
+    @property
+    def plan_init_arm_collision_recheck(self) -> bool:
+        """snap 后是否复检：候选 R snap 到 90°整倍朝向、重算 t 会改变工件姿态，snap 前的碰撞过滤此时已失效。
+        true=对最终 (Rv,t_new) 再查一次「retract 姿态整臂碰撞球 vs 工件 ESDF」，撞则丢弃（判据同 solve：
+        含 clearance_inflate、d<=collision_tolerance 判 safe）；false=关闭。
+        见 default.yaml plan_init_pose.arm_collision_recheck。"""
+        return bool(self.raw.get("plan_init_pose", {}).get("arm_collision_recheck", True))
+
     # ---- plan_init_pose_kejian（新逻辑：固定朝向 + 平移网格 + STOMP 可达，见 scripts/plan_init_pose_kejian.py） ----
     @property
     def _kejian(self) -> dict:

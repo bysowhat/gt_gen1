@@ -94,6 +94,9 @@ compute_goal_pose:                      # 观测位姿(goal pose) ES 优化器�
   max_iterations_refine: 40             # refine 阶段迭代上限
   num_steps: 5                          # 每个观测位姿覆盖的焊缝细分步数
   # 代价权重(collision/vision/insides/space/block/orientation…)沿用 ConfigurationPose 默认，需要时按其属性名在此加键覆盖。
+  orient_gate_relax: 40                 # 接受门槛的朝向放宽角度(deg)：把“朝向好不好”降级为偏好(仍在 ES 目标里驱动朝 45°)，
+                                        # 只有超过软上限的极端掠射(约>85°贴面)才判“没真正看到”。0=不放宽=旧行为。
+                                        # 用途：障碍逼相机偏离 45° 平分线时，仍接受这种大角度可行观测(带板 seam 不再无解)。
 
 init_free:                              # 初始引导 FREE 空间（见 docs/initial-free-space.md）
   # 末端相机初始视野极小，voxmap 全 UNKNOWN 时整臂扫掠必含 UNKNOWN → reach_pt=0，机械臂动不了。
@@ -144,6 +147,10 @@ plan_init_pose:                         # lookup 式初始位姿求解（scripts
                                         #   true=做该过滤（默认）；false=关闭（允许工件摆在底座正上方）。
   workpiece_x_min_m: 0.3                # 工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量下限（米）：
                                         #   须 > 此值否则丢弃（工件离底座 x 向太近/在底座后方）。仅看正 x（严格大于）。
+  arm_collision_recheck: true           # snap 后复检：把候选 R snap 到 90°整倍朝向、重算 t 会改变工件姿态，
+                                        #   snap 前的碰撞过滤在此姿态下已失效。true=对最终 (Rv,t_new) 再查一次
+                                        #   【retract 姿态整臂碰撞球 vs 工件 ESDF】，撞则丢弃（判据同 solve：
+                                        #   含 clearance_inflate_m、d<=collision_tolerance_m 判 safe）；false=关闭。
   # 角度采样：先把焊缝平分线 align 到名义焊枪轴(-ee_x)得基准姿态 R0，再【绕 xiaoyu_tip_link 末端局部
   # x/y/z 轴】各转一点组成扰动 R_delta，R=R_delta@R0（三角全有效）。名义焊枪轴=末端局部 -x，故绕 x
   # 即焊枪自转 roll（指向不变），绕 y/z 为 tilt（改变焊枪指向）。可视化核实见 plan_init_pose.viz_tip_frame。
