@@ -1740,6 +1740,27 @@ def _load_mesh_vf(obj_fp: str):
         return None, None
 
 
+def _voxelize_mesh_points(mesh_v, mesh_f, pitch: float):
+    """把工件表面按 pitch(米) 体素化，返回占据体素中心 (K,3)（mesh 局部系）。
+    用于「工件距 base 欧氏最近点 x」过滤的稠密点集——密度绑物理长度、与三角形大小解耦，
+    大三角形也会被填成一排体素，不会像顶点那样漏采。
+    体素化失败/无三角形则回退用原顶点 mesh_v（保证不崩），由调用方负责打印。"""
+    if mesh_v is None or mesh_f is None:
+        return mesh_v
+    try:
+        import gt_gen.compat
+        import trimesh as _trimesh
+        gt_gen.compat.apply_trimesh_shim()
+        tm = _trimesh.Trimesh(vertices=np.asarray(mesh_v, dtype=np.float64),
+                              faces=np.asarray(mesh_f, dtype=np.int64), process=False)
+        pts = np.asarray(tm.voxelized(pitch=float(pitch)).points, dtype=np.float64)
+        if pts.size == 0:
+            return mesh_v
+        return pts
+    except Exception:
+        return mesh_v
+
+
 def _base_circles_to_arrays(base_circles):
     """把 [(中心(2,),半径),…] 转成 (cc(C,2), rr(C,), 并集AABB下界 umin(2,), 并集AABB上界 umax(2,))。
     底座圆 q 无关，转一次即可复用；空则返回 (None,None,None,None)。"""
@@ -1873,6 +1894,21 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5, extra_geoms=N
         arrow.paint_uniform_color(col)
         return [arrow]
 
+    def _near_pt_geoms(p_near, radius: float = 0.03):
+        """把「工件距 base 原点欧氏最近的那个点」画成品红小球 + 从 base 原点(0,0,0)到它的连线，
+        直观展示 workpiece_x_min 过滤依据的那个点落在工件哪里、离底座多近。"""
+        import open3d as o3d
+        p = np.asarray(p_near, float)
+        s = o3d.geometry.TriangleMesh.create_sphere(radius=radius, resolution=12)
+        s.translate(p.tolist())
+        s.compute_vertex_normals()
+        s.paint_uniform_color([1.0, 0.1, 0.6])                # 品红
+        ls = o3d.geometry.LineSet(
+            points=o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0], p])),
+            lines=o3d.utility.Vector2iVector(np.array([[0, 1]], dtype=np.int32)))
+        ls.colors = o3d.utility.Vector3dVector(np.array([[1.0, 0.1, 0.6]]))
+        return [s, ls]
+
     cam = {"params": None}   # 跨窗口沿用相机视角，避免每次切换都重置
     idx = 0
     while idx < n:
@@ -1888,6 +1924,12 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5, extra_geoms=N
             vis.add_geometry(g)
         for g in _bisector_axis_geoms(seam_c, bis):   # 蓝色 bisector 轴（正反手判据）
             vis.add_geometry(g)
+        p_near = r.get("wpx_near_base", None)          # 品红球：工件距 base 原点最近点（workpiece_x_min 判据点）
+        if p_near is not None:
+            print(f"       最近点 base-x={float(np.asarray(p_near, float)[0]):+.3f}"
+                  f"（阈值 workpiece_x_min）")
+            for g in _near_pt_geoms(p_near):
+                vis.add_geometry(g)
         if extra_geoms is not None:                    # 随工件摆放的额外几何（如障碍物）
             try:
                 for g in extra_geoms(sol["R"], sol["t"]):
@@ -2121,6 +2163,13 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
     mesh_v, mesh_f = _load_mesh_vf(obj_fp)
     if mesh_v is None:
         print("[kejian2] 警告：读不到工件顶点，无法做「工件距 base 欧氏最近点 x」过滤（该候选不因此过滤）")
+    # 「最近点 x」过滤的稠密点集：把工件按 workpiece_x_voxel_m 体素化（与三角形大小解耦），
+    # 体素化失败/无三角形自动回退到顶点。存 mesh 局部系，per-candidate 只反变换 base 原点再 argmin。
+    wpx_pts = _voxelize_mesh_points(mesh_v, mesh_f, cfg.plan_init_workpiece_x_voxel)
+    if mesh_v is not None:
+        _n_pts = 0 if wpx_pts is None else len(wpx_pts)
+        _via = "体素" if (mesh_f is not None and wpx_pts is not None and wpx_pts is not mesh_v) else "顶点(回退)"
+        print(f"[kejian2] 「最近点 x」过滤点集：{_n_pts} 个（{_via}, pitch={cfg.plan_init_workpiece_x_voxel}m）")
     if cfg.plan_init_base_overlap_filter:
         base_circles = _fixed_base_xy_circles(cfg)
         bc_cc, bc_rr, bc_umin, bc_umax = _base_circles_to_arrays(base_circles)
@@ -2144,6 +2193,7 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
         "ee_xy_range": [float(v) for v in cfg.plan_init_ee_xy_range],
         "ee_z_range": [float(v) for v in cfg.plan_init_ee_z_range],
         "workpiece_x_min": float(cfg.plan_init_workpiece_x_min),
+        "wpx_pts": wpx_pts,
         "arm_collision_recheck": bool(cfg.plan_init_arm_collision_recheck),
         "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
         "mesh_v": mesh_v, "mesh_f": mesh_f,
@@ -2171,6 +2221,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     xy_lo, xy_hi = ctx["ee_xy_range"]
     z_lo, z_hi = ctx["ee_z_range"]
     wp_x_min = ctx["workpiece_x_min"]
+    wpx_pts = ctx["wpx_pts"]
     arm_recheck = ctx["arm_collision_recheck"]
     bc_cc, bc_rr, bc_umin, bc_umax = ctx["bc_cc"], ctx["bc_rr"], ctx["bc_umin"], ctx["bc_umax"]
     mesh_v, mesh_f = ctx["mesh_v"], ctx["mesh_f"]
@@ -2254,13 +2305,19 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
         bis_base = bis_all[i]
         seam_center_base = seam_center_all[i]
 
-        # 工件顶点变换到 base 系（供「工件距 base 欧氏最近点 x」与「底座-工件 XY 相交」共用，只算一次）
+        # 工件顶点变换到 base 系（供「底座-工件 XY 相交」过滤用，只算一次）
         v_base = (mesh_v @ Rv.T + t_new) if mesh_v is not None else None   # (V,3) base 系
 
         # （req）工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量须 > workpiece_x_min，否则丢弃。
-        if v_base is not None:
-            i_near = int(np.argmin(np.einsum("vi,vi->v", v_base, v_base)))   # argmin |p|^2（省 sqrt）
-            if float(v_base[i_near, 0]) <= wp_x_min:
+        #   点集 wpx_pts 为工件体素中心（mesh 局部系，与三角形大小解耦）。距离对刚体变换不变，
+        #   故把 base 原点反变换到局部系一次做 argmin，只把赢家变回 base 读 x（省整批变换）。
+        p_near_base = None                                               # 赢家点 base 系坐标（供过滤+可视化）
+        if wpx_pts is not None:
+            o_local = -(Rv.T @ t_new)                                    # base 原点在 mesh 局部系
+            d = wpx_pts - o_local
+            i_near = int(np.argmin(np.einsum("vi,vi->v", d, d)))         # argmin |p|^2（省 sqrt）
+            p_near_base = Rv @ wpx_pts[i_near] + t_new                   # 离 base 原点最近的那个点（base 系）
+            if float(p_near_base[0]) <= wp_x_min:                        # 看它的 base-x
                 n_wpx += 1
                 continue
 
@@ -2293,6 +2350,8 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
             "rot_z_deg": float(sol["rot_z_deg"]),
             "bisector_base": np.asarray(bis_base, dtype=np.float64),
             "seam_center_base": np.asarray(seam_center_base, dtype=np.float64),
+            "wpx_near_base": (np.asarray(p_near_base, dtype=np.float64)
+                              if p_near_base is not None else None),   # 距 base 原点最近点(base 系，可视化)
             "orientation_id": int(oid),
             "hand": hand,
         })
