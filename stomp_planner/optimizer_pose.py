@@ -100,6 +100,7 @@ class OptimizerPose:
         self.pos_costs = torch.zeros((self.num_batches, self.num_randoms_all), dtype=torch.float, device=self.device)
         self.rot_costs = torch.zeros((self.num_batches, self.num_randoms_all), dtype=torch.float, device=self.device)
         self.pos_optimized_cost = torch.zeros((self.num_batches,), dtype=torch.float, device=self.device)
+        self.pos_optimized_gate = torch.zeros((self.num_batches,), dtype=torch.float, device=self.device)
         self.rot_optimized_cost = torch.zeros((self.num_batches,), dtype=torch.float, device=self.device)
         self.original_costs = False
         self.pos_costs_o = torch.zeros((self.num_batches, self.num_randoms_all), dtype=torch.float, device=self.device)
@@ -172,6 +173,7 @@ class OptimizerPose:
         self.pos_costs = torch.zeros((self.num_batches, self.num_randoms_all), dtype=torch.float, device=self.device)
         self.rot_costs = torch.zeros((self.num_batches, self.num_randoms_all), dtype=torch.float, device=self.device)
         self.pos_optimized_cost = torch.zeros((self.num_batches,), dtype=torch.float, device=self.device)
+        self.pos_optimized_gate = torch.zeros((self.num_batches,), dtype=torch.float, device=self.device)
         self.rot_optimized_cost = torch.zeros((self.num_batches,), dtype=torch.float, device=self.device)
         self.original_costs = False
         self.pos_costs_o = torch.zeros((self.num_batches, self.num_randoms_all), dtype=torch.float, device=self.device)
@@ -375,6 +377,7 @@ class OptimizerPose:
         # compute cost of initial poses
         pos_cost, rot_cost, joints, pos_cost_o, rot_cost_o = self.computeCosts(self.cam_pose_optimized.unsqueeze(-2))
         self.pos_optimized_cost = pos_cost.clone().squeeze(-1)
+        self.pos_optimized_gate = self._pos_costs_gate.clone().squeeze(-1)
         self.rot_optimized_cost = rot_cost.clone().squeeze(-1)
         self.pos_optimized_cost_o = pos_cost_o.clone().squeeze(-1)
         self.rot_optimized_cost_o = rot_cost_o.clone().squeeze(-1)
@@ -435,8 +438,8 @@ class OptimizerPose:
         更新目标焊缝采样点
         """
         # update start and end updates, as well as cam poses
-        # 是否选定焊缝点完成观测
-        self.end_update = ((self.pos_optimized_cost + self.rot_optimized_cost) <= 0)
+        # 是否选定焊缝点完成观测——接受门槛用 gate 代价(朝向放宽为偏好，大角度也接受；relax=0 时等价旧版)
+        self.end_update = ((self.pos_optimized_gate + self.rot_optimized_cost) <= 0)
         # 存储最新的成功观测位姿
         self.cam_pose_saved[self.end_update] = self.cam_pose_optimized[self.end_update].clone()
         self.joints_saved[self.end_update] = self.joints_optimized[self.end_update].clone()
@@ -521,6 +524,8 @@ class OptimizerPose:
             pos_cost, rot_cost, joints, _, _ = self.computeCosts(self.cam_pose_optimized.unsqueeze(-2))
             self.pos_optimized_cost[self.end_update + self.start_update + forced] = \
                 pos_cost[self.end_update + self.start_update + forced].squeeze(-1)
+            self.pos_optimized_gate[self.end_update + self.start_update + forced] = \
+                self._pos_costs_gate[self.end_update + self.start_update + forced].squeeze(-1)
             self.rot_optimized_cost[self.end_update + self.start_update + forced] = \
                 rot_cost[self.end_update + self.start_update + forced].squeeze(-1)
             self.joints_optimized[self.end_update + self.start_update + forced] = \
@@ -599,6 +604,7 @@ class OptimizerPose:
         # compute cost of initial poses
         pos_cost, rot_cost, joints, _, _ = self.computeCosts(self.cam_pose_optimized.unsqueeze(-2))
         self.pos_optimized_cost = pos_cost.clone().squeeze(-1)
+        self.pos_optimized_gate = self._pos_costs_gate.clone().squeeze(-1)
         self.rot_optimized_cost = rot_cost.clone().squeeze(-1)
         self.joints_optimized = joints[:, 0]
 
@@ -727,16 +733,23 @@ class OptimizerPose:
         #                                                    seam_theta=self.seam_theta_s,
         #                                                    seam_rays_2d=self.seam_rays_2d_s,
         #                                                    cam_poses=cam_poses))     # (B, R')
-        vision_pos_costs, vision_rot_costs, vision_pos_costs_o, vision_rot_costs_o = self.scene.computeVisionCost_1(
+        _vc = self.scene.computeVisionCost_1(
             *self.flattenInputs_1(start_idx=self.start_pts,
                                   end_idx=self.end_pts,
                                   seam_lines=self.seam_lines,
                                   seam_tangent=self.seam_tangents,
                                   seam_limits=self.seam_limits_s,
                                   cam_poses=cam_poses), original_costs=self.original_costs)     # (B, R')
+        vision_pos_costs, vision_rot_costs, vision_pos_costs_o, vision_rot_costs_o = _vc[:4]
+        # scene_pose2 会多返回第5项(软上限 gate 的 vision_pos)；scene_pose(Isaac)只返回4项→gate 回退=全量，
+        # 故原 Isaac 管线行为不变(gate==全量代价)，无需改 scene_pose.py。
+        vision_pos_costs_gate = _vc[4] if len(_vc) > 4 else vision_pos_costs
 
         pos_costs = (self.collision_cost_weight * collision_costs + self.vision_pos_cost_weight * vision_pos_costs)
         rot_costs = (self.collision_cost_weight * collision_costs + self.vision_rot_cost_weight * vision_rot_costs)
+        # gate 代价(侧信道，不改返回元数)：接受门槛(end_update)与 refine 可行性因子用它，其余(采样/排序)仍用全量
+        self._pos_costs_gate = (self.collision_cost_weight * collision_costs
+                                + self.vision_pos_cost_weight * vision_pos_costs_gate)
         if self.original_costs:
             pos_costs_o = (self.collision_cost_weight * collision_costs + self.vision_pos_cost_weight * vision_pos_costs_o)
             rot_costs_o = (self.collision_cost_weight * collision_costs + self.vision_rot_cost_weight * vision_rot_costs_o)
@@ -825,30 +838,35 @@ class OptimizerPose:
             rot_optimized_cost = rot_optimized_cost.squeeze(-1)
             pos_optimized_cost_o = pos_optimized_cost_o.squeeze(-1)
             rot_optimized_cost_o = rot_optimized_cost_o.squeeze(-1)
+            pos_optimized_gate = self._pos_costs_gate.squeeze(-1)      # 软上限 gate 版 pos 代价
 
             # Update parameters, meaning optimized rollout
+            # 可行性因子改用 gate(接受大角度)；排序仍按全量 _o 代价(朝 45° 偏好保留)
             update_idx = \
                 ((pos_optimized_cost_o + rot_optimized_cost_o) < (self.pos_optimized_cost_o + self.rot_optimized_cost_o)) * \
-                    ((pos_optimized_cost + rot_optimized_cost) <= 0)
-            
+                    ((pos_optimized_gate + rot_optimized_cost) <= 0)
+
             # print(update_idx)
             self.pos_optimized_cost_o[update_idx] = pos_optimized_cost_o[update_idx]                    # (B,)
             self.rot_optimized_cost_o[update_idx] = rot_optimized_cost_o[update_idx]                    # (B,)
             self.pos_optimized_cost[update_idx] = pos_optimized_cost[update_idx]                        # (B,)
+            self.pos_optimized_gate[update_idx] = pos_optimized_gate[update_idx]                        # (B,)
             self.rot_optimized_cost[update_idx] = rot_optimized_cost[update_idx]                        # (B,)
             self.joints_optimized[update_idx] = joints[update_idx, 0]
         else:
             pos_optimized_cost, rot_optimized_cost, joints, _, _ = self.computeCosts(cam_pose_optimized)
             pos_optimized_cost = pos_optimized_cost.squeeze(-1)
             rot_optimized_cost = rot_optimized_cost.squeeze(-1)
-            
+            pos_optimized_gate = self._pos_costs_gate.squeeze(-1)
+
             # print("a:", pos_optimized_cost + rot_optimized_cost)
 
-            # Update parameters, meaning optimized rollout
+            # Update parameters, meaning optimized rollout（纯排序，用全量代价→朝 45° 偏好保留）
             update_idx = ((pos_optimized_cost + rot_optimized_cost) < (self.pos_optimized_cost + self.rot_optimized_cost))
-        
+
             # print(update_idx)
             self.pos_optimized_cost[update_idx] = pos_optimized_cost[update_idx]                        # (B,)
+            self.pos_optimized_gate[update_idx] = pos_optimized_gate[update_idx]                        # (B,)
             self.rot_optimized_cost[update_idx] = rot_optimized_cost[update_idx]                        # (B,)
             self.joints_optimized[update_idx] = joints[update_idx, 0]
 

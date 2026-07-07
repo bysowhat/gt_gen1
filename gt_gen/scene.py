@@ -896,7 +896,7 @@ class Scene:
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
 
-            # self.save('/media/a/新加卷/tempt/4/scene1.pkl')
+            self.save('/media/a/新加卷/tempt/4/scene1.pkl')
 
 
             jt = res["joints"]
@@ -1119,11 +1119,14 @@ class Scene:
         return vm
 
     def _inject_obstacles_into_scenepose2(self, scene2):
-        """把当前障碍实体（工件 mesh 系）按 piece->base_link 位姿一起并进 ScenePose2 的 cuRobo 碰撞世界。
+        """把当前障碍实体（工件 mesh 系）按 piece->base_link 位姿并进 ScenePose2 的碰撞世界，
+        并把障碍 mesh（piece 系）并进遮挡 raycast 的 warp mesh。
 
-        ScenePose2.reset 已把工件 mesh 摆到 robot_base_inv_pose（piece->base_link）；这里用【同一 pose】
-        把障碍实体（_obstacle_solid_trimeshes：类型2遮挡板 + 类型3 open_box；open_cylinder 纯视觉跳过）
-        合并成一块 Mesh，与工件一起 rw.update_world，使观测位姿碰撞过滤把障碍算进去。不改 scene_pose2.py。
+        两条独立路径都要喂障碍，缺一不可：
+          · 碰撞世界 rw（computeCollisionCost）：障碍与工件同 pose 摆到 base 系，机械臂避障；
+          · 遮挡 raycast _wp_mesh（visionBlock）：piece 系（piece_pos=0，不加 pose），
+            让优化器把“障碍挡住相机→焊缝视线”算进代价，否则会选出视线被障碍遮挡的位姿。
+        （_obstacle_solid_trimeshes：类型2遮挡板 + 类型3 open_box；open_cylinder 纯视觉跳过。）不改 scene_pose2.py 主体逻辑。
         """
         import trimesh as _trimesh
         obs_tms = self._obstacle_solid_trimeshes()
@@ -1139,7 +1142,11 @@ class Scene:
                                 faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
                                 pose=pose)
         scene2.rw.update_world(scene2._WorldConfig(mesh=[piece_mesh, obs_mesh]))
-        print(f"[scene] compute_goal_pose：障碍并入碰撞世界（{len(obs_tms)} 块实体）")
+        # 遮挡视线检测（visionBlock 的 raycast warp mesh）也并入障碍——piece 系，无需加 pose，
+        # 否则优化器眼里障碍“透明”，会选出视线被障碍挡住的观测位姿。
+        scene2.set_occluders(np.asarray(merged.vertices, float),
+                             np.asarray(merged.faces, np.int64).reshape(-1, 3))
+        print(f"[scene] compute_goal_pose：障碍并入碰撞世界 + 遮挡 raycast（{len(obs_tms)} 块实体）")
 
     # ------------------------------------------------------------------
     # 障碍物（工件 mesh 系；与 weld_json 的 corrected_p0/p1/bisector 同框）

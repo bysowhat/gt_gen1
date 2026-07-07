@@ -41,6 +41,10 @@ class ConfigurationPose:
         self.block_cost_weight: float = 22 / self.dist_limit
         self.orientation_limit: float = 30
         self.orientation_cost_weight: float = 23 / self.orientation_limit
+        # 接受门槛(end_update)专用的朝向放宽角度(deg)：把 gate 里 orientation 三项(tgt/pl/nm)的
+        # 目标带各放宽 orient_gate_relax 度——只把“朝向好不好”降级为偏好(仍在 ES 目标里驱动朝 45°)，
+        # 只有超过软上限的极端掠射才判“没真正看到”。默认 0=带宽不变=行为与旧版逐字节一致。
+        self.orient_gate_relax: float = 0.0
         self.block_radius: float = 0.04     # 0.04
         self.num_block_pts: int = 6         # 6
         self.forced: bool = False               # 是否单独拍起点和终点的点云

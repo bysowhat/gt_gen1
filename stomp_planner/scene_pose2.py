@@ -93,6 +93,8 @@ class ScenePose2:
         self.space_cost_weight = cfg.space_cost_weight
         self.block_cost_weight = cfg.block_cost_weight
         self.orientation_cost_weight = cfg.orientation_cost_weight
+        # 接受门槛专用的朝向放宽角度(deg)；0=不放宽=gate 与全量朝向代价一致(向后兼容)
+        self.orient_gate_relax = float(getattr(cfg, "orient_gate_relax", 0.0))
         self.block_radius = cfg.block_radius
         self.num_block_pts = cfg.num_block_pts
 
@@ -151,12 +153,29 @@ class ScenePose2:
         self._faces_list = self._faces.tolist()
 
         # warp mesh（raycast 用，piece 系；piece_pos=0 故无需变换）
+        self._build_wp_mesh()
+
+    def _build_wp_mesh(self, extra_verts=None, extra_faces=None):
+        """（重）建 raycast 用 warp mesh（piece 系）。extra_* 给定时把额外遮挡体
+        （障碍物，须同在 piece 系）拼进工件 mesh，使 visionBlock 遮挡判定含障碍物。"""
         import warp as wp
         _ensure_warp()
+        verts = self._verts.astype(np.float32)
+        faces = self._faces.astype(np.int32)
+        if extra_verts is not None and extra_faces is not None and len(extra_verts):
+            ev = np.asarray(extra_verts, dtype=np.float32).reshape(-1, 3)
+            ef = np.asarray(extra_faces, dtype=np.int64).reshape(-1, 3) + len(verts)
+            verts = np.concatenate([verts, ev], axis=0)
+            faces = np.concatenate([faces, ef.astype(np.int32)], axis=0)
         self._wp_mesh = wp.Mesh(
-            points=wp.array(self._verts.astype(np.float32), dtype=wp.vec3, device=self.device),
-            indices=wp.array(self._faces.reshape(-1).astype(np.int32), dtype=wp.int32, device=self.device),
+            points=wp.array(verts, dtype=wp.vec3, device=self.device),
+            indices=wp.array(faces.reshape(-1).astype(np.int32), dtype=wp.int32, device=self.device),
         )
+
+    def set_occluders(self, verts, faces):
+        """把额外遮挡体（障碍物 mesh，piece 系，与 self._verts 同框）并入遮挡 raycast
+        用的 warp mesh。传空则恢复为仅工件。碰撞世界（self.rw）另行 update_world，两者独立。"""
+        self._build_wp_mesh(extra_verts=verts, extra_faces=faces)
 
     def _init_curobo(self, robot_cfg_path):
         import gt_gen.compat  # noqa: F401  warp/trimesh shim 须在 import curobo 前
@@ -343,10 +362,14 @@ class ScenePose2:
         block_cost = torch.stack(block_cost, dim=0)
         block_cost /= self.num_steps
 
-        costs, costs_o = self.visionOrientation(seam_line, seam_tangent, seam_limits, cam_poses, block_mask)
+        costs, costs_o, costs_gate = self.visionOrientation(seam_line, seam_tangent, seam_limits, cam_poses, block_mask)
         orientation_cost = [computeCostSingle(costs[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
         orientation_cost = torch.stack(orientation_cost, dim=0)
         orientation_cost /= self.num_steps
+        # 软上限 gate：朝向放宽带后的 orientation 代价(始终计算，供接受门槛用；relax=0 时与 orientation_cost 相同)
+        orientation_cost_gate = [computeCostSingle(costs_gate[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
+        orientation_cost_gate = torch.stack(orientation_cost_gate, dim=0)
+        orientation_cost_gate /= self.num_steps
         if self.original_costs:
             assert isinstance(costs_o, torch.Tensor)
             orientation_cost_o = [computeCostSingle(costs_o[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
@@ -356,6 +379,9 @@ class ScenePose2:
         vision_pos_cost = (self.insides_cost_weight * insides_cost + self.block_cost_weight * block_cost +
                            self.orientation_cost_weight * orientation_cost)
         vision_rot_cost = self.insides_cost_weight * insides_cost
+        # gate：把 orientation 换成放宽带版本(insides/block 不变)——“能不能看到”的接受门槛专用
+        vision_pos_cost_gate = (self.insides_cost_weight * insides_cost + self.block_cost_weight * block_cost +
+                                self.orientation_cost_weight * orientation_cost_gate)
         if self.original_costs:
             vision_pos_cost_o = (self.insides_cost_weight * insides_cost_o + self.block_cost_weight * block_cost +
                                  self.orientation_cost_weight * orientation_cost_o)
@@ -363,7 +389,7 @@ class ScenePose2:
         else:
             vision_pos_cost_o = None
             vision_rot_cost_o = None
-        return vision_pos_cost, vision_rot_cost, vision_pos_cost_o, vision_rot_cost_o
+        return vision_pos_cost, vision_rot_cost, vision_pos_cost_o, vision_rot_cost_o, vision_pos_cost_gate
 
     def visionInsides(self, seam_line: torch.Tensor, cam_poses: torch.Tensor):
         """照搬 ScenePose.visionInsides（纯 torch）。判焊缝点是否在相机 FOV 六面体内。"""
@@ -459,8 +485,10 @@ class ScenePose2:
 
         cam_pos = cam_poses[:, :3]
         direction = cam_pos - seam_line
+        r = self.orient_gate_relax        # 接受门槛的朝向放宽角度(deg)；每子项目标带各放宽 r 度
         tgt_cost = torch.zeros((M,), dtype=torch.float, device=self.device)
         tgt_cost_o = torch.zeros((M,), dtype=torch.float, device=self.device)
+        tgt_cost_gate = torch.zeros((M,), dtype=torch.float, device=self.device)
         proj_tgt = torch.bmm(direction.unsqueeze(-2), seam_tangent.unsqueeze(-1)).squeeze(-1).squeeze(-1)
         if block_mask.int().sum() > 0:
             cos_theta_tgt = torch.clamp(proj_tgt[block_mask] / (torch.norm(direction[block_mask], dim=-1) + 1e-8), -1, 1).abs()
@@ -469,6 +497,8 @@ class ScenePose2:
             if self.original_costs:
                 tgt_cost_o[block_mask] = theta_tgt.clone() * self.num_steps
             tgt_cost[block_mask] = torch.clamp(theta_tgt, min=0) * self.num_steps
+            # 放宽带 [30-r, 60+r]：目标带对称平移 r，等价于未裁剪值减 r 再裁剪
+            tgt_cost_gate[block_mask] = torch.clamp(theta_tgt - r, min=0) * self.num_steps
 
         direction_pl = direction - proj_tgt.unsqueeze(-1) * seam_tangent
         direction_pl = direction_pl / (torch.norm(direction_pl, dim=-1, keepdim=True) + 1e-8)
@@ -477,6 +507,7 @@ class ScenePose2:
         dist = torch.bmm(direction_pl.unsqueeze(-2), mid_vector.unsqueeze(-1)).squeeze(-1).squeeze(-1)
         dist = torch.acos(torch.clamp(dist, -1, 1)) / torch.pi * 180
         pl_cost = dist - soll_dist
+        pl_cost_gate = torch.clamp((dist - soll_dist) - r, min=0)      # 放宽阈值 soll+r
         if self.original_costs:
             pl_cost_o = pl_cost.clone()
         pl_cost = torch.clamp(pl_cost, min=0)
@@ -487,6 +518,9 @@ class ScenePose2:
         nm_cost_0 = torch.zeros((M,), dtype=torch.float, device=self.device)
         nm_cost_1 = torch.zeros((M,), dtype=torch.float, device=self.device)
         nm_cost = torch.zeros((M,), dtype=torch.float, device=self.device)
+        nm_cost_0_gate = torch.zeros((M,), dtype=torch.float, device=self.device)
+        nm_cost_1_gate = torch.zeros((M,), dtype=torch.float, device=self.device)
+        nm_cost_gate = torch.zeros((M,), dtype=torch.float, device=self.device)
         nm_cost_o_0 = torch.zeros((M,), dtype=torch.float, device=self.device)
         nm_cost_o_1 = torch.zeros((M,), dtype=torch.float, device=self.device)
         nm_cost_o = torch.zeros((M,), dtype=torch.float, device=self.device)
@@ -496,24 +530,30 @@ class ScenePose2:
             dists_0 = torch.bmm(seam_normal[block_mask_neg, 0].unsqueeze(-2), direction_n.unsqueeze(-1)).squeeze(-1).squeeze(-1)
             dists_0 = torch.acos(torch.clamp(dists_0, -1, 1).abs()) / torch.pi * 180
             nm_cost_0[block_mask_neg] = torch.abs(dists_0 - 45) - 15
+            # 放宽带 45°±(15+r)
+            nm_cost_0_gate[block_mask_neg] = torch.clamp(torch.abs(dists_0 - 45) - 15 - r, min=0)
             if self.original_costs:
                 nm_cost_o_0 = nm_cost_0.clone()
             nm_cost_0 = torch.clamp(nm_cost_0, min=0)
             dists_1 = torch.bmm(seam_normal[block_mask_neg, 1].unsqueeze(-2), direction_n.unsqueeze(-1)).squeeze(-1).squeeze(-1)
             dists_1 = torch.acos(torch.clamp(dists_1, -1, 1).abs()) / torch.pi * 180
             nm_cost_1[block_mask_neg] = torch.abs(dists_1 - 45) - 15
+            nm_cost_1_gate[block_mask_neg] = torch.clamp(torch.abs(dists_1 - 45) - 15 - r, min=0)
             if self.original_costs:
                 nm_cost_o_1 = nm_cost_1.clone()
                 nm_cost_o = nm_cost_o_0 + nm_cost_o_1
             nm_cost_1 = torch.clamp(nm_cost_1, min=0)
             nm_cost = nm_cost_0 + nm_cost_1
+            nm_cost_gate = nm_cost_0_gate + nm_cost_1_gate
 
         orientation_cost = tgt_cost * tgt_cost_scale + pl_cost * pl_cost_scale + nm_cost * nm_cost_scale
+        orientation_cost_gate = (tgt_cost_gate * tgt_cost_scale + pl_cost_gate * pl_cost_scale
+                                 + nm_cost_gate * nm_cost_scale)
         if self.original_costs:
             orientation_cost_o = tgt_cost_o * tgt_cost_scale + pl_cost_o * pl_cost_scale + nm_cost_o * nm_cost_scale
         else:
             orientation_cost_o = None
-        return orientation_cost, orientation_cost_o
+        return orientation_cost, orientation_cost_o, orientation_cost_gate
 
     # ------------------------------------------------------------------ Utils（照搬 ScenePose）
     def generate_transformation(self, xyz, R):

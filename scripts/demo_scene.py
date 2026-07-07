@@ -77,11 +77,27 @@ def demo_obstacle_type3(args):
     print(f"[demo] 类型3 开口障碍 1 个：{spec3.kind}，启动 isaacsim 可视化…")
     Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless)
 
+def demo_init_poses(args):
+    """多候选初始位姿【同屏铺网格】isaacsim 可视化（两进程模式）。
+
+    进程①（curobo，会污染 warp）：求候选 + 存盘——
+        scene = _make_scene(args); scene._set_cur_seam(9)
+        scene.plan_init_pose(); scene.save('/media/a/新加卷/tempt/4/scene_init.pkl')
+    进程②（本函数，干净进程）：load + 铺网格可视化（每格 工件 + 机械臂摆到候选 q）。
+    """
+    from gt_gen.scene import Scene
+    from gt_gen.scene_viz import Open3DSceneVisualizer
+
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene_init.pkl')
+    Open3DSceneVisualizer(scene).show_init_poses_isaacsim(
+        hand=args.hand, top_n=args.top_n, spacing=args.spacing, headless=args.headless)
+
+
 def demo_main(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
     scene = _make_scene(args)
-    scene._set_cur_seam(24)#2
+    scene._set_cur_seam(24)#2,24
     scene.add_obstacle_type2()
     scene.plan_init_pose()
     # scene.seam_ids_by_length()
@@ -94,9 +110,10 @@ def demo_main(args):
 
     # from gt_gen.scene import Scene
     # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    # # Open3DSceneVisualizer(scene).show_init_poses()
     # # Open3DSceneVisualizer(scene).show_seam(41)
-    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
+    # # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
 
 
 def main():
@@ -106,12 +123,19 @@ def main():
     ap.add_argument("--headless", action="store_true", help="无显示器自检：spawn 后跑几帧即退")
     ap.add_argument("--goal-index", type=int, default=None,
                     help="再画一条到达第几个 goal 观测位姿的机械臂，并打印其三分碰撞（自碰撞/工件/障碍）")
+    ap.add_argument("--hand", default=None, choices=["forehand", "backhand"],
+                    help="demo_init_poses：只铺一只手的候选（缺省正手+反手都铺）")
+    ap.add_argument("--top-n", type=int, default=3,
+                    help="demo_init_poses：每只手取前 N 个候选（默认 3）")
+    ap.add_argument("--spacing", type=float, default=2.5,
+                    help="demo_init_poses：网格格心节距（米，默认 2.5；1m 会重叠）")
     args = ap.parse_args()
 
     # 默认跑障碍物类型2；想看别的换成下面对应调用（勿与本调用同进程先后跑，见模块 docstring）
     # demo_obstacle_type2(args)
     # demo_obstacle_type3(args)
     # demo_init_pose(args)
+    # demo_init_poses(args)   # 多候选初始位姿同屏铺网格（先另进程 plan_init_pose + save）
 
     demo_main(args)
 
