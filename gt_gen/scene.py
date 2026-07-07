@@ -28,6 +28,20 @@ from gt_gen.config import Config, load_config, PROJECT_ROOT
 _SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "scripts")
 
 
+class Ctx(dict):
+    """世界上下文容器：dict 语义完全不变（ctx["h_truth"] 照常用），仅重写 __repr__。
+
+    默认 dict 的 repr 会递归 str 化 h_truth / h_expl / truth_scene / vm 等巨型对象，
+    VSCode 调试器悬停 / 变量面板会非常卡。这里只打印各键名与其类型，不展开内容。
+    """
+
+    def __repr__(self):
+        items = ", ".join(f"{k}={type(v).__name__}" for k, v in self.items())
+        return f"Ctx({items})"
+
+    __str__ = __repr__
+
+
 def _load_plan_init_pose():
     """惰性导入 scripts/plan_init_pose.py 模块（不改它、原样复用其求解器与可视化）。
 
@@ -882,11 +896,14 @@ class Scene:
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
 
+            # self.save('/media/a/新加卷/tempt/4/scene1.pkl')
+
+
             jt = res["joints"]
             joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
             K, B = joints.shape[:2]
 
-            # 只使用1个变体
+            # 只使用第1个变体
             variant_list = [0]
 
             # 静态探索世界（工件+障碍摆放）只随 init pose 变，整批 variant 共用一套（省重型 handle）
@@ -918,7 +935,7 @@ class Scene:
                           variant: int = 0,
                           include_obstacles: bool = True,
                           device: str = None,
-                          ctx: dict = None,
+                          ctx: Ctx = None,
                           vm=None) -> dict:
         """从【当前机械臂关节角】边走边看规划一条到 goal 关节角目标的探索轨迹（GT）。
 
@@ -1077,10 +1094,10 @@ class Scene:
         truth_scene = _trimesh.util.concatenate(tms) if len(tms) > 1 else work_mesh
 
         cam = load_camera_model(self.cfg)
-        return dict(h_truth=h_truth, h_expl=h_expl, truth_scene=truth_scene,
-                    cam=cam, world=world, device=device)
+        return Ctx(h_truth=h_truth, h_expl=h_expl, truth_scene=truth_scene,
+                   cam=cam, world=world, device=device)
 
-    def _fresh_explore_voxmap(self, ctx: dict):
+    def _fresh_explore_voxmap(self, ctx: Ctx):
         """为一条观测位姿序列造一张【全新三态体素图 + 初始 FREE（冷启动立足之地）】。
 
         同一 init pose 的每条序列（每个 variant）各调一次以重置探索状态、互不串扰；序列【内部】的多个

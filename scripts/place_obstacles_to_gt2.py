@@ -36,6 +36,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
+from gt_gen.scene import Ctx  # noqa: E402  单一真源（scene.py 顶层仅轻量依赖，curobo/warp 惰性导入）
+
 DEFAULT_SCENE = "/media/a/新加卷/tempt/4/scene1.pkl"
 
 
@@ -109,8 +111,8 @@ def build_worlds(scene, include_obstacles=True):
     else:
         n_free = set_initial_free_cylinder(h_truth, vm, config=cfg)
         print(f"[gt2] 初始 FREE 空间=圆柱 体素={n_free}")
-    return dict(cfg=cfg, h_truth=h_truth, h_expl=h_expl, truth_scene=truth_scene,
-                vm=vm, cam=cam, world=world)
+    return Ctx(cfg=cfg, h_truth=h_truth, h_expl=h_expl, truth_scene=truth_scene,
+               vm=vm, cam=cam, world=world)
 
 
 def run(args):
