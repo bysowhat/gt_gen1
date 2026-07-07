@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -324,7 +324,7 @@ class Scene:
         self.cur_init_pose: Optional[InitPoseCandidate] = None    # 当前选定的 init pose 候选（set_init_pose 设定）——定义工件↔base 摆放
         self.cur_init_hand: Optional[str] = None                  # 当前候选所属手别（"forehand"/"backhand"）
         self.cur_init_index: Optional[int] = None                 # 当前候选在【该手别列表】中的下标
-        self.goal_poses: Dict[int, list] = {}     # {seam_id: list[dict]} compute_goal_pose 产出的观测位姿结果（含 cam_pose 等）
+        self.goal_poses: Dict[int, Optional[dict]] = {}   # {seam_id: dict|None} compute_goal_pose 产出的单个观测位姿结果（含 cam_pose 等）；无解=None
         self.trajectories: Dict[int, list] = {}   # {seam_id: list[dict]} plan_explore_path 产出的边走边看轨迹（含 positions/status 等）
         self.obstacles: Dict[int, list] = {}   # {seam_id: list[ObstacleSpec]} 已放障碍（按焊缝分组）
         self.truth_scene = None              # 工件+障碍（base 系）trimesh，raycast 几何源——后续
@@ -367,16 +367,17 @@ class Scene:
         self.seam = self.seams[seam_id]
         self.seam_id = seam_id
 
-    def seam_ids_by_length(self) -> List[int]:
-        """返回全部焊缝 id（self.seams 下标），按焊缝长度降序排列（最长的在前）。
+    def seam_ids_by_length(self) -> List[Tuple[int, float]]:
+        """返回全部焊缝 (id, 长度)，按焊缝长度降序排列（最长的在前）。
 
-        长度 = corrected_p0↔p1（p0_world↔p1_world 直线距离，米），与 _load_seam 的过滤口径一致。
-        稳定排序（同长保持原相对次序）。
+        id 为 self.seams 下标；长度 = corrected_p0↔p1（p0_world↔p1_world 直线距离，米），
+        与 _load_seam 的过滤口径一致。稳定排序（同长保持原相对次序）。
         """
         def _len(w):
             return float(np.linalg.norm(np.asarray(w["p1_world"], float)
                                         - np.asarray(w["p0_world"], float)))
-        return sorted(range(len(self.seams)), key=lambda i: -_len(self.seams[i]))
+        pairs = [(i, _len(self.seams[i])) for i in range(len(self.seams))]
+        return sorted(pairs, key=lambda p: -p[1])
     
 
     # ------------------------------------------------------------------
@@ -657,8 +658,8 @@ class Scene:
             cur_init_hand=self.cur_init_hand,
             cur_init_index=self.cur_init_index,
             obstacles=self.obstacles,                  # {seam_id: list[ObstacleSpec]}（dataclass；prims=Box、meshes=dict）
-            goal_poses={sid: [{k: _to_np(v) for k, v in r.items()} for r in results]
-                        for sid, results in self.goal_poses.items()},
+            goal_poses={sid: ({k: _to_np(v) for k, v in res.items()} if res else None)
+                        for sid, res in self.goal_poses.items()},   # {seam_id: dict|None}
             trajectories={sid: list(v) for sid, v in self.trajectories.items()},   # 边走边看轨迹（positions 等均 numpy，可直接 pickle）
         )
         d = os.path.dirname(os.path.abspath(path))
@@ -672,7 +673,7 @@ class Scene:
         cur = ("%s#%d" % (self.cur_init_hand, self.cur_init_index)
                if self.cur_init_index is not None else "未设")
         print(f"[scene] 已保存 → {path}（候选 正手{n_f}/反手{n_b}，"
-              f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(len(v) for v in self.goal_poses.values())}，"
+              f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
               f"轨迹 {sum(len(v) for v in self.trajectories.values())}，"
               f"当前 init pose={cur}）")
         return path
@@ -710,7 +711,7 @@ class Scene:
         cur = ("%s#%d" % (self.cur_init_hand, self.cur_init_index)
                if self.cur_init_index is not None else "未设")
         print(f"[scene] 已加载 ← {path}（候选 正手{n_f}/反手{n_b}，"
-              f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(len(v) for v in self.goal_poses.values())}，"
+              f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
               f"轨迹 {sum(len(v) for v in self.trajectories.values())}，"
               f"当前 init pose={cur}）")
         return self
@@ -759,8 +760,8 @@ class Scene:
           既有行为），默认 8×100 稳定。horizontal：0=水平 / 1=垂直 / 其它=all（全范围）。
 
         前提：先 set_init_pose(hand, index) 选定当前 init pose（否则报错）。
-        返回：list[dict]（每个 robot_pose 一项，含 cam_pose (K,B,7)/joints (K,B,6)/start_pts/end_pts/
-              robot_pose_rel），同时写入 self.goal_poses。无解则该项被跳过（可能返回空列表）。
+        返回：dict（含 cam_pose (K,B,7)/joints (K,B,DOF)/start_pts/end_pts/robot_pose_rel），
+              同时写入 self.goal_poses[self.seam_id]。无解则返回 None（并写入 None）。
 
         **输出张量三维语义** `(K, B, DOF)`（以 joints (160,1,6) 为例，见 optimizer_pose.py）：
           · DOF=6：UR12e 6 轴关节角（cam_pose 末维为 7=pos3+quat4）。
@@ -837,54 +838,88 @@ class Scene:
         optimizer.resetSeamData(seam_line, seam_tangent, seam_limits)
         cam_pose, joints, start_pts, end_pts = optimizer.solve()
 
-        results = []
+        result = None
         if cam_pose is None:
             print("[scene] compute_goal_pose：无观测位姿解")
         else:
-            results.append({
+            result = {
                 "cam_pose": cam_pose.detach().clone(),
                 "joints": joints.detach().clone(),
                 "start_pts": start_pts.detach().clone(),
                 "end_pts": end_pts.detach().clone(),
                 "robot_pose_rel": robot_pose_rel.detach().clone(),
-            })
+            }
             print(f"[scene] compute_goal_pose 成功：cam_pose {tuple(cam_pose.shape)} "
                   f"joints {tuple(joints.shape)}（障碍并入={want_obs}）")
-        self.goal_poses[self.seam_id] = results
-        return results
+        self.goal_poses[self.seam_id] = result
+        return result
     
-    def compute_pose_and_plan_path(self, hand):
+    def compute_pose_and_plan_path(self, hand, include_obstacles: bool = True,
+                                   device: str = None):
+        """对某手别的每个候选 init pose，求观测位姿序列后【按序边走边看规划】覆盖整条焊缝的 GT。
+
+        流程（每个候选 init pose）：
+          set_init_pose → compute_goal_pose（得【单个】结果，joints 形如 (K,B,DOF)）→
+          对选定的 variant（K 维，默认仅第 0 个）：
+            · 造一张全新三态体素图 vm（含初始 FREE 冷启动立足之地）；
+            · 按 pose 顺序 0..B-1 依次 plan_explore_path：pose[0] 从初始关节角(retract)起步，
+              pose[i] 从 pose[i-1]【实际到达的末关节角】起步，且全程共享同一张 vm →
+              后一个 pose 继承前一个 pose 边走边看观测到的世界；
+            · B 个 pose 全部 reached 才算该序列成功，任一失败即中断该 variant。
+        任一 variant 的整条序列成功即返回 True；全部候选/变体都失败返回 False。
+
+        参数：
+          hand             : "forehand"/"backhand"。
+          include_obstacles: 真值世界是否并入已放障碍（默认 True）。
+          device           : cuda/cpu（None→cfg.compute_goal_pose.device）。
+          variants         : 要尝试的 K 变体——None(默认)=仅 variant 0；int=仅该变体；"all"=全部 K；
+                             可迭代=指定若干。（K 是收敛后近等价快照，通常取 0 即可，全跑很重。）
+        """
         cur_cands = self.init_pose_candidates.get(self.seam_id, {"forehand": [], "backhand": []})
         for init_pose_idx in range(len(cur_cands[hand])):
             self.set_init_pose(hand, init_pose_idx)
-            self.compute_goal_pose()
-            cur_goal_poses = self.goal_poses.get(self.seam_id)
-            if not cur_goal_poses:
+            res = self.compute_goal_pose()
+            if res is None:                              # 该 init pose 无观测位姿解
                 continue
-            for idx_cur_goal_pose, cur_goal_pose in enumerate(cur_goal_poses):
-                num_candidates, num_pose, _ = cur_goal_pose['joints'].shape
-                for idx_candidates in range(num_candidates):
-                    for idx_num_pose in range(num_pose):
-                        if idx_num_pose == 0:
-                            cur_joints = None
-                        else:
-                            cur_joints = cur_goal_pose['joints'][idx_candidates][idx_num_pose-1]
-                        # 边走边看规划到 goal pose[0]（起点=当前关节角，缺省 retract）
-                        entry = self.plan_explore_path(goal_index=idx_cur_goal_pose, 
-                                                variant=idx_candidates, 
-                                                goal_index_seq=idx_num_pose, 
-                                                cur_joints=cur_joints)
-                        if entry['status'] =='reached':
-                            return True
+
+            jt = res["joints"]
+            joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
+            K, B = joints.shape[:2]
+
+            # 只使用1个变体
+            variant_list = [0]
+
+            # 静态探索世界（工件+障碍摆放）只随 init pose 变，整批 variant 共用一套（省重型 handle）
+            ctx = self._build_explore_world(include_obstacles=include_obstacles, device=device)
+
+            for variant in variant_list:
+                vm = self._fresh_explore_voxmap(ctx)     # 每个 variant 重置探索状态，互不串扰
+                start = list(self.cur_cfg)               # pose[0] 从初始关节角（retract）起步
+                all_reached = True
+                for pose_idx in range(B):                # 按序覆盖 B 个观测位姿
+                    entry = self.plan_explore_path(
+                        goal_index=pose_idx, variant=variant,
+                        cur_joints=start, ctx=ctx, vm=vm)   # 共享 vm ＝ 继承前一个 pose 的观测
+                    if entry["status"] != "reached":
+                        all_reached = False
+                        print(f"[scene] 序列中断：init#{init_pose_idx} variant#{variant} "
+                              f"pose#{pose_idx}/{B} status={entry['status']}")
+                        break
+                    start = entry["positions"][-1]        # 下一个 pose 从实际到达的末关节角起步
+                if all_reached:
+                    print(f"[scene] 序列成功：init#{init_pose_idx} variant#{variant} "
+                          f"覆盖 B={B} 个观测位姿")
+                    return True
         return False
 
     def plan_explore_path(self,
                           goal_index: int = 0,
                           cur_joints=None,
                           variant: int = 0,
-                          goal_index_seq: int = 0,
                           include_obstacles: bool = True,
-                          device: str = None) -> dict:
+                          device: str = None,
+                          ctx: dict = None,
+                          vm=None) -> dict:
         """从【当前机械臂关节角】边走边看规划一条到 goal 关节角目标的探索轨迹（GT）。
 
         忠实复用 scripts/place_obstacles_to_gt2.py 的主体（gt_gen.main_loop.generate_gt，一行不改），
@@ -913,102 +948,52 @@ class Scene:
           goal_index       : goal 序列（B 个覆盖观测位姿）里第几个作为终点（支持负索引）。
           cur_joints       : 机械臂当前关节角（rad，list/ndarray，长度=DOF）；None→用 self.cur_cfg。
           variant          : joints 的第几个变体 K（默认 0）。
-          goal_index_seq   : self.goal_poses 序列里第几次 compute_goal_pose 结果（默认 0）。
           include_obstacles: 真值世界是否并入已放障碍（默认 True；open_cylinder 纯视觉不并入）。
           device           : cuda/cpu（None→cfg.compute_goal_pose.device 或 'cuda'）。
+          ctx              : 可选【静态探索世界】(_build_explore_world 产出：h_truth/h_expl/truth_scene/
+                             cam/world/device)；None→内部按当前 init pose 现建一套（单独调用即用此路径）。
+                             同一 init pose 的整条观测位姿序列传同一个 ctx 可省去重复建重型 handle。
+          vm               : 可选【三态体素图】；None→内部 _fresh_explore_voxmap(ctx) 造全新的（含初始 FREE）。
+                             序列内多个 pose 传【同一张 vm】即可继承前一次规划观测到的世界（见 compute_pose_and_plan_path）。
         返回 dict（同时 append 进 self.trajectories）：
           {positions(T,DOF), status, goal_index, variant, cur_joints, goal_joints, goal_source, info}。
         """
         if self.cur_init_pose is None:
             raise RuntimeError("plan_explore_path 需要当前 init pose：请先 set_init_pose(hand, index)")
-        if not self.goal_poses.get(self.seam_id):
+        if self.goal_poses.get(self.seam_id) is None:
             raise RuntimeError("plan_explore_path 需要 goal pose：请先 compute_goal_pose()")
 
-        import trimesh as _trimesh
-        import gt_gen.compat as _compat  # noqa: F401  warp shim（须在 import curobo 前）
-        _compat.apply_trimesh_shim()
-
-        # compute_goal_pose 的 ES 优化器（num_envs≈800）此时已出作用域；显式回收显存，
-        # 否则同进程接着建 h_truth+h_expl 两个 MotionGen 易 CUDA OOM（小显存卡尤甚）。
-        import gc
-        import torch
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        from gt_gen import curobo_iface as ci
-        from gt_gen.voxmap import build_roi_voxmap
-        from gt_gen.sensor import load_camera_model, load_truth_scene
-        from gt_gen.init_free import set_initial_free_cylinder, set_initial_free_box
         from gt_gen.main_loop import generate_gt
-        from curobo.geom.types import WorldConfig, Mesh as CuMesh
-        from curobo.geom.sdf.world import CollisionCheckerType
+
+        # —— 静态探索世界：缺省现建一套（单独调用即走此路径）；序列驱动时由调用方传同一个 ctx 复用 ——
+        if ctx is None:
+            ctx = self._build_explore_world(include_obstacles=include_obstacles, device=device)
+        h_truth, h_expl = ctx["h_truth"], ctx["h_expl"]
+        truth_scene, cam, world = ctx["truth_scene"], ctx["cam"], ctx["world"]
 
         # —— goal joints：compute_goal_pose 的 joints[variant, goal_index]（形如 (K,B,DOF)） ——
-        seq = self.goal_poses.get(self.seam_id, [])
-        if not (-len(seq) <= int(goal_index_seq) < len(seq)):
-            raise IndexError(f"goal_index_seq 越界：{goal_index_seq}，当前焊缝共 {len(seq)} 次 compute_goal_pose 结果")
-        res = seq[int(goal_index_seq)]
+        res = self.goal_poses[self.seam_id]              # 单个 dict（compute_goal_pose 产出）
         jt = res["joints"]
         joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
         K, B = joints.shape[:2]
         vi = int(variant)
         gi = int(goal_index)
+        if not (-K <= vi < K):
+            raise IndexError(f"variant 越界：{variant}，该结果共 {K} 个变体")
         if not (-B <= gi < B):
             raise IndexError(f"goal_index 越界：{goal_index}，该序列共 {B} 个观测位姿")
         goal_joints = np.asarray(joints[vi, gi], float).tolist()
 
-        if device is None:
-            device = str(self.cfg.raw.get("compute_goal_pose", {}).get("device", "cuda"))
-
         # —— 起点关节角（缺省=self.cur_cfg）；作为 start_cfg 传入 generate_gt（无需覆盖 retract_config）——
         start = [float(v) for v in (self.cur_cfg if cur_joints is None else cur_joints)]
 
-        # —— base 系摆放：工件 + 障碍实体（顶点在工件 mesh 系）按 workpiece_pose7 一起摆到 base 系 ——
-        wp_pose7 = np.asarray(self.cur_init_pose.workpiece_pose7, float).tolist()
-        T = np.asarray(self.cur_init_pose.T_workpiece_in_base, float)
-
-        obs_tms = self._obstacle_solid_trimeshes() if include_obstacles else []
-        meshes = [CuMesh(name="workpiece", file_path=self.workpiece_obj, pose=wp_pose7)]
-        if obs_tms:
-            merged = _trimesh.util.concatenate(obs_tms)
-            meshes.append(CuMesh(
-                name="obstacles",
-                vertices=np.asarray(merged.vertices, float).tolist(),
-                faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
-                pose=wp_pose7))                          # 障碍与工件同 pose → 一并进 base 系
-        world = WorldConfig(mesh=meshes)                 # MESH 真值世界（工件+障碍）
-
-        print(f"[scene] plan_explore_path：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
-        h_truth = ci.init_curobo(self.cfg, world_model=world,
-                                 collision_checker_type=CollisionCheckerType.MESH,
-                                 position_threshold=0.05, rotation_threshold=0.5)
-        print("[scene] plan_explore_path：建 h_expl（VOXEL 三态）...")
-        h_expl = ci.init_curobo(self.cfg)
-
-        # truth_scene（base 系 trimesh）：工件 + 障碍（同一 T 变到 base 系）
-        work_mesh = load_truth_scene(self.workpiece_obj, mesh_pose=wp_pose7)
-        tms = [work_mesh]
-        for tm in obs_tms:
-            tmc = tm.copy()
-            tmc.apply_transform(T)                       # 工件 mesh 系 → base 系（与工件同一 T）
-            tms.append(tmc)
-        truth_scene = _trimesh.util.concatenate(tms) if len(tms) > 1 else work_mesh
+        # —— 三态体素图：缺省造全新的（含初始 FREE 冷启动立足之地）；序列内传【同一张 vm】即继承前次观测 ——
+        if vm is None:
+            vm = self._fresh_explore_voxmap(ctx)
 
         # goal=关节角目标：直接把 goal_joints 交给 generate_gt 的 goal_cfg（STOMP 走 plan_joint_single
         # 直达该关节角，不再解 IK / 换算焊枪位姿）；goal_pose 传 None，由 generate_gt 内部 FK(goal_cfg) 补出供 NBV 用。
         print(f"[scene] goal=关节角目标（观测位姿#{gi}/{B} 变体#{vi}/{K}）goal_joints={np.round(goal_joints, 4)}")
-
-        cam = load_camera_model(self.cfg)
-        vm = build_roi_voxmap(self.cfg)
-        method = self.cfg.init_free_method_for_init      # cylinder | box（default.yaml init_free.method_for_init）
-        if method == "box":
-            box_min, box_max = self.cfg.init_free_box_min_for_init, self.cfg.init_free_box_max_for_init
-            n_free = set_initial_free_box(h_truth, vm, config=self.cfg, box_min=box_min, box_max=box_max)
-            print(f"[scene] 初始 FREE 空间=box {box_min}~{box_max} 体素={n_free}")
-        else:
-            n_free = set_initial_free_cylinder(h_truth, vm, config=self.cfg)  # 起点末端周围罩 FREE
-            print(f"[scene] 初始 FREE 空间=圆柱 体素={n_free}")
         print("[scene] 开跑 generate_gt 主循环（边走边看）...")
 
         # world_plan=world：backend=stomp 时步② 规划 P* 需要 MESH 世界（真实尺寸，无 buffer）
@@ -1026,6 +1011,95 @@ class Scene:
         print(f"[scene] plan_explore_path 完成：status={status} 路点={len(positions)} "
               f"（当前焊缝第 {len(self.trajectories[self.seam_id])} 条轨迹）")
         return entry
+
+    def _build_explore_world(self, include_obstacles: bool = True, device: str = None) -> dict:
+        """构建【只依赖当前 init pose（工件摆放 + 障碍）】的静态探索世界，供一条观测位姿序列内的
+        多次 plan_explore_path 复用（省去重复建重型 handle，也缓解显存）。
+
+        与 plan_explore_path 原内联构建完全一致：工件 mesh + 障碍实体按当前 init pose 的 workpiece_pose7
+        摆到 base 系。返回 ctx dict：
+          h_truth(MESH 真值 handle) / h_expl(VOXEL 三态 handle) / truth_scene(base 系 trimesh，raycast 源) /
+          cam(相机模型) / world(MESH WorldConfig，兼作步② world_plan) / device。
+        ⚠ 会 import/初始化 warp+curobo，污染本进程；须在【未启动 SimulationApp 的进程】里调用。
+        """
+        if self.cur_init_pose is None:
+            raise RuntimeError("_build_explore_world 需要当前 init pose：请先 set_init_pose(hand, index)")
+
+        import trimesh as _trimesh
+        import gt_gen.compat as _compat  # noqa: F401  warp shim（须在 import curobo 前）
+        _compat.apply_trimesh_shim()
+
+        # compute_goal_pose 的 ES 优化器（num_envs≈800）此时已出作用域；显式回收显存，
+        # 否则接着建 h_truth+h_expl 两个 MotionGen 易 CUDA OOM（小显存卡尤甚）。
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        from gt_gen import curobo_iface as ci
+        from gt_gen.sensor import load_camera_model, load_truth_scene
+        from curobo.geom.types import WorldConfig, Mesh as CuMesh
+        from curobo.geom.sdf.world import CollisionCheckerType
+
+        if device is None:
+            device = str(self.cfg.raw.get("compute_goal_pose", {}).get("device", "cuda"))
+
+        # —— base 系摆放：工件 + 障碍实体（顶点在工件 mesh 系）按 workpiece_pose7 一起摆到 base 系 ——
+        wp_pose7 = np.asarray(self.cur_init_pose.workpiece_pose7, float).tolist()
+        T = np.asarray(self.cur_init_pose.T_workpiece_in_base, float)
+
+        obs_tms = self._obstacle_solid_trimeshes() if include_obstacles else []
+        meshes = [CuMesh(name="workpiece", file_path=self.workpiece_obj, pose=wp_pose7)]
+        if obs_tms:
+            merged = _trimesh.util.concatenate(obs_tms)
+            meshes.append(CuMesh(
+                name="obstacles",
+                vertices=np.asarray(merged.vertices, float).tolist(),
+                faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
+                pose=wp_pose7))                          # 障碍与工件同 pose → 一并进 base 系
+        world = WorldConfig(mesh=meshes)                 # MESH 真值世界（工件+障碍），兼作步② world_plan
+
+        print(f"[scene] _build_explore_world：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
+        h_truth = ci.init_curobo(self.cfg, world_model=world,
+                                 collision_checker_type=CollisionCheckerType.MESH,
+                                 position_threshold=0.05, rotation_threshold=0.5)
+        print("[scene] _build_explore_world：建 h_expl（VOXEL 三态）...")
+        h_expl = ci.init_curobo(self.cfg)
+
+        # truth_scene（base 系 trimesh）：工件 + 障碍（同一 T 变到 base 系）
+        work_mesh = load_truth_scene(self.workpiece_obj, mesh_pose=wp_pose7)
+        tms = [work_mesh]
+        for tm in obs_tms:
+            tmc = tm.copy()
+            tmc.apply_transform(T)                       # 工件 mesh 系 → base 系（与工件同一 T）
+            tms.append(tmc)
+        truth_scene = _trimesh.util.concatenate(tms) if len(tms) > 1 else work_mesh
+
+        cam = load_camera_model(self.cfg)
+        return dict(h_truth=h_truth, h_expl=h_expl, truth_scene=truth_scene,
+                    cam=cam, world=world, device=device)
+
+    def _fresh_explore_voxmap(self, ctx: dict):
+        """为一条观测位姿序列造一张【全新三态体素图 + 初始 FREE（冷启动立足之地）】。
+
+        同一 init pose 的每条序列（每个 variant）各调一次以重置探索状态、互不串扰；序列【内部】的多个
+        pose 则共享同一张 vm 累积观测＝继承前一次规划观测到的世界（见 compute_pose_and_plan_path）。
+        初始 FREE 按 cfg.init_free_method_for_init 选 box 或圆柱（与 plan_explore_path 原行为一致）。
+        """
+        from gt_gen.voxmap import build_roi_voxmap
+        from gt_gen.init_free import set_initial_free_cylinder, set_initial_free_box
+        h_truth = ctx["h_truth"]
+        vm = build_roi_voxmap(self.cfg)
+        method = self.cfg.init_free_method_for_init      # cylinder | box（default.yaml init_free.method_for_init）
+        if method == "box":
+            box_min, box_max = self.cfg.init_free_box_min_for_init, self.cfg.init_free_box_max_for_init
+            n_free = set_initial_free_box(h_truth, vm, config=self.cfg, box_min=box_min, box_max=box_max)
+            print(f"[scene] 初始 FREE 空间=box {box_min}~{box_max} 体素={n_free}")
+        else:
+            n_free = set_initial_free_cylinder(h_truth, vm, config=self.cfg)  # 起点末端周围罩 FREE
+            print(f"[scene] 初始 FREE 空间=圆柱 体素={n_free}")
+        return vm
 
     def _inject_obstacles_into_scenepose2(self, scene2):
         """把当前障碍实体（工件 mesh 系）按 piece->base_link 位姿一起并进 ScenePose2 的 cuRobo 碰撞世界。

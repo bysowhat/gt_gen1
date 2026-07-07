@@ -80,28 +80,23 @@ def demo_obstacle_type3(args):
 def demo_main(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
-    # scene = _make_scene(args)
-    # scene._set_cur_seam(2)
-    # scene.add_obstacle_type2()
-    # scene.plan_init_pose()
-    # # scene.seam_ids_by_length()
-    # flag = scene.compute_pose_and_plan_path(hand="forehand")
-    # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    # flag = scene.compute_pose_and_plan_path(hand="backhand")
-    # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+    scene = _make_scene(args)
+    scene._set_cur_seam(24)#2
+    scene.add_obstacle_type2()
+    scene.plan_init_pose()
+    # scene.seam_ids_by_length()
+    flag = scene.compute_pose_and_plan_path(hand="forehand")
+    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    flag = scene.compute_pose_and_plan_path(hand="backhand")
+    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
 
 
     # from gt_gen.scene import Scene
     # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # scene.plan_explore_path(goal_index=0, variant=0, goal_index_seq=0)
-    # scene.save('/media/a/新加卷/tempt/4/scene1_gt2.pkl')
-
-
-    from gt_gen.scene import Scene
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
-    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=1, headless=args.headless)
+    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    # # Open3DSceneVisualizer(scene).show_seam(41)
+    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
 
 
 def main():

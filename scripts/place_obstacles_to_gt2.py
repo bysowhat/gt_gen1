@@ -39,18 +39,18 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 DEFAULT_SCENE = "/media/a/新加卷/tempt/4/scene1.pkl"
 
 
-def goal_joints_from_scene(scene, variant, goal_index, goal_index_seq):
+def goal_joints_from_scene(scene, variant, goal_index):
     """从 compute_goal_pose 的结果里直接取【关节角目标】joints[variant, goal_index]（不再算 goal pose）。
 
-    scene.goal_poses[seam_id][goal_index_seq]['joints'] 形如 (K,B,DOF)：K=候选变体、B=观测位姿、DOF=6。
+    scene.goal_poses[seam_id]['joints'] 形如 (K,B,DOF)：K=候选变体、B=观测位姿、DOF=6。
     返回 (goal_joints, dbg)：goal_joints=长度 DOF 的 list（base 系关节角，直接当 generate_gt 的 goal_cfg）；
     dbg 记 variant/goal_index/K/B 供打印。
     """
-    res = scene.goal_poses[scene.seam_id][goal_index_seq]
+    res = scene.goal_poses[scene.seam_id]                    # 单个 dict（compute_goal_pose 产出）
     jt = np.asarray(res["joints"])                           # (K,B,DOF)
     K, B = jt.shape[:2]
     goal_joints = np.asarray(jt[variant, goal_index], float).tolist()
-    dbg = dict(variant=variant, goal_index=goal_index, goal_index_seq=goal_index_seq, K=K, B=B, goal_joints=goal_joints)
+    dbg = dict(variant=variant, goal_index=goal_index, K=K, B=B, goal_joints=goal_joints)
     return goal_joints, dbg
 
 
@@ -120,12 +120,12 @@ def run(args):
     scene = Scene.load(args.scene)
     if scene.cur_init_pose is None:
         raise RuntimeError("pkl 未设当前 init pose（需 set_init_pose 后再 save）")
-    if not scene.goal_poses.get(scene.seam_id):
+    if scene.goal_poses.get(scene.seam_id) is None:
         raise RuntimeError("pkl 无 goal pose（需 compute_goal_pose 后再 save）")
 
     W = build_worlds(scene, include_obstacles=not args.no_obstacles)
 
-    goal_joints, dbg = goal_joints_from_scene(scene, args.variant, args.goal_index, args.goal_index_seq)
+    goal_joints, dbg = goal_joints_from_scene(scene, args.variant, args.goal_index)
     print(f"[gt2] goal=关节角目标 joints#变体{dbg['variant']}/{dbg['K']} "
           f"位姿{dbg['goal_index']}/{dbg['B']}  goal_joints={np.round(dbg['goal_joints'],4)}")
 
@@ -162,7 +162,6 @@ def main():
     ap.add_argument("--scene", default=DEFAULT_SCENE, help="Scene pkl（demo_scene.demo_main 存）")
     ap.add_argument("--variant", type=int, default=0, help="joints 的变体 K（默认 0）")
     ap.add_argument("--goal-index", type=int, default=0, help="观测位姿的第几个合格解")
-    ap.add_argument("--goal-index-seq", type=int, default=0, help="观测位姿序列里第几个作终点（默认 0，支持负索引）")
     ap.add_argument("--no-obstacles", action="store_true", help="真值世界不并入障碍（仅工件）")
     ap.add_argument("--out", default=None, help="GT 存盘 pkl；缺省 <scene>_gt.pkl")
     args = ap.parse_args()

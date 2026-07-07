@@ -49,7 +49,6 @@ def _parse_args():
                     help="目标改用 scene goal pose 的关节角（需先 compute_goal_pose）")
     ap.add_argument("--variant", type=int, default=0, help="--target-from-scene 时 joints 的变体 K")
     ap.add_argument("--goal-index", type=int, default=0, help="--target-from-scene 时观测位姿的第几个合格解")
-    ap.add_argument("--goal-index-seq", type=int, default=0, help="--target-from-scene 时位姿序列里第几个作终点")
     ap.add_argument("--no-viz", action="store_true", help="规划成功也不拉起 Isaac Sim 可视化")
     ap.add_argument("--headless", action="store_true", help="可视化用无头模式（跑通即退，自检用）")
     ap.add_argument("--fps", type=int, default=30, help="可视化回放帧率")
@@ -121,9 +120,9 @@ def run_plan(args):
     # 或 --target-from-scene 改用 goal pose 的关节角当终点
     cur_cfg = list(CUR_CFG)
     if args.target_from_scene:
-        if not scene.goal_poses.get(scene.seam_id):
+        if scene.goal_poses.get(scene.seam_id) is None:
             raise RuntimeError("pkl 无 goal pose（--target-from-scene 需先 compute_goal_pose）")
-        target_cfg, dbg = goal_joints_from_scene(scene, args.variant, args.goal_index, args.goal_index_seq)
+        target_cfg, dbg = goal_joints_from_scene(scene, args.variant, args.goal_index)
         print(f"[scene] 目标=goal pose 关节角#变体{dbg['variant']}/{dbg['K']} 位姿{dbg['goal_index']}/{dbg['B']}")
     else:
         target_cfg = list(TARGET_CFG)

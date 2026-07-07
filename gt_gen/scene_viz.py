@@ -9,6 +9,7 @@ scripts/plan_init_pose.py 的 show_lookup_solutions（整臂碰撞球 + init_fre
 + standoff 落点），不改其渲染逻辑。
 
 本期已实现：
+  · Open3DSceneVisualizer.show_seam()            —— open3d 看指定焊缝：工件 + 焊缝红线 + 障碍物
   · Open3DSceneVisualizer.show_init_poses()      —— 逐个看 Scene 的候选初始位姿（按 C 切下一个）
   · Open3DSceneVisualizer.show_scene_isaacsim()  —— 用 isaacsim 可视化当前 3D 场景（工件 + 焊缝 + 障碍物类型2/3）
 
@@ -184,6 +185,84 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         return _factory
 
+    def show_seam(self, seam_id: int):
+        """在 **open3d** 中可视化【指定焊缝】：工件网格 + 该焊缝红色直线 + 障碍物（如有）。
+
+        坐标系为【工件 mesh 系】（工件停在自身坐标 identity）：焊缝端点 p0_world↔p1_world、
+        障碍（self.obstacles[seam_id]，本就在工件 mesh 系）与工件同框直接叠加，无需变换。
+        焊缝以 p0→p1 的 **单条红色直线**（o3d.LineSet）表示。障碍网格来自 ObstacleSpec.meshes
+        （棱柱/圆筒，_polygon_mesh_to_trimesh）与 prims（Box 原语，_box_prim_to_trimesh），
+        各染 ObstacleSpec.color。不画机械臂（mesh 系无工件↔base 摆放）。
+        """
+        import numpy as np
+        import open3d as o3d
+        import trimesh
+        from gt_gen.scene import _polygon_mesh_to_trimesh, _box_prim_to_trimesh
+
+        scene = self.scene
+        seams = scene.seams
+        if not (-len(seams) <= int(seam_id) < len(seams)):
+            raise IndexError(f"seam_id 越界：{seam_id}，共 {len(seams)} 条焊缝")
+        sid = int(seam_id) % len(seams)
+        w = seams[sid]
+
+        geoms = []
+
+        # 工件网格（mesh 系 identity，灰）
+        tm = trimesh.load(scene.workpiece_obj, force="mesh")
+        wp = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(np.asarray(tm.vertices, float)),
+            o3d.utility.Vector3iVector(np.asarray(tm.faces, np.int32)))
+        wp.compute_vertex_normals()
+        wp.paint_uniform_color([0.72, 0.72, 0.72])
+        geoms.append(wp)
+
+        # 焊缝红色直线 p0→p1：用细圆柱 mesh 表示（LineSet 线宽仅 1px 且贴面易被遮挡，看不清）
+        p0 = np.asarray(w["p0_world"], float)
+        p1 = np.asarray(w["p1_world"], float)
+        seg = p1 - p0
+        L = float(np.linalg.norm(seg))
+        if L < 1e-9:
+            raise RuntimeError(f"焊缝#{sid} 端点重合（p0==p1），无法画直线")
+        radius = max(0.001, L * 0.005)           # 半径随焊缝长度自适应，至少 1mm，保证可见
+        cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=L, resolution=16)
+        # 默认圆柱沿 +z、中心在原点 → 旋转 z 轴到 seam 方向，再平移到中点
+        d_hat = seg / L
+        z = np.array([0.0, 0.0, 1.0])
+        v = np.cross(z, d_hat); s = float(np.linalg.norm(v)); c = float(np.dot(z, d_hat))
+        if s < 1e-9:
+            R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+        else:
+            vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+            R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+        cyl.rotate(R, center=np.zeros(3))
+        cyl.translate((p0 + p1) / 2.0)
+        cyl.compute_vertex_normals()
+        cyl.paint_uniform_color([1.0, 0.0, 0.0])
+        geoms.append(cyl)
+
+        # 障碍（mesh 系，直接叠加；open_cylinder 也含在内）
+        obstacles = list(scene.obstacles.get(sid, []))
+        for ob in obstacles:
+            col = list(ob.color) if ob.color else [0.62, 0.64, 0.67]
+            tms = []
+            for mesh in ob.meshes:
+                t = _polygon_mesh_to_trimesh(mesh)
+                if t is not None:
+                    tms.append(t)
+            for prim in ob.prims:
+                tms.append(_box_prim_to_trimesh(prim))
+            for t in tms:
+                m = o3d.geometry.TriangleMesh(
+                    o3d.utility.Vector3dVector(np.asarray(t.vertices, float)),
+                    o3d.utility.Vector3iVector(np.asarray(t.faces, np.int32)))
+                m.compute_vertex_normals()
+                m.paint_uniform_color(col)
+                geoms.append(m)
+
+        print(f"[viz] 焊缝#{sid}：工件 + 焊缝红线（p0→p1）+ {len(obstacles)} 个障碍")
+        o3d.visualization.draw_geometries(geoms, window_name=f"seam #{sid}")
+
     def show_scene_isaacsim(self, headless: bool = False, goal_variant: int = 0,
                             trajectory=None, fps: int = 30, goal_arm_index: list = None):
         """用 **isaacsim** 可视化当前 3D 场景：工件 + 障碍物（如有）+ 机械臂 + goal pose（如有）+ 当前焊缝红线（如有）。
@@ -205,13 +284,12 @@ class Open3DSceneVisualizer(SceneVisualizer):
         headless=True 时 spawn 后跑几帧即退（自检）。goal_variant 选 cam_pose 的第几个变体 K（默认 0；
         仅在 goal_arm_index=None 时生效，给了 goal_arm_index 则由其 n 覆盖）。
 
-        goal_arm_index（可选，`[m, n]`，仅 base 系且已 compute_goal_pose）：
-          · m —— 选 **scene.goal_poses[m]**（哪一条 goal / robot_pose）。
-          · n —— 选该项 joints/cam_pose 第一维 **K**（变体）的索引，即 (160,1,6) 里 160 的下标。
-          给定时把机械臂关节角从 retract 改成 **goal_poses[m]["joints"][n, 0]**（B=0 首观测位姿，无需 IK），
-          同时 goal 视锥也画 goal_poses[m] 的第 n 个变体；并打印其三分碰撞：自碰撞 / 碰工件 / 碰障碍
+        goal_arm_index（可选，仅 base 系且已 compute_goal_pose）：
+          · 选 goal 观测位姿 joints/cam_pose 第一维 **K**（变体）的索引，即 (160,1,6) 里 160 的下标。
+          给定时把机械臂关节角从 retract 改成 **goal_poses[seam_id]["joints"][gk, 0]**（B=0 首观测位姿，无需 IK），
+          同时 goal 视锥也画该第 gk 个变体；并打印其三分碰撞：自碰撞 / 碰工件 / 碰障碍
           （curobo FK 碰撞球 + trimesh signed_distance，见 _goal_arm_collision）。越界则夹取。
-          兼容旧标量写法（视作 m，n 退回 goal_variant）。None（默认）时机械臂仍摆 retract，行为同旧版。
+          标量=K 变体；兼容旧 [m,n] 写法：m 已废弃、忽略，取 n。None（默认）时机械臂仍摆 retract，行为同旧版。
         """
         import os
         import sys
@@ -222,16 +300,15 @@ class Open3DSceneVisualizer(SceneVisualizer):
         cur = scene.cur_init_pose
         base_frame = cur is not None
 
-        # —— 解析 goal_arm_index=[m, n]：m 选 scene.goal_poses[m]（哪条 goal），
-        #    n 选该项 joints/cam_pose 第一维 K（如 (160,1,6) 的 160）变体索引。
-        #    兼容旧标量写法（视作 m，n 退回 goal_variant）。默认 m=0、n=goal_variant。——
-        gm, gk = 0, int(goal_variant)
+        # —— 解析 goal_arm_index → gk：选 goal 观测位姿的第一维 K（如 (160,1,6) 的 160）变体索引。
+        #    goal_poses 现为单个 dict（不再是 list），故标量直接当 K 变体；兼容旧 [m,n] 写法：m 已废弃、
+        #    忽略，取 n 作 K 变体（缺省退回 goal_variant）。——
+        gk = int(goal_variant)
         if goal_arm_index is not None:
             if isinstance(goal_arm_index, (list, tuple)):
-                gm = int(goal_arm_index[0])
                 gk = int(goal_arm_index[1]) if len(goal_arm_index) > 1 else int(goal_variant)
             else:
-                gm = int(goal_arm_index)
+                gk = int(goal_arm_index)
 
         # —— 渲染坐标系变换 T（mesh 系 → 渲染系）：base 系用 T_workpiece_in_base，否则单位阵 ——
         if base_frame:
@@ -436,18 +513,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 robot, _ = add_robot_to_scene(robot_cfg, world)
                 # goal_arm_index 给定：解析该 goal 观测位姿的关节角（已存于 goal_poses，无需 IK），
                 # 稍后把这条唯一的机械臂摆到该关节角（而非 retract），并打印其三分碰撞。
-                if goal_arm_index is not None and scene.goal_poses.get(scene.seam_id):
-                    seq = scene.goal_poses[scene.seam_id]
-                    G = len(seq)
-                    if not (-G <= gm < G):
-                        print(f"[viz] goal_arm_index 的 m={gm} 越界（当前焊缝共 {G} 条 goal_poses），跳过第二条臂")
-                    else:
-                        jt = seq[gm]["joints"]
-                        jt = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
-                        Kj, Bj = jt.shape[:2]                  # (K 变体, B 观测位姿, DOF)
-                        vi = max(0, min(gk, Kj - 1))           # n → K 变体索引（越界则夹取）
-                        goal_joints = [float(v) for v in jt[vi, 0]]   # 机械臂摆到首观测位姿 B=0
-                        goal_label = f"goal_poses#{gm % G}/K#{vi}(共{Kj}变体,B={Bj})"
+                if goal_arm_index is not None and scene.goal_poses.get(scene.seam_id) is not None:
+                    res = scene.goal_poses[scene.seam_id]     # 单个 dict（compute_goal_pose 产出）
+                    jt = res["joints"]
+                    jt = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
+                    Kj, Bj = jt.shape[:2]                  # (K 变体, B 观测位姿, DOF)
+                    vi = max(0, min(gk, Kj - 1))           # n → K 变体索引（越界则夹取）
+                    goal_joints = [float(v) for v in jt[vi, 0]]   # 机械臂摆到首观测位姿 B=0
+                    goal_label = f"goal/K#{vi}(共{Kj}变体,B={Bj})"
                 elif goal_arm_index is not None:
                     print("[viz] 无 goal_poses（未 compute_goal_pose），跳过第二条臂")
             except Exception as e:
@@ -476,14 +549,13 @@ class Open3DSceneVisualizer(SceneVisualizer):
             for k, mesh in enumerate(ob.meshes):
                 spawn_mesh(f"/World/obs/o{oi}/mesh{k}", mesh)
 
-        # goal pose 视锥（仅 base 系且已 compute_goal_pose）：用 gm 选 goal_poses[gm]、gk 选 K 变体
+        # goal pose 视锥（仅 base 系且已 compute_goal_pose）：gk 选 K 变体
         n_goal = 0
-        if base_frame and scene.goal_poses.get(scene.seam_id):
-            seq = scene.goal_poses[scene.seam_id]
+        if base_frame and scene.goal_poses.get(scene.seam_id) is not None:
+            res = scene.goal_poses[scene.seam_id]                # 单个 dict
             near, far = _fov_corners()
             half_w, half_h, near_z, far_z = _cam_intrinsics()
-            gmc = gm % len(seq)                                      # 夹到合法范围
-            cam_pose = np.asarray(seq[gmc]["cam_pose"])              # (K,B,7) piece 系 wxyz
+            cam_pose = np.asarray(res["cam_pose"])               # (K,B,7) piece 系 wxyz
             K = cam_pose.shape[0]
             vi = max(0, min(gk, K - 1))
             seq = cam_pose[vi]                                        # (B,7)
