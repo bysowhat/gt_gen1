@@ -37,6 +37,14 @@ class ThreeStateVoxelMap:
         self.dims = np.maximum(np.round(size / self.voxel_size).astype(np.int64), 1)  # (nx,ny,nz)
         self.grid = np.full(tuple(self.dims), UNKNOWN, dtype=np.uint8)
 
+    def __repr__(self):
+        # 只打印形状/几何摘要，不展开 grid（避免 VSCode 调试器悬停/变量面板卡住）。
+        d = tuple(int(x) for x in self.dims)
+        o = tuple(round(float(x), 3) for x in self.origin)
+        return f"ThreeStateVoxelMap(dims={d}, voxel_size={self.voxel_size}, origin={o})"
+
+    __str__ = __repr__
+
     # ---- 形状/几何信息 ----
     @property
     def shape(self):

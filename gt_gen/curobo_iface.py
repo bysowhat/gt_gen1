@@ -27,6 +27,15 @@ class CuroboHandle:
     config: Any             # gt_gen.config.Config
     voxel: dict             # {name, dims, pose, voxel_size}
 
+    def __repr__(self):
+        # 默认 dataclass repr 会展开 mg/ik 等巨型对象，VSCode 调试器悬停/变量面板会卡死。
+        # 这里只打印各字段类型 + voxel 名字，不展开内容。
+        vox = self.voxel.get("name") if isinstance(self.voxel, dict) else type(self.voxel).__name__
+        return (f"CuroboHandle(mg={type(self.mg).__name__}, ik={type(self.ik).__name__}, "
+                f"ta={type(self.ta).__name__}, config={type(self.config).__name__}, voxel={vox!r})")
+
+    __str__ = __repr__
+
     @property
     def joint_names(self):
         return self.config.joint_names
