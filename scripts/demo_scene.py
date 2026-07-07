@@ -110,10 +110,10 @@ def demo_main(args):
 
     # from gt_gen.scene import Scene
     # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
     # # Open3DSceneVisualizer(scene).show_init_poses()
     # # Open3DSceneVisualizer(scene).show_seam(41)
-    # # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
+    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=1, headless=args.headless)
 
 
 def main():

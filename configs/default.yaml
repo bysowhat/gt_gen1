@@ -145,8 +145,10 @@ plan_init_pose:                         # lookup 式初始位姿求解（scripts
   base_overlap_filter: false             # 是否启用「固定底座(xiaoyu_base_link)碰撞球 vs 工件 在 base-xy 投影相交」过滤：
                                         #   相交=机械臂底座压在工件下/工件盖在底座上，丢弃该候选。
                                         #   true=做该过滤（默认）；false=关闭（允许工件摆在底座正上方）。
-  workpiece_x_min_m: 0.3                # 工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量下限（米）：
+  workpiece_x_min_m: 0.36                # 工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量下限（米）：
                                         #   须 > 此值否则丢弃（工件离底座 x 向太近/在底座后方）。仅看正 x（严格大于）。
+  workpiece_x_voxel_m: 0.03             # 上一过滤的稠密点集体素粒度（米）：工件表面按此 pitch 体素化，用体素中心
+                                        #   当点集（与三角形大小解耦，大三角形也不漏采）。与碰撞 ESDF voxel_size_m 无关。
   arm_collision_recheck: true           # snap 后复检：把候选 R snap 到 90°整倍朝向、重算 t 会改变工件姿态，
                                         #   snap 前的碰撞过滤在此姿态下已失效。true=对最终 (Rv,t_new) 再查一次
                                         #   【retract 姿态整臂碰撞球 vs 工件 ESDF】，撞则丢弃（判据同 solve：

@@ -245,6 +245,13 @@ class Config:
         return float(self.raw.get("plan_init_pose", {}).get("workpiece_x_min_m", 0.3))
 
     @property
+    def plan_init_workpiece_x_voxel(self) -> float:
+        """「工件距 base 欧氏最近点 x」过滤的点集体素粒度（米）：把工件表面按此 pitch 体素化，
+        用体素中心当稠密点集（与三角形大小解耦，大三角形也不漏采）。与碰撞 ESDF 的 voxel_size_m
+        无关、互不影响。见 default.yaml plan_init_pose.workpiece_x_voxel_m。"""
+        return float(self.raw.get("plan_init_pose", {}).get("workpiece_x_voxel_m", 0.03))
+
+    @property
     def plan_init_arm_collision_recheck(self) -> bool:
         """snap 后是否复检：候选 R snap 到 90°整倍朝向、重算 t 会改变工件姿态，snap 前的碰撞过滤此时已失效。
         true=对最终 (Rv,t_new) 再查一次「retract 姿态整臂碰撞球 vs 工件 ESDF」，撞则丢弃（判据同 solve：
