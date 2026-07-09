@@ -111,6 +111,112 @@ def _goal_arm_collision(scene, goal_joints, wp_pose7, T):
             "n_self": n_self, "n_work": n_work, "n_obs": n_obs}
 
 
+def _pose7_to_T(pose7):
+    """pose7 [x,y,z, qw,qx,qy,qz] → 4×4 齐次矩阵。"""
+    import numpy as np
+    p = np.asarray(pose7, float)
+    t = p[:3]
+    w, x, y, z = p[3:]
+    n = (w * w + x * x + y * y + z * z) ** 0.5 or 1.0
+    w, x, y, z = w / n, x / n, y / n, z / n
+    R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                  [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                  [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], float)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def _build_scenepose2_debug(scene, include_obstacles=True, device=None):
+    """【忠实复刻 Scene.compute_goal_pose 的 ScenePose2 搭建】，供碰撞可视化诊断复用。
+
+    与 compute_goal_pose 同口径：读 configs/default.yaml 的 compute_goal_pose 段建 ConfigurationPose、
+    seam 数据、robot_pose7=pose7(inv(T_workpiece_in_base))、piece=identity，建 ScenePose2 + reset
+    （含障碍则 _inject_obstacles_into_scenepose2），再建 OptimizerPose + resetSeamData。
+    返回 dict(scene2, optimizer, device, want_obs)。前提：先 set_init_pose。⚠ 会初始化 curobo/warp。"""
+    import numpy as np
+    import torch
+    from gt_gen.scene import _load_compute_goal_poses2, _load_plan_init_pose
+
+    if scene.cur_init_pose is None:
+        raise RuntimeError("需要当前 init pose：请先 set_init_pose(hand, index)")
+
+    sec = dict(scene.cfg.raw.get("compute_goal_pose", {}) or {})
+    horizontal = int(sec.get("horizontal", 2))
+    dev = device or str(sec.get("device", "cuda"))
+
+    cgp = _load_compute_goal_poses2()
+    Configuration, Optimizer, ScenePose2 = cgp.Configuration, cgp.Optimizer, cgp.Scene
+    cfg = Configuration()
+    cfg.usd_path = ""
+    cfg.pc_path = ""
+    for k, v in sec.items():
+        if k in ("include_obstacles", "horizontal", "device"):
+            continue
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+    cfg.num_randoms_all = cfg.num_randoms_new + cfg.num_randoms_old + 1
+    cfg.num_envs = cfg.num_batches * (cfg.num_randoms_new + cfg.num_randoms_old)
+
+    sl, st_, slim = scene._seam_data_arrays()
+    seam_line = torch.as_tensor(sl, dtype=torch.float, device=dev)
+    seam_tangent = torch.as_tensor(st_, dtype=torch.float, device=dev)
+    seam_limits = torch.as_tensor(slim, dtype=torch.float, device=dev)
+
+    pim = _load_plan_init_pose()
+    T = np.asarray(scene.cur_init_pose.T_workpiece_in_base, float)
+    robot_pose7 = np.asarray(pim.mat44_to_pose7(np.linalg.inv(T)), float)
+    robot_pose_t = torch.as_tensor(robot_pose7, dtype=torch.float, device=dev)
+    piece_pose_t = torch.as_tensor([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=torch.float, device=dev)
+
+    scene2 = ScenePose2(cfg, num_envs=cfg.num_envs, device=dev,
+                        obj_path=scene.workpiece_obj, robot_cfg_path=scene.cfg.robot_cfg_path)
+    scene2.reset(robot_pose_t, horizontal, piece_pose_t)
+    want_obs = bool(include_obstacles and scene.obstacles.get(scene.seam_id))
+    if want_obs:
+        scene._inject_obstacles_into_scenepose2(scene2)
+
+    optimizer = Optimizer(cfg=cfg, scene=scene2, device=dev)
+    optimizer.resetSeamData(seam_line, seam_tangent, seam_limits)
+    return dict(scene2=scene2, optimizer=optimizer, device=dev, want_obs=want_obs)
+
+
+def _ik_select_candidates(scene2, cam_poses_piece, joints_opt, device):
+    """对一批候选相机位姿（piece 系，(M,7)）复刻 scene_pose2.getJoints 的 IK 解析+选解口径，
+    逐候选返回 dict(cam(piece7), joints(6), ik_fail(bool))。用于挑一个"能到的" IK 构型来可视化。"""
+    import numpy as np
+    import torch
+    import scene_pose2 as sp2
+
+    M = cam_poses_piece.shape[0]
+    K = 2
+    robot_inv = scene2.robot_base_inv_pose.clone().repeat(M, 1)
+    cam_quat, cam_pos = sp2.math.tf_combine(robot_inv[:, 3:], robot_inv[:, :3],
+                                            cam_poses_piece[:, 3:], cam_poses_piece[:, :3])
+    ik_solver = sp2.UR12e_t(num_envs=M, device=device)
+    R_mat = sp2.math.matrix_from_quat(cam_quat)
+    T_mat = scene2.generate_transformation(cam_pos, R_mat)
+    ik = torch.nan_to_num(ik_solver.solve_fairino_ec(T_mat).float(), nan=-20)      # (M,8,6)
+    outb = torch.any((ik < scene2.joints_lower_limit) | (ik > scene2.joints_upper_limit), dim=-1)
+    rewards = -torch.norm(ik - joints_opt.unsqueeze(-2), dim=-1)
+    rewards[outb] -= 500
+    rmax, midx = torch.topk(rewards, k=K, dim=1)                                    # (M,K)
+    ik_sel = torch.gather(ik, 1, midx.unsqueeze(-1).expand(-1, -1, 6))              # (M,K,6)
+    outb_sel = torch.gather(outb, 1, midx)                                          # (M,K)
+    # 首选 K 中未越界者；全越界则记 ik_fail
+    best = []
+    for m in range(M):
+        kk = 0 if (not bool(outb_sel[m, 0])) else (1 if not bool(outb_sel[m, 1]) else 0)
+        ikfail = bool(outb_sel[m].all()) or bool((rmax[m] <= -400).all())
+        q = ik_sel[m, kk].detach().cpu().numpy()
+        if ikfail:                                                                 # 兜底：用 retract
+            q = joints_opt[0].detach().cpu().numpy()
+        best.append(dict(cam=cam_poses_piece[m].detach().cpu().numpy(),
+                         joints=[float(v) for v in q], ik_fail=ikfail))
+    return best
+
+
 
 
 class SceneVisualizer:
@@ -125,12 +231,18 @@ class SceneVisualizer:
 class Open3DSceneVisualizer(SceneVisualizer):
     """open3d 后端可视化（本机开窗）。"""
 
-    def show_init_poses(self, stride: int = 1):
+    def show_init_poses(self, stride: int = 1, show_init_arm: bool = True, init_joints=None):
         """逐个可视化该 Scene 焊缝的【候选初始位姿】（工件相对机械臂的摆放）。
 
         前提：先调用 Scene.plan_init_pose() 求出候选。可视化复用 scripts/plan_init_pose.py 的
         _show_kejian2_results（正手→反手依次开窗：按 (R,t) 摆放的工件网格 + 焊缝/中点 + standoff 落点
-        + 蓝色 bisector 正反手判据轴）；同一窗口按 **C 键**切到下一个候选。
+        + 蓝色 bisector 正反手判据轴 + 【焊接位姿 sol["q"] 的整臂碰撞球，红色线框】）；同一窗口按
+        **C 键** 切到下一个候选。
+
+        show_init_arm=True（默认）：额外叠加机械臂在【初始关节角】(retract，缺省 scene.cur_cfg=
+        cfg.retract_config) 的整臂碰撞球，**各 link 用不同颜色**（区别于焊接位姿那条红色臂），
+        便于对照"起步 home 姿态"与工件/障碍的相对关系（如判断初始臂是否已插进工件——见诊断）。
+        init_joints：显式指定要画的初始关节角（rad，长度=关节数）；None→用 scene.cur_cfg。
 
         若 Scene 已放障碍（add_obstacle_type2/type3），障碍随工件一起按各候选的 T_workpiece_in_base
         摆到 base 系一并显示（经 _show_kejian2_results 的 extra_geoms 钩子；open_cylinder 也含在内）。
@@ -145,9 +257,73 @@ class Open3DSceneVisualizer(SceneVisualizer):
         pim = _load_plan_init_pose()
         res = {"forehand": [c.raw for c in cands.get("forehand", [])],
                "backhand": [c.raw for c in cands.get("backhand", [])]}
-        extra = self._obstacle_o3d_factory() if scene.obstacles.get(scene.seam_id) else None
+
+        # extra_geoms 钩子：障碍（随工件按 (R,t) 摆放）+ 初始关节角机械臂碰撞球（base 系、与候选无关）
+        factories = []
+        if scene.obstacles.get(scene.seam_id):
+            factories.append(self._obstacle_o3d_factory())
+        if show_init_arm:
+            factories.append(self._init_arm_o3d_factory(init_joints))
+        extra = None
+        if factories:
+            def extra(R, t, _fs=factories):
+                geoms = []
+                for f in _fs:
+                    geoms.extend(f(R, t))
+                return geoms
+
         pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
                                   stride=stride, extra_geoms=extra)
+
+    def _init_arm_o3d_factory(self, init_joints=None):
+        """返回回调 (R,t)->list[o3d.geometry]：机械臂在【初始关节角】(retract，缺省 scene.cur_cfg)
+        的整臂碰撞球，画成线框球，**各 link 一种颜色**（避开红色=焊接位姿臂，便于区分）。
+
+        碰撞球由 compute_link_sweep 做 per-link FK 得到（base 系，robot base 在原点）；臂姿固定，
+        与候选工件摆放 (R,t) 无关，故一次 FK 缓存、对所有候选返回同一套几何。"""
+        import numpy as np
+        import open3d as o3d
+        from gt_gen.obstacle_placement import compute_link_sweep
+
+        scene = self.scene
+        q = [float(v) for v in (init_joints if init_joints is not None else scene.cur_cfg)]
+        per_wp, _ = compute_link_sweep(scene.cfg, [q], scene.cfg.collision_link_names)
+
+        # 每 link 一种颜色（避开红色 [0.85,0.1,0.1]=焊接位姿臂）
+        palette = [
+            [0.10, 0.45, 0.90],   # 蓝
+            [0.10, 0.75, 0.75],   # 青
+            [0.55, 0.25, 0.85],   # 紫
+            [0.95, 0.60, 0.10],   # 橙
+            [0.20, 0.70, 0.30],   # 绿
+            [0.85, 0.75, 0.10],   # 黄
+            [0.55, 0.40, 0.22],   # 棕
+            [0.40, 0.40, 0.45],   # 灰
+            [0.10, 0.30, 0.55],   # 深蓝
+            [0.90, 0.45, 0.75],   # 粉
+            [0.30, 0.80, 0.55],   # 蓝绿
+            [0.65, 0.85, 0.15],   # 黄绿
+        ]
+        cached = []
+        for li, (ln, s) in enumerate(per_wp.items()):
+            col = palette[li % len(palette)]
+            for c in np.asarray(s, float)[0]:            # (S,4)：取唯一路点
+                cx, cy, cz, r = (float(v) for v in c)
+                if r <= 1e-4:
+                    continue
+                ball = o3d.geometry.TriangleMesh.create_sphere(radius=r, resolution=8)
+                ball.translate((cx, cy, cz))
+                ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+                ls.paint_uniform_color(col)
+                cached.append(ls)
+        print(f"[viz] 初始关节角机械臂碰撞球：{len(cached)} 球 / {len(per_wp)} link（各异色线框，"
+              f"q={np.round(q, 3).tolist()}）")
+
+        def _factory(R, t, _g=cached):
+            return _g          # 臂固定在 base 系，与候选 (R,t) 无关
+
+        return _factory
+
 
     def _obstacle_o3d_factory(self):
         """返回回调 (R,t)->list[o3d.geometry]：把 scene.obstacles（工件 mesh 系）按 T_workpiece_in_base
@@ -184,6 +360,195 @@ class Open3DSceneVisualizer(SceneVisualizer):
             return geoms
 
         return _factory
+
+    def show_goal_pose_collision(self, hand: str = "forehand", index: int = 0, cand=None,
+                                 joints=None, include_obstacles: bool = True,
+                                 show_cone: bool = True, compare: bool = True, device=None):
+        """可视化 compute_goal_pose(ScenePose2) 内部的碰撞检测：把机械臂在【某候选观测相机位姿的
+        IK 构型】下的整臂碰撞球画出来，按 stomp_planning_api._viz_collision 风格分色标出碰撞部位。
+
+        动机：诊断"show_init_poses 里初始臂不碰工件，但 compute_goal_pose 报 world_hit≈100%"的矛盾。
+        疑点在坐标系——ScenePose2 判碰时工件/障碍摆在 robot_base_inv_pose(=inv(robot_pose·base_transform)，
+        含 base_transform 的 0.26m 平移 + 绕z 90°)，而 show_init_poses 摆在 T_workpiece_in_base。
+        compare=True 开【两窗对照】：窗A=ScenePose2 摆放(重现判碰)、窗B=真值摆放(应无碰)，肉眼即可定位。
+
+        参数：
+          hand/index       : set_init_pose 选哪只手第几个候选。
+          joints           : 直接指定要画的关节角(6)；缺省=从优化器初始化的候选相机位姿里解 IK 挑一个。
+          cand             : 缺省从 8 个初始候选相机位姿自动挑(优先 IK 可达)；给定则用第 cand 个。
+          include_obstacles: 是否并入障碍(默认 True，与 compute_goal_pose 同口径)。
+          show_cone        : 是否标出 field 视锥自遮挡球(紫，仅 Link1/2/3)。
+          compare          : True 开 A/B 双窗对照(强烈建议)。
+          device           : None→cfg.compute_goal_pose.device。
+
+        颜色：灰=未碰　红=碰工件/自碰低link　绿=自碰高link　橙=碰障碍　紫=视锥自遮挡；蓝球+蓝线=相机镜头/视线。
+        ⚠ 会初始化 curobo/warp，须在【未启动 SimulationApp 的干净进程】里调用。缺 open3d/无显示则打印跳过。
+        """
+        import numpy as np
+        import torch
+        import trimesh
+
+        scene = self.scene
+        scene.set_init_pose(hand, index)
+        ip = scene.cur_init_pose
+
+        ctx = _build_scenepose2_debug(scene, include_obstacles=include_obstacles, device=device)
+        scene2, optimizer, dev = ctx["scene2"], ctx["optimizer"], ctx["device"]
+        import scene_pose2 as sp2   # _build_scenepose2_debug 已把 stomp_planner 加进 sys.path
+        retract = torch.as_tensor([list(scene.cur_cfg)], dtype=torch.float, device=dev)
+
+        # —— 选一个 IK 构型（+ 对应候选相机位姿，供视锥） ——
+        cam_piece = None
+        if joints is not None:
+            q_list = [float(v) for v in joints]
+            picked_desc = "用户指定 joints"
+        else:
+            optimizer.defineVariables()
+            optimizer.initializePose()
+            cams = optimizer.cam_pose_optimized.detach()             # (B,7) piece 系候选相机位姿
+            cand_poses = cams[:8] if cams.shape[0] >= 8 else cams    # 前 8 = 8 个基姿(端点×±45°×flip)
+            picks = _ik_select_candidates(scene2, cand_poses, retract, dev)
+            if cand is not None:
+                ci = int(cand) % len(picks)
+            else:
+                valid = [i for i, p in enumerate(picks) if not p["ik_fail"]]
+                ci = valid[0] if valid else 0
+            q_list = picks[ci]["joints"]
+            cam_piece = torch.as_tensor(picks[ci]["cam"], dtype=torch.float, device=dev)
+            picked_desc = (f"候选#{ci}/{len(picks)} ik_fail={picks[ci]['ik_fail']}"
+                           + ("（无 IK 解→retract 兜底，与 getJoints 一致）" if picks[ci]["ik_fail"] else ""))
+        print(f"[viz] 可视化构型：{picked_desc}  q={np.round(q_list, 3).tolist()}")
+        q = torch.as_tensor([q_list], dtype=torch.float, device=dev)
+
+        # —— FK 整臂碰撞球（base_link 系；即 ScenePose2 判碰所用） ——
+        kin = scene2.rw.get_kinematics(q)
+        sph = kin.link_spheres_tensor[0].detach().cpu().numpy()       # (S,4)
+        kc = scene2.rw.kinematics.kinematics_config
+        idx_map = kc.link_sphere_idx_map.detach().cpu().numpy()       # (S,) 每球所属 link idx
+        idx2name = {int(v): k for k, v in kc.link_name_to_idx_map.items()}
+        keep = sph[:, 3] > 1e-4
+        centers, radii = sph[keep, :3], sph[keep, 3]
+        link_ids = idx_map[keep]
+        link_names = [idx2name.get(int(i), str(int(i))) for i in link_ids]
+        S = len(centers)
+
+        # —— 自碰撞球对（与摆放无关；跳过同 link + self_collision_ignore） ——
+        from curobo.util_file import load_yaml
+        kin_yml = load_yaml(scene.cfg.robot_cfg_path)["robot_cfg"]["kinematics"]
+        ignore = set()
+        for a, nbrs in (kin_yml.get("self_collision_ignore") or {}).items():
+            for b in nbrs:
+                ignore.add(frozenset((a, b)))
+        self_lo, self_hi, self_pairs = set(), set(), []
+        for i in range(S):
+            for j in range(i + 1, S):
+                if link_names[i] == link_names[j] or frozenset((link_names[i], link_names[j])) in ignore:
+                    continue
+                if float(np.linalg.norm(centers[i] - centers[j])) < radii[i] + radii[j]:
+                    lo, hi = (i, j) if link_ids[i] <= link_ids[j] else (j, i)
+                    self_lo.add(lo); self_hi.add(hi)
+                    self_pairs.append((link_names[lo], link_names[hi]))
+
+        # —— field 视锥自遮挡球（与摆放无关；仅 Link1/2/3；需候选相机位姿） ——
+        cone_hit = np.zeros(S, bool)
+        cam_apex = cam_axis = None
+        if show_cone and cam_piece is not None:
+            rbi = scene2.robot_base_inv_pose
+            cq, cp = sp2.math.tf_combine(rbi[:, 3:], rbi[:, :3],
+                                         cam_piece[3:].unsqueeze(0), cam_piece[:3].unsqueeze(0))
+            cam_apex = cp[0].detach().cpu().numpy()
+            cam_axis = sp2.math.matrix_from_quat(cq)[0, :, 2].detach().cpu().numpy()
+            fmask = np.array([ln in sp2._FIELD_LINKS for ln in link_names])
+            rel = centers - cam_apex
+            tt = rel @ cam_axis
+            radial = np.linalg.norm(rel - tt[:, None] * cam_axis, axis=-1)
+            cone_r = np.clip(tt, 0, None) / sp2._FIELD_HEIGHT * sp2._FIELD_RADIUS
+            cone_hit = fmask & (tt >= -radii) & (tt <= sp2._FIELD_HEIGHT + radii) & (radial <= cone_r + radii)
+
+        # —— 工件/障碍原始 mesh（工件 mesh 系）——两窗只是施加的摆放 T 不同 ——
+        wp_raw = trimesh.load(scene.workpiece_obj, force="mesh")
+        obs_tms = scene._obstacle_solid_trimeshes() if ctx["want_obs"] else []
+
+        def _placed(T4):
+            wp = wp_raw.copy(); wp.apply_transform(np.asarray(T4, float))
+            om = None
+            if obs_tms:
+                tms = [tm.copy() for tm in obs_tms]
+                for tm in tms:
+                    tm.apply_transform(np.asarray(T4, float))
+                om = trimesh.util.concatenate(tms) if len(tms) > 1 else tms[0]
+            return wp, om
+
+        def _hits(mesh):
+            if mesh is None or S == 0:
+                return np.zeros(S, bool)
+            sd = trimesh.proximity.ProximityQuery(mesh).signed_distance(centers)   # 网格内为正
+            return (sd + radii) > 0
+
+        _GRAY = [0.60, 0.60, 0.62]; _RED = [0.90, 0.10, 0.10]; _GREEN = [0.10, 0.80, 0.20]
+        _ORANGE = [0.95, 0.55, 0.10]; _PURPLE = [0.60, 0.20, 0.80]
+
+        def _colors(hit_w, hit_o):
+            cols = [list(_GRAY) for _ in range(S)]
+            for i in range(S):
+                if cone_hit[i]:
+                    cols[i] = list(_PURPLE)
+                if hit_o[i]:
+                    cols[i] = list(_ORANGE)
+                if hit_w[i]:
+                    cols[i] = list(_RED)
+            for i in self_lo:
+                cols[i] = list(_RED)
+            for i in self_hi:
+                cols[i] = list(_GREEN)
+            return cols
+
+        try:
+            import open3d as o3d
+        except Exception as e:                                        # noqa: BLE001
+            print(f"[viz] open3d 不可用，跳过：{e}")
+            return
+
+        def _mesh_geom(tm, color):
+            m = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(np.asarray(tm.vertices, float)),
+                o3d.utility.Vector3iVector(np.asarray(tm.faces, np.int32)))
+            m.compute_vertex_normals(); m.paint_uniform_color(color)
+            return m
+
+        def _window(T4, title):
+            wp_mesh, obs_mesh = _placed(T4)
+            hit_w, hit_o = _hits(wp_mesh), _hits(obs_mesh)
+            cols = _colors(hit_w, hit_o)
+            geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)]
+            geoms.append(_mesh_geom(wp_mesh, [0.72, 0.72, 0.75]))
+            if obs_mesh is not None:
+                geoms.append(_mesh_geom(obs_mesh, [0.55, 0.50, 0.35]))
+            for i in range(S):
+                ball = o3d.geometry.TriangleMesh.create_sphere(radius=max(float(radii[i]), 1e-3), resolution=8)
+                ball.translate(tuple(float(v) for v in centers[i]))
+                ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+                ls.paint_uniform_color(cols[i])
+                geoms.append(ls)
+            if cam_apex is not None:                                  # 相机镜头(蓝球) + 视线轴(蓝线)
+                cb = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
+                cb.translate(tuple(float(v) for v in cam_apex)); cb.compute_vertex_normals()
+                cb.paint_uniform_color([0.1, 0.1, 0.9]); geoms.append(cb)
+                axl = o3d.geometry.LineSet(
+                    points=o3d.utility.Vector3dVector([cam_apex, cam_apex + cam_axis * sp2._FIELD_HEIGHT]),
+                    lines=o3d.utility.Vector2iVector([[0, 1]]))
+                axl.paint_uniform_color([0.1, 0.1, 0.9]); geoms.append(axl)
+            print(f"[viz] {title}\n      碰工件球={int(hit_w.sum())}/{S}  碰障碍球={int(hit_o.sum())}  "
+                  f"视锥球={int(cone_hit.sum())}  自碰对={len(self_pairs)}")
+            o3d.visualization.draw_geometries(geoms, window_name=title[:60])
+
+        # 窗A：ScenePose2 摆放（工件/障碍 @ robot_base_inv_pose）——重现 compute_goal_pose 判碰
+        poseA = scene2.robot_base_inv_pose[0].detach().cpu().tolist()
+        _window(_pose7_to_T(poseA), "A: ScenePose2摆放(robot_base_inv_pose)=compute_goal_pose判碰")
+        # 窗B：真值摆放（工件/障碍 @ T_workpiece_in_base）——与 show_init_poses 一致
+        if compare:
+            _window(np.asarray(ip.T_workpiece_in_base, float),
+                    "B: 真值摆放(T_workpiece_in_base)=show_init_poses一致")
 
     def show_seam(self, seam_id: int):
         """在 **open3d** 中可视化【指定焊缝】：工件网格 + 该焊缝红色直线 + 障碍物（如有）。

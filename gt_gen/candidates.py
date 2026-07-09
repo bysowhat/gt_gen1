@@ -312,7 +312,7 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
                 # （否则如 J3=6.2776 这类目标会让后续从该支出发的规划被迫扫 ~288° 而中途碰撞，见 joint_wrap）。
                 # 归一在②看向校验/③可达性/存储之前完成，使这三步与 plan_to_config 实际规划的分支一致。
                 if jl is not None:
-                    cfg = wrap_goal_near_start(cur_cfg, cfg, jl[0], jl[1], tag="wrap/candidate")
+                    cfg = wrap_goal_near_start(cur_cfg, cfg, jl[0], jl[1], tag="wrap/candidate", verbose=False)
                 # ② 看向校验：实际相机光轴 vs (T - 相机位置) 的夹角
                 Tc = camera_pose_from_config(handle, cfg, camera_model)
                 axis = Tc[:3, 2]

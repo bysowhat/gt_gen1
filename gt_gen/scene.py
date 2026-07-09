@@ -891,13 +891,14 @@ class Scene:
         """
         cur_cands = self.init_pose_candidates.get(self.seam_id, {"forehand": [], "backhand": []})
         for init_pose_idx in range(len(cur_cands[hand])):
+            # 最多尝试2个初始位姿
+            if init_pose_idx >= 2:
+                continue
+
             self.set_init_pose(hand, init_pose_idx)
             res = self.compute_goal_pose()
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
-
-            self.save('/media/a/新加卷/tempt/4/scene1.pkl')
-
 
             jt = res["joints"]
             joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)

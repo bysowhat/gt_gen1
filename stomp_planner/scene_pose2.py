@@ -89,12 +89,34 @@ class ScenePose2:
 
         # —— 与 ScenePose.__init__ 一致的纯 torch 配置 ——
         self.num_steps = cfg.num_steps
+        '''
+        ┌─────────────────────────┬───────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │          变量            │        定义（config_pose.py）          │                                                       含义                                                       │
+        ├─────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+        │ insides_cost_weight     │ 19 / dist_limit（=19/0.5=38）          │ "工件内部"代价：惩罚相机位姿落到工件内部/穿模，或相机离焊缝太近钻进实体里                                        │
+        ├─────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+        │ space_cost_weight       │ 21 / dist_limit（=42）                 │ "视野空间"代价：惩罚相机与目标的距离偏离期望工作距离（太远/太近，看不清或超出景深）                              │
+        ├─────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+        │ block_cost_weight       │ 22 / dist_limit（=44）                 │ "遮挡"代价：惩罚焊缝被工件自身或环境挡住（视线被 block），配合 block_radius=0.04、num_block_pts=6 做遮挡采样检测 │
+        ├─────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+        │ orientation_cost_weight │ 23 / orientation_limit（=23/30≈0.77）  │ "方向/朝向"代价：惩罚相机光轴与焊缝法向的夹角偏离理想观测角（约 45°），orientation_limit=30 是软上限（度）       │
+        └─────────────────────────┴───────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        '''
         self.insides_cost_weight = cfg.insides_cost_weight
         self.space_cost_weight = cfg.space_cost_weight
         self.block_cost_weight = cfg.block_cost_weight
         self.orientation_cost_weight = cfg.orientation_cost_weight
         # 接受门槛专用的朝向放宽角度(deg)；0=不放宽=gate 与全量朝向代价一致(向后兼容)
         self.orient_gate_relax = float(getattr(cfg, "orient_gate_relax", 0.0))
+        '''
+        ┌───────────────┬──────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+        │     变量       │      值      │                                                                             作用                                                                              │
+        ├───────────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+        │ block_radius  │ 0.04（4 cm）  │ 遮挡判定的"容差半径"：从相机到焊缝的视线附近，用一个半径 4cm 的球（或圆柱）去检测有没有障碍物挡在视线上。半径越大，判定"被挡"越严格（视线周围一圈都得空出来） │
+        ├───────────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+        │ num_block_pts │ 6            │ 沿视线的采样点数：把"相机→焊缝"这条视线均匀切成 6 个采样点，逐点检查是否落进工件/障碍物里。点数越多，遮挡检测越细但越慢                                       │
+        └───────────────┴──────────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+        '''
         self.block_radius = cfg.block_radius
         self.num_block_pts = cfg.num_block_pts
 
@@ -199,7 +221,7 @@ class ScenePose2:
         rw_cfg = RobotWorldConfig.load_from_config(
             self._rd, WorldConfig(mesh=[m0]), tensor_args=ta,
             collision_checker_type=CollisionCheckerType.MESH,
-            collision_activation_distance=0.0, n_meshes=4,
+            collision_activation_distance=0.0, n_meshes=6,#n_meshes 这个碰撞世界最多放几个 mesh"
         )
         self.rw = RobotWorld(rw_cfg)
         self._WorldConfig = WorldConfig
@@ -224,10 +246,16 @@ class ScenePose2:
             robot_pose = torch.cat((robot_pos, robot_quat), dim=-1)
         self.robot_pose_init = robot_pose.clone()
 
+        '''
+        现在的麻烦是：机器人底座上有两个不同的原点，它们俩差了 90° + 0.26 米：
+            - 一个叫 base_link（真正机械臂的第一个关节处）
+            - 一个叫 靠上底座（往上抬 0.26 米、又拧了 90° 的另一个参照点）
+        '''
+        # 去 Isaac：cuRobo FK 根就是 base_link（固定底座 xiaoyu_base_link 已在运动学模型内），
+        # 且 robot_pose 由 plan_init_pose 在 base_link 系给出（robot_pose = pose7(inv(T_workpiece_in_base))），
+        # 本就是 base_link 位姿——**不能再叠底座 base_transform**，否则把 0.26m+90° 的底座重复计一遍，
+        # 令工件/相机/IK 帧整体错转 90°（原版 Isaac scene_pose.py 里 root≠base_link 才需要它，这里不需要）。
         robot_base = robot_pose.clone()
-        base_transform = torch.tensor([0, 0, 0.26, 0.7071068, 0, 0, 0.7071068], dtype=torch.float, device=self.device)
-        robot_base_quat, robot_base_pos = math.tf_combine(robot_base[3:], robot_base[:3], base_transform[3:], base_transform[:3])
-        robot_base = torch.cat((robot_base_pos, robot_base_quat), dim=-1)
         robot_base_inv_quat, robot_base_inv_pos = math.tf_inverse(robot_base[3:].unsqueeze(0), robot_base[:3].unsqueeze(0))
         self.robot_base_inv_pose = torch.cat((robot_base_inv_pos, robot_base_inv_quat), dim=-1)   # piece->base_link
 
@@ -274,8 +302,17 @@ class ScenePose2:
 
         # 解析 IK（与 ScenePose 一致）
         ik_solver = UR12e_t(num_envs=M, device=self.device)
-        R_mat = math.matrix_from_quat(cam_quat)
-        T_mat = self.generate_transformation(cam_pos, R_mat)
+        # ⚠ ik_cam_pose 的解析 IK/FK 其 DH 根是「靠上底座」(base_link 上抬 0.26m + 绕 z 转 90°)，
+        #   不是 base_link。上面 cam_quat/cam_pos 在 base_link 系，直接喂 solve_fairino_ec 会因
+        #   base_transform(0.26m+90°) 缺失而令关节角整体错转 90°（表现：回放轨迹手臂对不准视锥）。
+        #   故 IK 目标须先从 base_link 系换到靠上底座系：cam_up = inv(base_transform) · cam_base_link。
+        #   注意只转这一路——下面碰撞锥的 apex/axis(:321) 仍用 base_link 系(与 cuRobo 碰撞世界一致)。
+        base_transform = torch.tensor([0.0, 0.0, 0.26, 0.7071068, 0.0, 0.0, 0.7071068],
+                                      dtype=cam_quat.dtype, device=self.device)
+        bt_inv_quat, bt_inv_pos = math.tf_inverse(base_transform[3:].unsqueeze(0), base_transform[:3].unsqueeze(0))
+        ik_quat, ik_pos = math.tf_combine(bt_inv_quat.repeat(M, 1), bt_inv_pos.repeat(M, 1), cam_quat, cam_pos)
+        R_mat = math.matrix_from_quat(ik_quat)
+        T_mat = self.generate_transformation(ik_pos, R_mat)
         joints_all_ik = ik_solver.solve_fairino_ec(T_mat).float()        # (M, 8, 6)
         joints_all_ik = torch.nan_to_num(joints_all_ik, nan=-20)
         outbound = (joints_all_ik < self.joints_lower_limit) | (joints_all_ik > self.joints_upper_limit)
