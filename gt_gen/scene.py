@@ -400,7 +400,8 @@ class Scene:
     def plan_init_pose(self,
                        diagnostic: bool = False,
                        rebuild: bool = False,
-                       include_obstacles: bool = True) -> Dict[str, List[InitPoseCandidate]]:
+                       include_obstacles: bool = True,
+                       verbose: bool = False) -> Dict[str, List[InitPoseCandidate]]:
         """计算「工件 ↔ 机械臂」的候选初始位姿（kejian2 逻辑，本焊缝 self.seam）。
 
         与 scripts/plan_init_pose.py 走【完全同一套过滤逻辑】（直接复用其 _kejian2_build_ctx /
@@ -424,6 +425,8 @@ class Scene:
           diagnostic       : 预留（kejian2 逐焊缝求解暂不细分诊断，当前未使用）。
           rebuild          : True 强制重建工件级 ctx（换工件 / 改 n_per_dof 等缓存失效时）。
           include_obstacles: True（默认）把 self.obstacles 并入碰撞世界后再求解（避障）。
+          verbose          : True 打印 ESDF 并入 / solve profile 计时（诊断噪声，默认 False 静默）。
+                             注：逐步过滤候选计数（① lookup→…→⑧ 复检→合格）无条件打印，不受此开关影响。
 
         返回：候选 dict {"forehand":[...], "backhand":[...]}（各组可能为空=该手别无合格解）。
         """
@@ -442,13 +445,13 @@ class Scene:
         solver = self._k2ctx["solver"]
         want_obs = bool(include_obstacles and self.obstacles.get(self.seam_id))
         if want_obs:
-            self._inject_obstacles_into_solver(solver)   # 每次按当前障碍重算合并 ESDF（覆盖体素）
+            self._inject_obstacles_into_solver(solver, verbose=verbose)   # 每次按当前障碍重算合并 ESDF（覆盖体素）
             self._k2ctx_injected = True
         elif self._k2ctx_injected:                       # 之前注过障碍、这次要干净工件世界 → 还原
             solver._build_robot_world()
             self._k2ctx_injected = False
 
-        res, _prof = pim._kejian2_solve_weld(self._k2ctx, self.seam)
+        res, _prof = pim._kejian2_solve_weld(self._k2ctx, self.seam, verbose=verbose)
 
         # 正反手分组返回（不做数量上限挑选）：每组各自按工件平移 xyz 差异独立分数降序
         fore = [InitPoseCandidate.from_kejian2(d) for d in res.get("forehand", [])]
@@ -503,7 +506,7 @@ class Scene:
                 pass
         return out
 
-    def _inject_obstacles_into_solver(self, solver):
+    def _inject_obstacles_into_solver(self, solver, verbose: bool = True):
         """把当前障碍实体 + 工件 mesh 合并重算 signed ESDF，覆盖 solver 的碰撞体素（避障）。
 
         镜像 InitPoseLookupSolver._compute_esdf 的体素化 + igl 缠绕数纠符号，但：
@@ -526,7 +529,8 @@ class Scene:
 
         obs_tms = self._obstacle_solid_trimeshes()
         if not obs_tms:
-            print("[scene] 无可注入碰撞世界的障碍（仅工件或仅 open_cylinder）")
+            if verbose:
+                print("[scene] 无可注入碰撞世界的障碍（仅工件或仅 open_cylinder）")
             return
 
         voxel_size = float(solver.voxel_size)
@@ -577,8 +581,9 @@ class Scene:
             sign = torch.where(inside_t, torch.ones_like(unsigned), -torch.ones_like(unsigned))
             esdf.feature_tensor = sign * unsigned
             n_in = int(inside_mask.sum()); n_tot = inside_mask.size
-            print(f"[scene] 障碍并入 ESDF：{len(obs_tms)} 块实体，igl inside "
-                  f"{n_in}/{n_tot} voxels（{100.0 * n_in / max(n_tot, 1):.1f}%）")
+            if verbose:
+                print(f"[scene] 障碍并入 ESDF：{len(obs_tms)} 块实体，igl inside "
+                      f"{n_in}/{n_tot} voxels（{100.0 * n_in / max(n_tot, 1):.1f}%）")
         except ImportError:
             print("[scene][warn] libigl 未安装，障碍 ESDF sign 沿用 cuRobo 默认")
         except Exception as e:

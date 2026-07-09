@@ -2201,10 +2201,12 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
     }
 
 
-def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
+def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Dict[str, list], dict]:
     """对单条焊缝求解（④ lookup 碰撞过滤 + ⑤ 朝向 snap/正面过滤/正反手分类），复用 ctx 里工件级的
     solver/朝向/底座/mesh（不重建 ②③）。返回 ({"forehand":[...],"backhand":[...]}, prof_weld)，
-    prof_weld 记录 ④⑤ 耗时。per-weld 结果与原 plan_init_pose_kejian2 单焊缝逐位一致。"""
+    prof_weld 记录 ④⑤ 耗时。per-weld 结果与原 plan_init_pose_kejian2 单焊缝逐位一致。
+    verbose=False 时静默 lookup 明细 / solve profile 计时（求解不变；scene.py 默认走此路）；
+    逐步过滤计数（① lookup→…→⑧ 复检→合格）为结果口径信息，【无条件打印】，不受 verbose 影响。"""
     import time as _time
     import torch as _torch
     from scipy.spatial.transform import Rotation as _sR
@@ -2229,15 +2231,17 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     prof = {}
     # —— ④ lookup（碰撞过滤 + 朝向粗筛） ——
     _t = _time.time()
-    solver.solve_one_weld_lookup(weld, rot_x, rot_y, rot_z, profile=True,
+    solver.solve_one_weld_lookup(weld, rot_x, rot_y, rot_z, profile=verbose,
                                  orient_valid=R_valid_list, orient_snap_deg=snap_deg)
     _sync()
     prof["④solve_one_weld_lookup(碰撞过滤)"] = _time.time() - _t
     cands = list(getattr(solver, "last_all_solutions", []) or [])
-    print(f"[kejian2] lookup 候选 {len(cands)} 个（绕末端轴采样 "
-          f"{len(rot_x)}×{len(rot_y)}×{len(rot_z)}）")
+    if verbose:
+        print(f"[kejian2] lookup 候选 {len(cands)} 个（绕末端轴采样 "
+              f"{len(rot_x)}×{len(rot_y)}×{len(rot_z)}）")
     if not cands:
-        print("[kejian2] lookup 无候选：请放宽 ee_xy_range_m/ee_z_range_m 或增大 n_per_dof")
+        print("[kejian2] 逐步过滤：① lookup 候选 0 个 → 合格 0"
+              "（请放宽 ee_xy_range_m/ee_z_range_m 或增大 n_per_dof）")
         prof["⑤snap+正反手分类(CPU遍历候选)"] = 0.0
         return {"forehand": [], "backhand": []}, prof
 
@@ -2257,6 +2261,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
     n_wpx = 0          # 因「工件距 base 欧氏最近点 base-x <= workpiece_x_min」丢弃
     n_overlap = 0      # 因「固定底座与工件在 base-xy 投影相交」丢弃
     n_arm_collide = 0  # 因「snap 后 retract 姿态整臂 vs 工件碰撞」丢弃（最后一步复检）
+    n_dedup = 0        # 因「同朝向 + 同位置(2cm)重复」轻去重丢弃
     seen = set()
 
     # —— 向量化预筛（批量替代逐候选 scipy/几何；与逐个版逐位等价，仅 overlap+去重+组装仍按原始顺序循环）——
@@ -2330,6 +2335,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
 
         key = (oid, round(float(t_new[0]), 2), round(float(t_new[1]), 2), round(float(t_new[2]), 2))
         if key in seen:                              # 轻去重：同朝向 + 同位置(2cm 粒度)只留一份
+            n_dedup += 1
             continue
         seen.add(key)
 
@@ -2370,10 +2376,24 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict) -> Tuple[Dict[str, list], dict]:
         fore = [r for r in results if r["hand"] == "forehand"]
         back = [r for r in results if r["hand"] == "backhand"]
     prof["⑤snap+正反手分类(CPU遍历候选)"] = _time.time() - _t
-    print(f"[kejian2] 候选 {len(cands)} → 朝向命中(snap) {n_hit} → 背面丢 {n_back} / x<=0 丢 {n_xneg} "
-          f"/ 工件最近点x<={wp_x_min} 丢 {n_wpx} / 底座-工件XY相交丢 {n_overlap} "
-          f"/ snap后retract-工件碰撞丢 {n_arm_collide} → 合格 {len(results)}"
-          f"（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
+    # —— 逐步过滤计数（前→后，括号=本步丢弃）；这是结果口径信息，无条件打印（不受 verbose 影响） ——
+    after_hit = n_hit                          # ② 工作空间 + 朝向 snap 命中
+    after_back = n_hit - n_back                # ③ 正面过滤（背面丢）
+    after_xneg = after_back - n_xneg           # ④ 焊缝中心 base-x>0（= int(mask_survive.sum())）
+    after_wpx = after_xneg - n_wpx             # ⑤ 工件最近点 base-x>wp_x_min
+    after_overlap = after_wpx - n_overlap      # ⑥ 底座-工件 XY 投影不相交
+    after_dedup = after_overlap - n_dedup      # ⑦ 轻去重（= 组装完、复检前的 results 数）
+    n_final = len(results)                     # ⑧ snap 后 retract-工件无碰撞复检 → 合格
+    print("[kejian2] 逐步过滤 候选初始位姿（前→后，括号内=本步丢弃）：")
+    print(f"  ① lookup 候选（绕末端轴 {len(rot_x)}×{len(rot_y)}×{len(rot_z)} 采样） : {len(cands)}")
+    print(f"  ② 工作空间 + 朝向snap 命中            : {len(cands)} → {after_hit}")
+    print(f"  ③ 正面过滤(bisector base-z≥0)        : {after_hit} → {after_back}（背面丢 {n_back}）")
+    print(f"  ④ 焊缝中心 base-x>0                   : {after_back} → {after_xneg}（x≤0 丢 {n_xneg}）")
+    print(f"  ⑤ 工件最近点 base-x>{wp_x_min}          : {after_xneg} → {after_wpx}（丢 {n_wpx}）")
+    print(f"  ⑥ 底座-工件 XY 投影不相交            : {after_wpx} → {after_overlap}（相交丢 {n_overlap}）")
+    print(f"  ⑦ 轻去重(同朝向 + 2cm 同位)          : {after_overlap} → {after_dedup}（重复丢 {n_dedup}）")
+    print(f"  ⑧ snap后 retract-工件无碰撞复检      : {after_dedup} → {n_final}（碰撞丢 {n_arm_collide}）")
+    print(f"  ⇒ 合格 {n_final}（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
     return {"forehand": fore, "backhand": back}, prof
 
 
