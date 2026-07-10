@@ -41,7 +41,8 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
     一次（边走边拍），终点构型再补拍一次。
 
     every_n=None 时取 h_expl.config.params.loop.observe_every_n（默认 10）。
-    返回该段轨迹去掉首点后的 (t,dof) np（接进 GT）；规划失败返回 None。
+    返回 (seg, seg_obs)：该段轨迹去掉首点后的 (t,dof) np（接进 GT）+ 等长 0/1 观测标记
+    （该路点是否被 _observe 拍过）；规划失败返回 (None, None)。
     """
     from gt_gen import curobo_iface as ci
 
@@ -60,23 +61,26 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
                                     checker_type=ck)
         if traj is None:
             print("[_move_to] STOMP plan_joint 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
-            return None
+            return None, None
     else:
         res = ci.plan_to_config(h_expl, cur_cfg, target_cfg, max_attempts=cfg.plan_max_attempts)
         if res is None or not bool(res.success.item()):
             # 诊断：起点/终点哪个在碰撞，还是中间连不上（区分三种成因）
             print("[_move_to] plan_to_config 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
             # cuRobo 实际避障的占据场（sync 后、含 inflate），看 target_cfg 整臂是否泡在障碍里
-            return None
+            return None, None
         traj = res.get_interpolated_plan().position.detach().cpu().numpy()
 
     # 沿途每 every_n 个路点拍一次（h_expl 做相机 FK，与 h_truth 同一套运动学）
+    obs_flags = np.zeros(len(traj), dtype=np.int64)
     for i in range(0, len(traj), every_n):
         _observe(voxmap, h_expl, traj[i], camera_model, truth_scene, max_depth, pixel_stride)
+        obs_flags[i] = 1
     _observe(voxmap, h_expl, traj[-1], camera_model, truth_scene, max_depth, pixel_stride)
+    obs_flags[-1] = 1
 
     # _debug_viz_voxmap(voxmap, h_expl, traj[-1], truth_scene, show_unknown=True, transparent=False)  # 本段走完后的 voxmap 三态（含灰 UNKNOWN）
-    return traj[1:]                                   # 去掉与上一段重复的首点
+    return traj[1:], obs_flags[1:]                    # 去掉与上一段重复的首点
 
 
 def _frontier_cells(voxmap) -> np.ndarray:
@@ -102,7 +106,7 @@ def handle_stuck(h_truth, h_expl, voxmap, cur_cfg, camera_model, truth_scene, ma
 
     以 _frontier_cells(vm) 为目标，generate_candidates(h_truth) 找可达候选，选「假设性 raycast
     揭开 UNKNOWN 最多」的那个，_move_to 过去。先把已知空间整体摊大，常能间接绕开遮挡。
-    返回 (progressed: bool, new_cfg, seg)；无可达候选/规划失败 → (False, cur_cfg, None)。
+    返回 (progressed: bool, new_cfg, seg, seg_obs)；无可达候选/规划失败 → (False, cur_cfg, None, None)。
     """
     from gt_gen.candidates import generate_candidates
     from gt_gen.nbv import raycast_reveal
@@ -110,11 +114,11 @@ def handle_stuck(h_truth, h_expl, voxmap, cur_cfg, camera_model, truth_scene, ma
 
     frontier = _frontier_cells(voxmap)
     if frontier.shape[0] == 0:
-        return False, cur_cfg, None
+        return False, cur_cfg, None, None
 
     cands = generate_candidates(h_truth, voxmap, frontier, camera_model, cur_cfg)
     if not cands:
-        return False, cur_cfg, None
+        return False, cur_cfg, None, None
 
     best, best_gain = None, 0
     for c in cands:
@@ -125,13 +129,13 @@ def handle_stuck(h_truth, h_expl, voxmap, cur_cfg, camera_model, truth_scene, ma
         if gain > best_gain:
             best, best_gain = c, gain
     if best is None or best_gain <= 0:
-        return False, cur_cfg, None
+        return False, cur_cfg, None, None
 
-    seg = _move_to(h_expl, voxmap, cur_cfg, best.config, camera_model, truth_scene,
-                   max_depth, every_n=every_n)
+    seg, seg_obs = _move_to(h_expl, voxmap, cur_cfg, best.config, camera_model, truth_scene,
+                            max_depth, every_n=every_n)
     if seg is None:
-        return False, cur_cfg, None
-    return True, list(best.config), seg
+        return False, cur_cfg, None, None
+    return True, list(best.config), seg, seg_obs
 
 
 def look_around(handle, voxmap, cur_cfg, camera_model, truth_scene, max_depth):
@@ -775,6 +779,8 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
 
     cur_cfg = [float(v) for v in start_cfg] if start_cfg is not None else list(cfg.retract_config)
     GT = [np.asarray(cur_cfg, dtype=np.float64)]
+    OBS = [1]           # 是否被 _observe 拍过，与 GT 逐行对齐；起点紧接着下面就补拍一次
+    GOAL_FLAG = [0]      # 是否是本段规划目标到达点（观测目标 goal_cfg/goal_pose），与 GT 逐行对齐
     # _dump_seg_isaacsim(None, None, reset=True)               # 清空执行段落盘（供 viz_seg_isaacsim.py 干净进程回放）
     metric = ci.free_pose_metric(h_truth, free_rot=(0,))     # 放开焊枪绕接近轴 roll
     h_plan = h_truth_plan if h_truth_plan is not None else h_truth  # 步② P* 规划用（带障碍 buffer / 退回 h_truth）
@@ -815,7 +821,11 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             seg = (res.get_interpolated_plan().position.detach().cpu().numpy()
                    if reached_direct else None)
         if reached_direct:
+            n_seg = len(seg) - 1
             GT.extend(seg[1:])
+            OBS.extend([0] * n_seg)                     # 步①直达段全程未调 _observe
+            if n_seg > 0:
+                GOAL_FLAG.extend([0] * (n_seg - 1) + [1])   # 最后一行=真正到达 goal
             status = "reached"
             info["rounds"] = rnd + 1
             # _debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)  # 步① 直达目标段 seg 路径
@@ -848,6 +858,8 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     # STOMP 规划不出 P* → 本场景不可行，直接失败退出 generate_gt（不再进 NBV/后续轮）
                     info["rounds"] = rnd + 1
                     status = "infeasible"
+                    info["observe"] = np.asarray(OBS, dtype=np.int64)
+                    info["goal"] = np.asarray(GOAL_FLAG, dtype=np.int64)
                     return np.asarray(GT, dtype=np.float64), status, info
         else:
             # 改走 plan_to_pose_all（= place_obstacles.detour_exists 那条成功路径）：对多条 IK 分支逐个 plan，
@@ -884,12 +896,14 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             break
         elif r.status == "ok":                               # 正常探索一步
             for cand_idx, cand in enumerate(r_list):                              # 按 score 降序逐个试，第一个能走通(seg 非 None)的就用
-                seg = _move_to(h_expl, voxmap, cur_cfg, cand.cfg, camera_model, truth_scene,
-                               max_depth, every_n=every_n)
+                seg, seg_obs = _move_to(h_expl, voxmap, cur_cfg, cand.cfg, camera_model, truth_scene,
+                                        max_depth, every_n=every_n)
                 if seg is not None:
                     # _debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)  # 收尾段 seg 路径
                     # _dump_seg_isaacsim(cur_cfg, seg, rnd=rnd)    # 同段落盘（isaacsim 回放：工件+障碍+臂，无 voxmap）
                     GT.extend(seg)
+                    OBS.extend(seg_obs.tolist())
+                    GOAL_FLAG.extend([0] * len(seg))          # NBV 候选点，非 goal
                     cur_cfg = list(cand.cfg)
                     print(f'cand_idx: {cand_idx}')
                     break
@@ -899,29 +913,37 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
         elif r.status == "corridor_confirmed":               # B 空但 ① 没成 → 沿 P* 推进已确认段
             reach_idx = r.reach_idx
             if reach_idx >= len(P) - 1:                       # 整条 P* 已落在 FREE → 直接收尾
-                seg = _move_to(h_expl, voxmap, cur_cfg, list(P[-1]), camera_model, truth_scene,
-                               max_depth, every_n=every_n)
+                seg, seg_obs = _move_to(h_expl, voxmap, cur_cfg, list(P[-1]), camera_model, truth_scene,
+                                        max_depth, every_n=every_n)
                 if seg is not None:
                     GT.extend(seg)
+                    OBS.extend(seg_obs.tolist())
+                    if len(seg) > 0:
+                        GOAL_FLAG.extend([0] * (len(seg) - 1) + [1])   # 最后一行=真正到达 goal
                     cur_cfg = list(P[-1])
                     status = "reached"
                     info["rounds"] = rnd + 1
                     break
             else:                                             # 沿 P* 往前挪一段，记一次进展
-                seg = _move_to(h_expl, voxmap, cur_cfg, list(P[reach_idx]), camera_model,
-                               truth_scene, max_depth, every_n=every_n)
+                seg, seg_obs = _move_to(h_expl, voxmap, cur_cfg, list(P[reach_idx]), camera_model,
+                                        truth_scene, max_depth, every_n=every_n)
                 if seg is not None:
                     GT.extend(seg)
+                    OBS.extend(seg_obs.tolist())
+                    GOAL_FLAG.extend([0] * len(seg))          # 沿 P* 中途点，非 goal
                     cur_cfg = list(P[reach_idx])
         elif r.status == "no_reachable_candidate":            # B 遮死/够不着 → 就近揭示兜底
-            prog, new_cfg, seg = handle_stuck(h_truth, h_expl, voxmap, cur_cfg,
+            prog, new_cfg, seg, seg_obs = handle_stuck(h_truth, h_expl, voxmap, cur_cfg,
                                               camera_model, truth_scene, max_depth, every_n=every_n)
             if prog and seg is not None:
                 GT.extend(seg)
+                OBS.extend(seg_obs.tolist())
+                GOAL_FLAG.extend([0] * len(seg))              # 就近揭示兜底点，非 goal
                 cur_cfg = new_cfg
 
         # 步⑥：终点补拍（_move_to 沿途已拍；对未移动/兜底失败的轮次再确保当前构型有观测）
         _observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth)
+        OBS[-1] = 1
 
         # 步⑦：进展判定（free 或 reach 增长 = 有进展；连续 stuck_rounds 轮无进展 → 卡死）
         free_now = voxmap.counts()[FREE]
@@ -940,4 +962,6 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
     else:
         info["rounds"] = max_rounds
 
+    info["observe"] = np.asarray(OBS, dtype=np.int64)
+    info["goal"] = np.asarray(GOAL_FLAG, dtype=np.int64)
     return np.asarray(GT, dtype=np.float64), status, info

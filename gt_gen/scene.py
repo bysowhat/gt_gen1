@@ -339,7 +339,13 @@ class Scene:
         self.cur_init_hand: Optional[str] = None                  # 当前候选所属手别（"forehand"/"backhand"）
         self.cur_init_index: Optional[int] = None                 # 当前候选在【该手别列表】中的下标
         self.goal_poses: Dict[int, Optional[dict]] = {}   # {seam_id: dict|None} compute_goal_pose 产出的单个观测位姿结果（含 cam_pose 等）；无解=None
-        self.trajectories: Dict[int, list] = {}   # {seam_id: list[dict]} plan_explore_path 产出的边走边看轨迹（含 positions/status 等）
+        self.trajectories: Dict[int, Dict[Tuple[str, int], list]] = {}   # {seam_id: {(hand, index): list[dict]}} plan_explore_path 产出的
+                                                                          # 边走边看轨迹；二级 key=当前 init pose(手别,候选下标)，避免同一 seam 下
+                                                                          # 正/反手、不同候选的多条轨迹混进同一个 list
+        self.trajectory_goal_poses: Dict[int, Dict[Tuple[str, int], dict]] = {}   # {seam_id: {(hand, index): goal_pose结果}}
+                                                                          # 每条成功轨迹对应候选当时的 compute_goal_pose 结果快照，
+                                                                          # 供 show_trajectory_isaacsim 按 traj_index 还原正确的视锥（
+                                                                          # self.goal_poses 是全局单值，会被后续候选覆盖，不够用）
         self.obstacles: Dict[int, list] = {}   # {seam_id: list[ObstacleSpec]} 已放障碍（按焊缝分组）
         self.truth_scene = None              # 工件+障碍（base 系）trimesh，raycast 几何源——后续
         self.voxmap = None                   # 三态记忆 ThreeStateVoxelMap——后续
@@ -641,6 +647,49 @@ class Scene:
         self.workpiece_pose = cand.workpiece_pose7          # 工件在 base 系 pose7
         return cand
 
+    def _trajectory_key(self) -> Tuple[str, int]:
+        """当前 init pose 派生的 trajectories 二级 key：(手别, 候选下标)。"""
+        if self.cur_init_hand is None or self.cur_init_index is None:
+            raise RuntimeError("_trajectory_key 需要当前 init pose：请先 set_init_pose(hand, index)")
+        return (self.cur_init_hand, self.cur_init_index)
+
+    def add_trajectory_entry(self, entry: dict) -> None:
+        """把一条边走边看轨迹 entry 追加进 self.trajectories[seam_id][当前 init pose key]。"""
+        key = self._trajectory_key()
+        self.trajectories.setdefault(self.seam_id, {}).setdefault(key, []).append(entry)
+
+    @staticmethod
+    def merge_trajectory_entries(entries: List[dict]) -> dict:
+        """把同一 init pose 下按序规划的多段 entry 合并成 1 条完整轨迹 entry。
+
+        entries 须按规划顺序排列：entries[i]["positions"][0] == entries[i-1]["positions"][-1]
+        （后一段从前一段实际到达的末关节角起步，见 compute_pose_and_plan_path），故拼接时每段
+        （除第一段）都跳过开头这个重复路点。observe/goal（各 (n,1)，逐行对齐 positions）按同样
+        规则拼接：observe 标该行是否被 _observe 拍过，goal 标该行是否是某段的到达目标（一条合并
+        轨迹依次到达 B 个观测位姿，故 goal 列可能有多个 1）。
+        """
+        positions = np.asarray(entries[0]["positions"], float)
+        observe = np.asarray(entries[0]["observe"], np.int64)
+        goal = np.asarray(entries[0]["goal"], np.int64)
+        for e in entries[1:]:
+            positions = np.concatenate([positions, np.asarray(e["positions"], float)[1:]], axis=0)
+            observe = np.concatenate([observe, np.asarray(e["observe"], np.int64)[1:]], axis=0)
+            goal = np.concatenate([goal, np.asarray(e["goal"], np.int64)[1:]], axis=0)
+        statuses = [e.get("status") for e in entries]
+        status = "reached" if all(s == "reached" for s in statuses) else next(
+            s for s in statuses if s != "reached")
+        return dict(
+            positions=positions, status=status,
+            observe=observe, goal=goal,
+            goal_index=[e.get("goal_index") for e in entries],
+            variant=entries[0].get("variant"),
+            cur_joints=entries[0].get("cur_joints"),
+            goal_joints=entries[-1].get("goal_joints"),
+            goal_source=entries[-1].get("goal_source"),
+            info=[e.get("info") for e in entries],
+            segments=len(entries),
+        )
+
     # ------------------------------------------------------------------
     # 存盘 / 读盘（数据态；供跨进程「算 goal pose → save → 另进程 load → 可视化」）
     # ------------------------------------------------------------------
@@ -679,7 +728,11 @@ class Scene:
             obstacles=self.obstacles,                  # {seam_id: list[ObstacleSpec]}（dataclass；prims=Box、meshes=dict）
             goal_poses={sid: ({k: _to_np(v) for k, v in res.items()} if res else None)
                         for sid, res in self.goal_poses.items()},   # {seam_id: dict|None}
-            trajectories={sid: list(v) for sid, v in self.trajectories.items()},   # 边走边看轨迹（positions 等均 numpy，可直接 pickle）
+            trajectories={sid: {k: list(v2) for k, v2 in d.items()}
+                          for sid, d in self.trajectories.items()},   # {seam_id: {(hand,index): list[dict]}}（positions 等均 numpy，可直接 pickle）
+            trajectory_goal_poses={sid: {k: ({kk: _to_np(vv) for kk, vv in res.items()} if res else None)
+                                          for k, res in d.items()}
+                                   for sid, d in self.trajectory_goal_poses.items()},   # {seam_id: {(hand,index): goal_pose结果}}
         )
         d = os.path.dirname(os.path.abspath(path))
         if d:
@@ -693,7 +746,7 @@ class Scene:
                if self.cur_init_index is not None else "未设")
         print(f"[scene] 已保存 → {path}（候选 正手{n_f}/反手{n_b}，"
               f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
-              f"轨迹 {sum(len(v) for v in self.trajectories.values())}，"
+              f"轨迹 {sum(len(v2) for d in self.trajectories.values() for v2 in d.values())}，"
               f"当前 init pose={cur}）")
         return path
 
@@ -723,7 +776,8 @@ class Scene:
         self.cur_init_index = state.get("cur_init_index")
         self.obstacles = state.get("obstacles", {}) or {}
         self.goal_poses = state.get("goal_poses", {}) or {}
-        self.trajectories = state.get("trajectories", {}) or {}   # {seam_id: list[dict]}
+        self.trajectories = state.get("trajectories", {}) or {}   # {seam_id: {(hand,index): list[dict]}}
+        self.trajectory_goal_poses = state.get("trajectory_goal_poses", {}) or {}   # {seam_id: {(hand,index): goal_pose结果}}
         cur_cands = self.init_pose_candidates.get(self.seam_id, {})
         n_f = len(cur_cands.get("forehand", []))
         n_b = len(cur_cands.get("backhand", []))
@@ -731,7 +785,7 @@ class Scene:
                if self.cur_init_index is not None else "未设")
         print(f"[scene] 已加载 ← {path}（候选 正手{n_f}/反手{n_b}，"
               f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
-              f"轨迹 {sum(len(v) for v in self.trajectories.values())}，"
+              f"轨迹 {sum(len(v2) for d in self.trajectories.values() for v2 in d.values())}，"
               f"当前 init pose={cur}）")
         return self
 
@@ -919,10 +973,12 @@ class Scene:
                 vm = self._fresh_explore_voxmap(ctx)     # 每个 variant 重置探索状态，互不串扰
                 start = list(self.cur_cfg)               # pose[0] 从初始关节角（retract）起步
                 all_reached = True
+                seq_entries = []                          # 本序列按 pose 顺序产出的分段 entry，成功后合并成 1 条
                 for pose_idx in range(B):                # 按序覆盖 B 个观测位姿
                     entry = self.plan_explore_path(
                         goal_index=pose_idx, variant=variant,
                         cur_joints=start, ctx=ctx, vm=vm)   # 共享 vm ＝ 继承前一个 pose 的观测
+                    seq_entries.append(entry)
                     if entry["status"] != "reached":
                         all_reached = False
                         print(f"[scene] 序列中断：init#{init_pose_idx} variant#{variant} "
@@ -930,9 +986,18 @@ class Scene:
                         break
                     start = entry["positions"][-1]        # 下一个 pose 从实际到达的末关节角起步
                 if all_reached:
+                    merged = self.merge_trajectory_entries(seq_entries)
+                    key = self._trajectory_key()
+                    self.trajectories.setdefault(self.seam_id, {})[key] = [merged]
+                    self.trajectory_goal_poses.setdefault(self.seam_id, {})[key] = res   # 快照当前候选的观测位姿结果，
+                                                                                          # 供 show_trajectory_isaacsim 还原对应视锥
                     print(f"[scene] 序列成功：init#{init_pose_idx} variant#{variant} "
-                          f"覆盖 B={B} 个观测位姿")
+                          f"覆盖 B={B} 个观测位姿，已合并为 1 条轨迹（路点={len(merged['positions'])}）")
                     return True
+            # 本候选所有 variant 都失败：清掉 plan_explore_path 遗留的分段 entry（未 reached、未合并），
+            # 避免污染 self.trajectories 导致 show_trajectory_isaacsim 拍平后取错轨迹
+            self.trajectories.get(self.seam_id, {}).pop(self._trajectory_key(), None)
+            self.trajectory_goal_poses.get(self.seam_id, {}).pop(self._trajectory_key(), None)
         return False
 
     def plan_explore_path(self,
@@ -978,8 +1043,10 @@ class Scene:
                              同一 init pose 的整条观测位姿序列传同一个 ctx 可省去重复建重型 handle。
           vm               : 可选【三态体素图】；None→内部 _fresh_explore_voxmap(ctx) 造全新的（含初始 FREE）。
                              序列内多个 pose 传【同一张 vm】即可继承前一次规划观测到的世界（见 compute_pose_and_plan_path）。
-        返回 dict（同时 append 进 self.trajectories）：
+        返回 dict（同时 append 进 self.trajectories[seam_id][(当前 hand, 当前 index)]）：
           {positions(T,DOF), status, goal_index, variant, cur_joints, goal_joints, goal_source, info}。
+          （compute_pose_and_plan_path 序列成功后会把同一 key 下按序产出的多段 entry 合并成 1 条，
+          见 Scene.merge_trajectory_entries；单独调用本方法时该 key 下会保留分段的多条 entry。）
         """
         if self.cur_init_pose is None:
             raise RuntimeError("plan_explore_path 需要当前 init pose：请先 set_init_pose(hand, index)")
@@ -1026,13 +1093,17 @@ class Scene:
                                        goal_cfg=goal_joints, start_cfg=start)
 
         positions = np.asarray([np.asarray(q, float) for q in GT])
+        observe = np.asarray(info.get("observe", []), dtype=np.int64).reshape(-1, 1)
+        goal = np.asarray(info.get("goal", []), dtype=np.int64).reshape(-1, 1)
         entry = dict(positions=positions, status=status, goal_index=gi, variant=vi,
                      cur_joints=np.asarray(start, float),
                      goal_joints=np.asarray(goal_joints, float),
-                     goal_source="joint_target_K_variant", info=info)
-        self.trajectories.setdefault(self.seam_id, []).append(entry)
+                     goal_source="joint_target_K_variant", info=info,
+                     observe=observe, goal=goal)
+        self.add_trajectory_entry(entry)
+        key = self._trajectory_key()
         print(f"[scene] plan_explore_path 完成：status={status} 路点={len(positions)} "
-              f"（当前焊缝第 {len(self.trajectories[self.seam_id])} 条轨迹）")
+              f"（当前 init pose{key} 第 {len(self.trajectories[self.seam_id][key])} 段）")
         return entry
 
     def _build_explore_world(self, include_obstacles: bool = True, device: str = None) -> dict:

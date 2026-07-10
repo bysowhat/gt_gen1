@@ -86,7 +86,7 @@ def _launch_viz_subprocess(scene, traj, cur_cfg, target_cfg, scene_out, headless
     entry = dict(positions=positions, status="reached",
                  cur_joints=np.asarray(cur_cfg, float), goal_joints=np.asarray(target_cfg, float),
                  goal_source="plan_two_cfgs_scene", goal_index=0, variant=0)
-    scene.trajectories.setdefault(scene.seam_id, []).append(entry)
+    scene.add_trajectory_entry(entry)
     scene.save(scene_out)
     print(f"轨迹已追加进 scene 并存盘：{scene_out}（{len(positions)} 点）")
 

@@ -629,7 +629,10 @@ class Open3DSceneVisualizer(SceneVisualizer):
         o3d.visualization.draw_geometries(geoms, window_name=f"seam #{sid}")
 
     def show_scene_isaacsim(self, headless: bool = False, goal_variant: int = 0,
-                            trajectory=None, fps: int = 30, goal_arm_index: list = None):
+                            trajectory=None, fps: int = 30, goal_arm_index: list = None,
+                            observe=None, goal=None, flash_peak: float = 6e4,
+                            flash_decay: int = None, goal_hold: int = None,
+                            base_intensity: float = 250.0):
         """用 **isaacsim** 可视化当前 3D 场景：工件 + 障碍物（如有）+ 机械臂 + goal pose（如有）+ 当前焊缝红线（如有）。
 
         两种坐标系，取决于是否已 Scene.set_init_pose(hand, index) 选定当前 init pose：
@@ -643,6 +646,16 @@ class Open3DSceneVisualizer(SceneVisualizer):
         trajectory（可选，(T,DOF) 关节角序列，仅 base 系有意义）：给定则机械臂沿该序列【逐帧回放】
         （首尾各补 30 帧静止、播完保持 fps*2 帧后循环），用于看 plan_explore_path 的边走边看 GT；
         None 时保持原静态显示。fps=回放帧率。一般经 show_trajectory_isaacsim 转调，不直接传。
+
+        observe / goal（可选，各 (T,) 或 (T,1) 的 0/1，与 trajectory 逐行对齐；merge_trajectory_entries 产出）：
+          给定则进入【闪光回放】模式——基础照明压暗（不用 Grey Studio，改一盏低强度 DomeLight，
+          intensity=base_intensity），在每个 goal 相机位姿处各放一盏 UsdLux.SphereLight（常态强度 0）。
+          · observe[t]==1（该帧拍照）→ 对应 goal 相机的闪光灯瞬间拉到 flash_peak 白光，随后 flash_decay
+            帧内线性衰减 → 相机位处爆闪（闪光从观测相机发出）。
+          · goal[t]==1（着到某观测位姿那一刻）→ 机械臂在此【停顿 goal_hold 帧】，同时把该观测位姿的视锥
+            染白高亮，便于肉眼确认"到位"，停顿结束再继续。
+          闪光相机由 goal 列累计计数映射（第 n 个 goal==1 → 第 n 个视锥/相机）。flash_decay 缺省=fps//4，
+          goal_hold 缺省=fps//2。无 goal 视锥（未 compute_goal_pose）时不闪光，仅普通回放。
 
         障碍以 Box 原语（open_box）与棱柱/圆筒 mesh（遮挡板 / open_cylinder）两种形态渲染，颜色取各
         ObstacleSpec.color。须在【未初始化 curobo/torch】的干净进程里调用（SimulationApp 要最先启动）。
@@ -708,7 +721,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         from omni.isaac.core.utils.stage import add_reference_to_stage
         from omni.isaac.core.prims import XFormPrim
         import omni.usd
-        from pxr import Usd, UsdGeom, UsdPhysics, Gf
+        from pxr import Usd, UsdGeom, UsdPhysics, UsdLux, Gf
         from scipy.spatial.transform import Rotation as Rsp
 
         def _compose_pose7(pose7):
@@ -755,7 +768,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
             seg = p1 - p0
             L = float(np.linalg.norm(seg))
             if L < 1e-9:
-                return
+                return None
             d_hat = seg / L
             z = np.array([0.0, 0.0, 1.0])
             v = np.cross(z, d_hat); s = float(np.linalg.norm(v)); c = float(np.dot(z, d_hat))
@@ -768,6 +781,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
             _cuboid.VisualCuboid(prim_path=path, name=name, position=(p0 + p1) / 2.0,
                                  orientation=np.r_[quat[3], quat[:3]], size=1.0,
                                  scale=np.array([thick, thick, L]), color=np.asarray(color, float))
+            return path
 
         def spawn_seam_line(prefix, name0, seam_pts, color=(1.0, 0.0, 0.0), thick=0.01):
             """seam_pts 已在渲染系。"""
@@ -840,11 +854,37 @@ class Open3DSceneVisualizer(SceneVisualizer):
             apex = np.asarray(pos_w, float)
             nw = apex + near @ R_w.T
             fw = apex + far @ R_w.T
+            segs = []
             for k in range(4):
-                spawn_segment(f"{prefix}/near{k}", f"g{idx}_near{k}", nw[k], nw[(k + 1) % 4], color, 0.004)
-                spawn_segment(f"{prefix}/far{k}", f"g{idx}_far{k}", fw[k], fw[(k + 1) % 4], color, 0.004)
-                spawn_segment(f"{prefix}/side{k}", f"g{idx}_side{k}", nw[k], fw[k], color, 0.004)
-                spawn_segment(f"{prefix}/apex{k}", f"g{idx}_apex{k}", apex, nw[k], color, 0.004)
+                segs.append(spawn_segment(f"{prefix}/near{k}", f"g{idx}_near{k}", nw[k], nw[(k + 1) % 4], color, 0.004))
+                segs.append(spawn_segment(f"{prefix}/far{k}", f"g{idx}_far{k}", fw[k], fw[(k + 1) % 4], color, 0.004))
+                segs.append(spawn_segment(f"{prefix}/side{k}", f"g{idx}_side{k}", nw[k], fw[k], color, 0.004))
+                segs.append(spawn_segment(f"{prefix}/apex{k}", f"g{idx}_apex{k}", apex, nw[k], color, 0.004))
+            return [s for s in segs if s]
+
+        def spawn_flash_light(path, pos_w, radius=0.05):
+            """在 goal 相机位姿处放一盏球形闪光灯（常态 intensity=0，回放时逐帧驱动）。返回 light schema。"""
+            stage = omni.usd.get_context().get_stage()
+            light = UsdLux.SphereLight.Define(stage, path)
+            light.CreateRadiusAttr(float(radius))
+            light.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+            light.CreateIntensityAttr(0.0)
+            # 屏蔽外壳几何、只当发光体（避免遮挡视锥）
+            try:
+                UsdGeom.Imageable(light.GetPrim()).CreateVisibilityAttr("inherited")
+            except Exception:
+                pass
+            XFormPrim(path).set_world_pose(position=np.asarray(pos_w, float).tolist())
+            return light
+
+        def set_segs_color(seg_paths, color):
+            """把一组线段（视锥）的 DisplayColor 改成 color——用于 goal 到达时高亮。"""
+            stage = omni.usd.get_context().get_stage()
+            c = [Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))]
+            for p in seg_paths:
+                pr = stage.GetPrimAtPath(p)
+                if pr and pr.IsValid():
+                    UsdGeom.Gprim(pr).GetDisplayColorAttr().Set(c)
 
         print(f"工件     : {scene.workpiece_obj}")
         print(f"当前 init pose : " + ("候选#%d（base 系，含机械臂 retract）" % scene.cur_init_index
@@ -916,6 +956,9 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         # goal pose 视锥（仅 base 系且已 compute_goal_pose）：gk 选 K 变体
         n_goal = 0
+        frustum_segs = []          # 每个 goal 视锥的线段路径（闪光回放时高亮用）
+        frustum_base_color = []    # 各视锥原色（高亮后复原）
+        flash_lights = []          # 每个 goal 相机位姿处的球形闪光灯
         if base_frame and scene.goal_poses.get(scene.seam_id) is not None:
             res = scene.goal_poses[scene.seam_id]                # 单个 dict
             near, far = _fov_corners()
@@ -929,8 +972,11 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 p7 = _compose_pose7(seq[i])                          # piece→base
                 R_w = Rsp.from_quat([p7[4], p7[5], p7[6], p7[3]]).as_matrix()
                 t = 0.0 if B <= 1 else i / (B - 1)
-                spawn_frustum(f"/World/goal/c{i}", i, p7[:3], R_w, near, far, [t, 1.0, 1.0 - t])
+                col = [t, 1.0, 1.0 - t]
+                frustum_segs.append(spawn_frustum(f"/World/goal/c{i}", i, p7[:3], R_w, near, far, col))
+                frustum_base_color.append(col)
                 spawn_camera(f"/World/goal/cam{i}", p7[:3], R_w, half_w, half_h, near_z, far_z)
+                flash_lights.append(spawn_flash_light(f"/World/goal/flash{i}", p7[:3]))
             n_goal = B
         print(f"goal pose : " + (f"{n_goal} 个观测视锥（青→黄）+ {n_goal} 个真实相机"
                                   if n_goal else "无（未 compute_goal_pose 或非 base 系）"))
@@ -959,6 +1005,25 @@ class Open3DSceneVisualizer(SceneVisualizer):
         # 再否则 retract 起始角（idx_list 供回放复用）。
         n_dof = len(scene.cfg.joint_names)
         traj = None if trajectory is None else np.asarray(trajectory, float).reshape(-1, n_dof)
+
+        # —— 闪光回放：解析 observe/goal（各 (T,) 0/1，与 traj 逐行对齐），映射每行归属的 goal 相机 ——
+        observe_row = None if observe is None else np.asarray(observe, np.int64).reshape(-1)
+        goal_row = None if goal is None else np.asarray(goal, np.int64).reshape(-1)
+        flash_mode = (traj is not None and len(flash_lights) > 0 and
+                      (observe_row is not None or goal_row is not None))
+        cam_of_row = None       # 每行归属 goal 相机下标（第 n 个 goal==1 → 相机 n）
+        if flash_mode:
+            n_rows = traj.shape[0]
+            if observe_row is None:
+                observe_row = np.zeros(n_rows, np.int64)
+            if goal_row is None:
+                goal_row = np.zeros(n_rows, np.int64)
+            observe_row = observe_row[:n_rows]; goal_row = goal_row[:n_rows]
+            gcum = np.cumsum(goal_row) - 1                     # -1=首个 goal 之前
+            cam_of_row = np.clip(gcum, 0, len(flash_lights) - 1)
+            fdecay = int(flash_decay) if flash_decay else max(1, int(fps) // 4)
+            fhold = int(goal_hold) if goal_hold else max(1, int(fps) // 2)
+
         idx_list = None
         if robot is not None:
             try:
@@ -985,13 +1050,87 @@ class Open3DSceneVisualizer(SceneVisualizer):
             simulation_app.close()
             return
 
-        try:
-            from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
-            _set_lighting_mode("Grey Studio")
-        except Exception:
-            pass
+        # 灯光：闪光回放时压暗（换一盏低强度 DomeLight，让爆闪明显）；否则沿用 Grey Studio。
+        if flash_mode:
+            try:
+                stg = omni.usd.get_context().get_stage()
+                # 先把已有灯光（默认 distant/dome 等）压到极低，避免盖过爆闪；自家灯不动
+                for pr in stg.Traverse():
+                    p = pr.GetPath().pathString
+                    if p.startswith("/World/goal/flash") or p == "/World/flashBaseDome":
+                        continue
+                    if pr.HasAPI(UsdLux.LightAPI) or pr.GetTypeName() in (
+                            "DistantLight", "DomeLight", "SphereLight", "RectLight",
+                            "DiskLight", "CylinderLight"):
+                        try:
+                            UsdLux.LightAPI(pr).GetIntensityAttr().Set(0.0)
+                        except Exception:
+                            pass
+                dome = UsdLux.DomeLight.Define(stg, "/World/flashBaseDome")
+                dome.CreateIntensityAttr(float(base_intensity))
+                dome.CreateColorAttr(Gf.Vec3f(0.8, 0.85, 1.0))     # 略偏冷，衬托白色爆闪
+            except Exception as e:
+                print(f"[viz] 压暗基础照明失败（忽略）: {e}")
+        else:
+            try:
+                from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
+                _set_lighting_mode("Grey Studio")
+            except Exception:
+                pass
 
-        # —— 有轨迹：逐帧回放（首尾补静止帧、播完保持后循环）——
+        # —— 闪光回放：机械臂沿 GT 逐帧运动，observe 帧相机爆闪、goal 帧停顿+视锥高亮 ——
+        if flash_mode and robot is not None and idx_list is not None:
+            pad = np.concatenate([np.tile(traj[0][None], (30, 1)), traj,
+                                  np.tile(traj[-1][None], (30, 1))], axis=0)
+            nL = len(flash_lights)
+            n_rows = traj.shape[0]
+            print(f"闪光回放（{pad.shape[0]} 帧，含首尾静止）：observe→相机位爆闪、goal→停顿{fhold}帧+视锥高亮。"
+                  f"观测帧 {int(observe_row.sum())} 个、goal 到达 {int(goal_row.sum())} 个。关闭窗口结束。")
+            i = 0                     # pad 索引
+            prev_r = -999             # 上一处理的 traj 行（防 hold 期间重复触发）
+            hold_remaining = 0
+            held_cam = -1
+            flash_timer = np.zeros(nL, float)
+            end_hold = 0
+            while simulation_app.is_running():
+                # 每渲染帧驱动闪光灯强度（线性衰减）
+                for c in range(nL):
+                    inten = flash_peak * (flash_timer[c] / fdecay) if flash_timer[c] > 0 else 0.0
+                    flash_lights[c].GetIntensityAttr().Set(float(inten))
+                    if flash_timer[c] > 0:
+                        flash_timer[c] -= 1
+                world.step(render=True)
+                if not world.is_playing():
+                    continue
+                if i < pad.shape[0]:
+                    robot.set_joint_positions(pad[i], idx_list)
+                    r = i - 30                                    # 对应 traj 行（<0 或 >=n_rows 为首尾静止）
+                    if 0 <= r < n_rows and r != prev_r:           # 刚进入一条新 traj 行才触发
+                        if observe_row[r] == 1:
+                            flash_timer[int(cam_of_row[r])] = fdecay
+                            print(f"[flash] frame {r}: OBSERVE 相机#{int(cam_of_row[r])} 爆闪")
+                        if goal_row[r] == 1:
+                            held_cam = int(cam_of_row[r])
+                            set_segs_color(frustum_segs[held_cam], [1.0, 1.0, 1.0])
+                            hold_remaining = fhold
+                            print(f"[flash] frame {r}: GOAL#{held_cam} 到达 → 停顿+视锥高亮")
+                        prev_r = r
+                    if hold_remaining > 0:                         # 停顿：不推进 i，机械臂停在 goal
+                        hold_remaining -= 1
+                        if hold_remaining == 0 and held_cam >= 0:
+                            set_segs_color(frustum_segs[held_cam], frustum_base_color[held_cam])
+                            held_cam = -1
+                    else:
+                        i += 1
+                else:
+                    end_hold += 1
+                    if end_hold > int(fps) * 2:                    # 播完保持 2s 后循环
+                        i = 0; prev_r = -999; end_hold = 0
+                        flash_timer[:] = 0.0
+            simulation_app.close()
+            return
+
+        # —— 普通轨迹回放（无 observe/goal 或无 goal 视锥）：逐帧回放（首尾补静止帧、播完循环）——
         if traj is not None and robot is not None and idx_list is not None:
             pad = np.concatenate([np.tile(traj[0][None], (30, 1)), traj,
                                   np.tile(traj[-1][None], (30, 1))], axis=0)
@@ -1094,7 +1233,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         from omni.isaac.core.utils.stage import add_reference_to_stage
         from omni.isaac.core.prims import XFormPrim
         import omni.usd
-        from pxr import Usd, UsdGeom, UsdPhysics, Gf
+        from pxr import Usd, UsdGeom, UsdPhysics, UsdLux, Gf
         from scipy.spatial.transform import Rotation as Rsp
 
         # —— spawn 辅助（与 T 无关的直接照搬 show_scene_isaacsim；T 相关的把 R_T/t_T 作参数传入）——
@@ -1132,7 +1271,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
             seg = p1 - p0
             L = float(np.linalg.norm(seg))
             if L < 1e-9:
-                return
+                return None
             d_hat = seg / L
             z = np.array([0.0, 0.0, 1.0])
             v = np.cross(z, d_hat); s = float(np.linalg.norm(v)); c = float(np.dot(z, d_hat))
@@ -1145,6 +1284,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
             _cuboid.VisualCuboid(prim_path=path, name=name, position=(p0 + p1) / 2.0,
                                  orientation=np.r_[quat[3], quat[:3]], size=1.0,
                                  scale=np.array([thick, thick, L]), color=np.asarray(color, float))
+            return path
 
         def spawn_seam_line(prefix, name0, seam_pts, color=(1.0, 0.0, 0.0), thick=0.01):
             for si in range(len(seam_pts) - 1):
@@ -1281,37 +1421,60 @@ class Open3DSceneVisualizer(SceneVisualizer):
         simulation_app.close()
 
     def show_trajectory_isaacsim(self, traj_index: int = -1, headless: bool = False,
-                                 fps: int = 30, goal_variant: int = 0):
+                                 fps: int = 30, goal_variant: int = 0,
+                                 flash_peak: float = 6e4, flash_decay: int = None,
+                                 goal_hold: int = None, base_intensity: float = 250.0):
         """用 **isaacsim** 回放【边走边看轨迹】（Scene.plan_explore_path 产出）。
 
         base 系里机械臂沿 GT 关节序列逐帧运动，同屏显示工件 + 障碍物 + goal 观测视锥/真实相机
         （复用 show_scene_isaacsim(trajectory=...)，故场景摆放与那套完全一致）。参考 launch.json 的
-        viz_placed_obstacle_isaacsim：首尾补静止帧、播完循环重播。
+        viz_placed_obstacle_isaacsim：首尾补静止帧、播完循环重播。会自动 set_init_pose 到该轨迹实际
+        所属的 (手别,候选下标)，并还原该候选当时的 goal_poses 快照，故工件摆放/焊缝/视锥与所选轨迹一致
+        （不依赖调用前 scene.cur_init_hand/index 恰好是哪个候选）。
 
         前提：先 plan_explore_path（其内部要求已 set_init_pose，故必为 base 系、会画机械臂）。跨进程时
         先 Scene.save→另起干净进程 Scene.load 再调用（compute/plan 会污染 warp，见 save/load 说明）。
 
         参数：
-          traj_index  : self.scene.trajectories 里第几条（默认 -1=最新；支持负索引）。
+          traj_index  : 把 self.scene.trajectories[seam_id] 里各 init pose(手别,候选下标) 下的 list
+                        按 key 插入顺序拼成一个扁平列表后，取第几条（默认 -1=最新；支持负索引）。
           headless    : 无显示器自检（spawn+跑几帧即退，打印路点数 + VIZ_SCENE_DONE）。
           fps         : 回放帧率。
           goal_variant: 画 goal 视锥用 cam_pose 的第几个变体 K（默认 0）。
+          flash_peak / flash_decay / goal_hold / base_intensity:
+              闪光回放参数——爆闪峰值强度 / 衰减帧数(缺省 fps//4) / goal 停顿帧数(缺省 fps//2) /
+              压暗后基础 DomeLight 强度。entry 里有 observe/goal 时自动进入闪光模式（见 show_scene_isaacsim）。
         """
         import numpy as np
 
-        trajs = list(self.scene.trajectories.get(self.scene.seam_id, []))
+        scene = self.scene
+        traj_map = scene.trajectories.get(scene.seam_id, {})
+        trajs = [(key, e) for key, lst in traj_map.items() for e in lst]
         if not trajs:
             raise RuntimeError("无可回放轨迹：请先 Scene.plan_explore_path()")
         n = len(trajs)
         if not (-n <= int(traj_index) < n):
             raise IndexError(f"traj_index 越界：{traj_index}，共 {n} 条轨迹")
-        entry = trajs[int(traj_index)]
+        key, entry = trajs[int(traj_index)]
         positions = np.asarray(entry["positions"], float)
-        print(f"[viz] 回放轨迹 #{int(traj_index) % n}/{n}：status={entry.get('status')} "
-              f"路点={len(positions)} goal=观测位姿#{entry.get('goal_index')}"
+        observe = entry.get("observe")
+        goal = entry.get("goal")
+        print(f"[viz] 回放轨迹 #{int(traj_index) % n}/{n}：init pose={key[0]}#{key[1]} "
+              f"status={entry.get('status')} 路点={len(positions)} goal=观测位姿#{entry.get('goal_index')}"
               f"（变体#{entry.get('variant')}）")
+
+        # 切到该轨迹实际所属的 init pose，并还原它当时的 goal_poses（视锥）快照——
+        # 否则工件摆放/焊缝/视锥会停在 scene 当前的 cur_init_hand/index（多手别依次计算时，
+        # 那始终是最后一次 compute_pose_and_plan_path 的候选，与本条轨迹不一致）。
+        scene.set_init_pose(*key)
+        snap = scene.trajectory_goal_poses.get(scene.seam_id, {}).get(key)
+        if snap is not None:
+            scene.goal_poses[scene.seam_id] = snap
         self.show_scene_isaacsim(headless=headless, goal_variant=goal_variant,
-                                 trajectory=positions, fps=fps)
+                                 trajectory=positions, fps=fps,
+                                 observe=observe, goal=goal, flash_peak=flash_peak,
+                                 flash_decay=flash_decay, goal_hold=goal_hold,
+                                 base_intensity=base_intensity)
 
 
 class IsaacSimSceneVisualizer(SceneVisualizer):

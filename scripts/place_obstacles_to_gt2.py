@@ -149,7 +149,7 @@ def run(args):
                  variant=dbg["variant"], cur_joints=np.asarray(start, float),
                  goal_joints=np.asarray(goal_joints, float), goal_source="joint_target_K_variant",
                  info=info)
-    scene.trajectories.setdefault(scene.seam_id, []).append(entry)
+    scene.add_trajectory_entry(entry)
     out = args.out or (os.path.splitext(args.scene)[0] + "_gt.pkl")
     scene.save(out)
     print(f"\nPLACE_OBSTACLES_TO_GT2_{'OK' if status == 'reached' else 'PARTIAL'} "
