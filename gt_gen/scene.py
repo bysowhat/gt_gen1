@@ -336,6 +336,9 @@ class Scene:
         # 每焊缝下再按手别分组，每组各自按【工件平移 xyz 差异】独立分数降序（差异大的排前面），两组互不混排。
         self.init_pose_candidates: Dict[int, Dict[str, List[InitPoseCandidate]]] = {}
         self.init_pose_candidates_length: Dict[int, Dict[str, int]] = {}
+        # {seam_id: [step1,…,step8]}：plan_init_pose 逐步过滤每步【通过】的候选（raw 结果 dict），
+        # 供 Open3DSceneVisualizer.show_init_poses_debug(n) 单步可视化。每次 plan_init_pose 覆盖本 seam。
+        self.init_pose_debug_steps: Dict[int, List[List[dict]]] = {}
         self.cur_init_pose: Optional[InitPoseCandidate] = None    # 当前选定的 init pose 候选（set_init_pose 设定）——定义工件↔base 摆放
         self.cur_init_hand: Optional[str] = None                  # 当前候选所属手别（"forehand"/"backhand"）
         self.cur_init_index: Optional[int] = None                 # 当前候选在【该手别列表】中的下标
@@ -441,6 +444,18 @@ class Scene:
                              注：逐步过滤候选计数（① lookup→…→⑧ 复检→合格）无条件打印，不受此开关影响。
 
         返回：候选 dict {"forehand":[...], "backhand":[...]}（各组可能为空=该手别无合格解）。
+
+
+        过滤步骤：
+        ① lookup 候选（绕末端轴 13×5×5 采样） : 4834
+        ② 工作空间 + 朝向snap 命中            : 4834 → 446
+        ③ 正面过滤(bisector base-z≥0)        : 446 → 317（背面丢 129）
+        ④ 焊缝中心 base-x>0                   : 317 → 313（x≤0 丢 4）
+        # 废弃 ⑤ 工件+障碍 vs init_free 空间无交集   : 313 → 0（相交丢 313）
+        ⑤ 工件+障碍 vs init_free 空间无交集
+        ⑥ 底座-工件 XY 投影不相交            : 0 → 0（相交丢 0）
+        ⑦ 轻去重(同朝向 + 2cm 同位)          : 0 → 0（重复丢 0）
+        ⑧ snap后 retract-工件无碰撞复检      : 0 → 0（碰撞丢                           
         """
         if not self.workpiece_obj:
             raise ValueError("plan_init_pose 需要 workpiece_obj（工件 mesh）")
@@ -463,7 +478,24 @@ class Scene:
             solver._build_robot_world()
             self._k2ctx_injected = False
 
-        res, _prof = pim._kejian2_solve_weld(self._k2ctx, self.seam, verbose=verbose)
+        # —— ⑤「工件+障碍 vs init_free 起步空间无交集」过滤的障碍点云（piece/mesh 系，与工件同框、同 T） ——
+        #   取碰撞实体障碍（_obstacle_solid_trimeshes，与注入 solver 的同源；open_cylinder 纯视觉不计），
+        #   按 plan_init_workpiece_x_voxel 体素化成稠密点。每次都重设（含 None），避免上一条焊缝的障碍点残留。
+        obs_pts = None
+        if want_obs:
+            chunks = []
+            for tm in self._obstacle_solid_trimeshes():
+                p = pim._voxelize_mesh_points(np.asarray(tm.vertices, dtype=np.float64),
+                                              np.asarray(tm.faces, dtype=np.int64).reshape(-1, 3),
+                                              self.cfg.plan_init_workpiece_x_voxel)
+                if p is not None and len(p):
+                    chunks.append(np.asarray(p, dtype=np.float64))
+            if chunks:
+                obs_pts = np.concatenate(chunks, axis=0)
+        self._k2ctx["init_free_obstacle_pts"] = obs_pts
+
+        res, _prof, debug_steps = pim._kejian2_solve_weld(self._k2ctx, self.seam, verbose=verbose)
+        self.init_pose_debug_steps[self.seam_id] = debug_steps   # 逐步过滤每步通过候选（覆盖本 seam，供 show_init_poses_debug）
 
         # 正反手分组返回（不做数量上限挑选）：每组各自按工件平移 xyz 差异独立分数降序
         fore = [InitPoseCandidate.from_kejian2(d) for d in res.get("forehand", [])]
@@ -734,6 +766,7 @@ class Scene:
             goal_user=self.goal_user,
             cur_cfg=list(self.cur_cfg),
             init_pose_candidates=self.init_pose_candidates,   # {seam_id: {"forehand":[...],"backhand":[...]}}（InitPoseCandidate dataclass）
+            init_pose_debug_steps=self.init_pose_debug_steps,  # {seam_id: [step1..step8]} 逐步过滤每步通过候选（raw dict）
             cur_init_pose=self.cur_init_pose,
             cur_init_hand=self.cur_init_hand,
             cur_init_index=self.cur_init_index,
@@ -782,6 +815,7 @@ class Scene:
         self.goal_user = state.get("goal_user")
         self.cur_cfg = list(state.get("cur_cfg", self.cur_cfg))
         self.init_pose_candidates = state.get("init_pose_candidates", {}) or {}
+        self.init_pose_debug_steps = state.get("init_pose_debug_steps", {}) or {}
         self.cur_init_pose = state.get("cur_init_pose")
         self.cur_init_hand = state.get("cur_init_hand",
                                        getattr(self.cur_init_pose, "hand", None))
@@ -1317,9 +1351,31 @@ class Scene:
         mesh = _prism_mesh(anchor, R, profile, thickness, color)
         spec = ObstacleSpec(
             otype=2, kind=shape, meshes=[mesh], seam_line=seam_line, color=color,
-            meta=dict(candidate="C1", anchor=anchor, R=R, width=width,
-                      length=length, thickness=thickness))
+            meta=dict(candidate="C1", anchor=anchor, R=R, b_dir=b_dir, n_cm=float(p["n_cm"]),
+                      width=width, length=length, thickness=thickness))
         self.obstacles.setdefault(self.seam_id, []).append(spec)
+        return spec
+
+    def grow_obstacle_n(self, n_cm: float, spec: Optional[ObstacleSpec] = None) -> ObstacleSpec:
+        """把已放的【类型2遮挡板】沿离缝方向 b_dir 再抬高 n_cm（cm）——等价于把创建时的 n_cm 增大 n_cm。
+
+        n_cm 可正可负：正=沿 b_dir 抬远离缝，负=沿 -b_dir 靠近焊缝。直接平移该障碍全部网格顶点
+        delta=n_cm/100 米（沿 meta['b_dir']），并同步更新 meta 的 anchor / n_cm。spec 缺省取当前
+        焊缝最后放入的障碍。仅适用类型2（meta 含 b_dir/anchor）。
+        """
+        if spec is None:
+            lst = self.obstacles.get(self.seam_id, [])
+            if not lst:
+                raise RuntimeError(f"焊缝 {self.seam_id} 尚无障碍，无法调整 n_cm")
+            spec = lst[-1]
+        meta = spec.meta or {}
+        if "b_dir" not in meta or "anchor" not in meta:
+            raise RuntimeError("该障碍无 b_dir/anchor（仅类型2遮挡板支持增大 n_cm）")
+        shift = (float(n_cm) / 100.0) * np.asarray(meta["b_dir"], float)
+        for m in spec.meshes:                              # 平移全部网格顶点
+            m["points"] = np.asarray(m["points"], float) + shift
+        meta["anchor"] = np.asarray(meta["anchor"], float) + shift
+        meta["n_cm"] = float(meta.get("n_cm", 0.0)) + float(n_cm)
         return spec
 
     def _box_geom_type3(self, dis_m):

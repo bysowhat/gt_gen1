@@ -12,6 +12,7 @@ scripts/plan_init_pose.py 的 show_lookup_solutions（整臂碰撞球 + init_fre
   · Open3DSceneVisualizer.show_seam()            —— open3d 看指定焊缝：工件 + 焊缝红线 + 障碍物
   · Open3DSceneVisualizer.show_init_poses()      —— 逐个看 Scene 的候选初始位姿（按 C 切下一个）
   · Open3DSceneVisualizer.show_scene_isaacsim()  —— 用 isaacsim 可视化当前 3D 场景（工件 + 焊缝 + 障碍物类型2/3）
+  · Open3DSceneVisualizer.show_joint_table_ee()  —— open3d 看关节表(.pt)落在 ee_xy/ee_z 范围内的末端 xyz 点云
 
 后续补充（占位）：3D 世界 / 机械臂 / 焊缝 / 已观测区域 等的 open3d & isaacsim 可视化。
 """
@@ -264,6 +265,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
             factories.append(self._obstacle_o3d_factory())
         if show_init_arm:
             factories.append(self._init_arm_o3d_factory(init_joints))
+        factories.append(self._init_free_o3d_factory())
         extra = None
         if factories:
             def extra(R, t, _fs=factories):
@@ -274,6 +276,171 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
                                   stride=stride, extra_geoms=extra)
+
+    # 逐步过滤 8 个步骤的名字（与 plan_init_pose._kejian2_solve_weld 打印口径一致，n 从 1 起）
+    _DEBUG_STEP_NAMES = [
+        "① lookup 候选（绕末端轴采样）",
+        "② 工作空间 + 朝向snap 命中",
+        "③ 正面过滤(bisector base-z≥0)",
+        "④ 焊缝中心 base-x>0",
+        "⑤ 工件+障碍 vs init_free 空间无交集",
+        "⑥ 底座-工件 XY 投影不相交",
+        "⑦ 轻去重(同朝向 + 2cm 同位)",
+        "⑧ snap后 retract-工件无碰撞复检（合格）",
+    ]
+
+    def show_init_poses_debug(self, n: int, stride: int = 1,
+                              show_init_arm: bool = True, init_joints=None,
+                              sort_by_seam_x: bool = True):
+        """可视化【逐步过滤第 n 步通过】的候选位姿（n=1..8），其余可视化与 show_init_poses 完全一致。
+
+        n 对应 _kejian2_solve_weld 打印的 8 个步骤（见 _DEBUG_STEP_NAMES）：
+          1=lookup 原始候选(未 snap)、2=工作空间+朝向 snap、3=正面过滤、4=焊缝中心 base-x>0、
+          5=工件最近点、6=底座-工件 XY 不相交、7=轻去重后(复检前)、8=复检后合格。
+        前提：先调用 Scene.plan_init_pose()（求解成功后自动把逐步候选存进 scene.init_pose_debug_steps）。
+        与 show_init_poses 一致：正手→反手依次开窗，工件 mesh + 焊缝/中点 + standoff 落点 + 蓝色
+        bisector 轴 + 焊接位姿整臂碰撞球（红），障碍随工件摆放、初始关节角机械臂碰撞球(异色)一并叠加；
+        按 C 切下一个、直接关窗退出。stride：每隔几个抽 1 个。
+        sort_by_seam_x：True 时每手候选按【焊缝中点在 base-x 分量（seam_center_base[0]）】从大到小排序后再开窗。"""
+        scene = self.scene
+        steps = scene.init_pose_debug_steps.get(scene.seam_id)
+        if not steps:
+            raise RuntimeError(
+                "无逐步 debug 候选：请先调用 Scene.plan_init_pose()（且求解成功）")
+        n = int(n)
+        if not (1 <= n <= len(steps)):
+            raise ValueError(f"n 需在 1..{len(steps)}（8 个过滤步骤），收到 {n}")
+        step_list = steps[n - 1]
+        name = self._DEBUG_STEP_NAMES[n - 1]
+        if not step_list:
+            raise RuntimeError(f"第 {n} 步「{name}」无通过候选（0 个），无可视化")
+        pim = _load_plan_init_pose()
+        # 按 hand 分组喂 _show_kejian2_results（该函数依 forehand→backhand 顺序开窗）；debug 存的
+        # 就是 raw 结果 dict（含 T_workpiece_in_base/joint_angles/bisector_base/… 可视化所需字段），
+        # 无需 .raw / from_kejian2，直接使用。
+        res = {"forehand": [c for c in step_list if c.get("hand") == "forehand"],
+               "backhand": [c for c in step_list if c.get("hand") == "backhand"]}
+
+        if sort_by_seam_x:
+            def _seam_x(c):
+                sc = c.get("seam_center_base")
+                return float(sc[0]) if sc is not None else float("-inf")
+            for _h in ("forehand", "backhand"):
+                res[_h].sort(key=_seam_x, reverse=True)
+
+        # extra_geoms 钩子：与 show_init_poses 相同（障碍随工件摆放 + 初始关节角机械臂碰撞球）
+        factories = []
+        if scene.obstacles.get(scene.seam_id):
+            factories.append(self._obstacle_o3d_factory())
+        if show_init_arm:
+            factories.append(self._init_arm_o3d_factory(init_joints))
+        factories.append(self._init_free_o3d_factory())
+        extra = None
+        if factories:
+            def extra(R, t, _fs=factories):
+                geoms = []
+                for f in _fs:
+                    geoms.extend(f(R, t))
+                return geoms
+
+        print(f"[viz] 逐步过滤第 {n} 步「{name}」通过候选 {len(step_list)} 个"
+              f"（正手 {len(res['forehand'])} / 反手 {len(res['backhand'])}）")
+        pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
+                                  stride=stride, extra_geoms=extra)
+
+    def show_joint_table_ee(self, path=None, show_out_of_range: bool = True,
+                            show_range_shell: bool = True, show_init_arm: bool = True):
+        """open3d 可视化【预计算关节表】(configs/plan_init_joint_table.pt) 里落在工作空间范围内的
+        末端 xyz 点云（需 env_isaaclab 环境：装了 open3d + torch）。
+
+        关节表由 precompute_joint_table 产出（与工件无关的 n^dof 关节采样），其中 ee_pos_t 是各采样
+        关节角对应【焊枪末端 tip_link 在 base_link 系的位置】。本方法按 default.yaml plan_init_pose 的
+        两组范围过滤并画成点云：
+          · ee_xy_range_m=[lo,hi]：末端在 base xy 平面到原点距离 ∈ [lo,hi]（径向环）；
+          · ee_z_range_m=[lo,hi]：末端 base-z ∈ [lo,hi]。
+        命中点画绿色；show_out_of_range=True 时其余末端画淡灰便于对照；叠加 base 坐标系；
+        show_range_shell=True 时叠加范围壳线框（内/外半径 xy_lo/xy_hi、z∈[z_lo,z_hi] 的两个竖直
+        圆柱，标出被过滤的环形区域）；show_init_arm=True 时叠加【初始关节角】(retract) 整臂碰撞球
+        线框（各 link 异色，见 _init_arm_o3d_factory），便于看末端点相对机械臂的位置。
+
+        path：关节表 .pt 路径，None→cfg.plan_init_joint_table_path（= default.yaml
+        plan_init_pose.joint_table_path，已解析为绝对路径）。
+        """
+        import os
+        import numpy as np
+        import open3d as o3d
+        import torch
+
+        cfg = self.scene.cfg
+        fp = path or cfg.plan_init_joint_table_path
+        if not os.path.isfile(fp):
+            raise FileNotFoundError(
+                f"关节表不存在：{fp}（请先 precompute_joint_table + save_joint_table）")
+        try:
+            payload = torch.load(fp, map_location="cpu", weights_only=False)
+        except TypeError:                               # 老版 torch 无 weights_only 形参
+            payload = torch.load(fp, map_location="cpu")
+        ee = np.asarray(payload["ee_pos_t"], dtype=float)   # (N,3) 末端在 base 系
+        if ee.ndim != 2 or ee.shape[1] != 3:
+            raise RuntimeError(f"ee_pos_t 形状异常：{ee.shape}（应为 (N,3)）")
+
+        xy = np.linalg.norm(ee[:, :2], axis=1)
+        z = ee[:, 2]
+        xy_lo, xy_hi = (float(v) for v in cfg.plan_init_ee_xy_range)
+        z_lo, z_hi = (float(v) for v in cfg.plan_init_ee_z_range)
+        in_mask = (xy >= xy_lo) & (xy <= xy_hi) & (z >= z_lo) & (z <= z_hi)
+        n_in = int(in_mask.sum())
+        print(f"[viz] 关节表末端点 {len(ee)} 个 <- {fp}")
+        print(f"[viz] 范围内 {n_in} 个（xy∈[{xy_lo:.3f},{xy_hi:.3f}] & "
+              f"z∈[{z_lo:.3f},{z_hi:.3f}]），范围外 {len(ee) - n_in} 个")
+        if n_in == 0:
+            raise RuntimeError("范围内末端点为 0：请放宽 ee_xy_range_m/ee_z_range_m 或检查关节表")
+
+        geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)]
+
+        if show_out_of_range and n_in < len(ee):
+            pc_out = o3d.geometry.PointCloud(
+                o3d.utility.Vector3dVector(ee[~in_mask]))
+            pc_out.paint_uniform_color([0.75, 0.75, 0.78])   # 淡灰
+            geoms.append(pc_out)
+
+        pc_in = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(ee[in_mask]))
+        pc_in.paint_uniform_color([0.10, 0.80, 0.20])        # 绿
+        geoms.append(pc_in)
+
+        if show_range_shell:
+            h = max(1e-4, z_hi - z_lo)
+
+            def _shell_cyl(radius):
+                cyl = o3d.geometry.TriangleMesh.create_cylinder(
+                    radius=max(radius, 1e-4), height=h, resolution=48)
+                cyl.translate((0.0, 0.0, (z_lo + z_hi) / 2.0))
+                ls = o3d.geometry.LineSet.create_from_triangle_mesh(cyl)
+                ls.paint_uniform_color([0.0, 0.55, 0.85])    # 蓝
+                return ls
+
+            geoms.append(_shell_cyl(xy_lo))
+            geoms.append(_shell_cyl(xy_hi))
+
+            # 断面「方形」：在若干角向画 [xy_lo,xy_hi]×[z_lo,z_hi] 的矩形环线，直观展示被过滤区域
+            for ang in np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False):
+                cx, cy = np.cos(ang), np.sin(ang)
+                pts = np.array([
+                    [xy_lo * cx, xy_lo * cy, z_lo], [xy_hi * cx, xy_hi * cy, z_lo],
+                    [xy_hi * cx, xy_hi * cy, z_hi], [xy_lo * cx, xy_lo * cy, z_hi],
+                ], dtype=float)
+                rect = o3d.geometry.LineSet(
+                    o3d.utility.Vector3dVector(pts),
+                    o3d.utility.Vector2iVector([[0, 1], [1, 2], [2, 3], [3, 0]]))
+                rect.paint_uniform_color([0.0, 0.55, 0.85])  # 蓝
+                geoms.append(rect)
+
+        if show_init_arm:
+            # 初始关节角(retract) 整臂碰撞球线框；臂固定在 base 系，(R,t) 无关，取 factory 缓存即可
+            geoms.extend(self._init_arm_o3d_factory()(None, None))
+
+        o3d.visualization.draw_geometries(
+            geoms, window_name=f"joint_table ee（范围内 {n_in}/{len(ee)}）")
 
     def _init_arm_o3d_factory(self, init_joints=None):
         """返回回调 (R,t)->list[o3d.geometry]：机械臂在【初始关节角】(retract，缺省 scene.cur_cfg)
@@ -321,6 +488,47 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         def _factory(R, t, _g=cached):
             return _g          # 臂固定在 base 系，与候选 (R,t) 无关
+
+        return _factory
+
+
+    def _init_free_o3d_factory(self):
+        """返回回调 (R,t)->list[o3d.geometry]：机械臂【初始 FREE 起步引导空间】（青色线框，base 系）。
+        按 cfg.init_free_method_for_init 选形状（与 Scene 起步 FREE 一致）：
+          box     → AABB 盒 [init_free_box_min_for_init, init_free_box_max_for_init]；
+          cylinder→ 轴过 base 原点(x=y=0)、底面 z=init_free_cyl_z_min、半径 init_free_cyl_radius、
+                    高 init_free_cyl_height 的竖直圆柱线框。
+        该空间固定在 base 系、与候选工件摆放 (R,t) 无关，故对所有候选返回同一几何。"""
+        import numpy as np
+        import open3d as o3d
+
+        cfg = self.scene.cfg
+        col = (0.0, 0.75, 0.75)
+        method = getattr(cfg, "init_free_method_for_init", "box")
+        cached = []
+        if method == "cylinder":
+            radius = float(cfg.init_free_cyl_radius)
+            height = float(cfg.init_free_cyl_height)
+            z_min = float(getattr(cfg, "init_free_cyl_z_min", -0.02))
+            cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=height,
+                                                            resolution=32)
+            cyl.translate((0.0, 0.0, z_min + height / 2.0))   # 底面落在 z_min
+            ls = o3d.geometry.LineSet.create_from_triangle_mesh(cyl)
+            ls.paint_uniform_color(col)
+            cached.append(ls)
+            print(f"[viz] init_free 圆柱（青色线框）：半径={radius:.3f}m 高={height:.3f}m "
+                  f"底面 z={z_min:.3f}（轴过 base 原点）")
+        else:
+            lo = np.asarray(cfg.init_free_box_min_for_init, float)
+            hi = np.asarray(cfg.init_free_box_max_for_init, float)
+            aabb = o3d.geometry.AxisAlignedBoundingBox(lo.tolist(), hi.tolist())
+            aabb.color = col
+            cached.append(aabb)
+            print(f"[viz] init_free 盒（青色线框）：min={np.round(lo, 3).tolist()} "
+                  f"max={np.round(hi, 3).tolist()} 尺寸={np.round(hi - lo, 3).tolist()}m")
+
+        def _factory(R, t, _g=cached):
+            return _g          # FREE 空间固定在 base 系，与候选 (R,t) 无关
 
         return _factory
 
@@ -627,6 +835,164 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         print(f"[viz] 焊缝#{sid}：工件 + 焊缝红线（p0→p1）+ {len(obstacles)} 个障碍")
         o3d.visualization.draw_geometries(geoms, window_name=f"seam #{sid}")
+
+    def show_seam_all_isaacsim(self, seam_ids=None, headless: bool = False, radius: float = None):
+        """用 **isaacsim** 一次性可视化【所有焊缝】：工件网格 + 每条焊缝一根【红色圆柱】。
+
+        每根焊缝圆柱的 prim 路径含 `seam{seam_id}`（如 `/World/seam3`），在 stage 树里一眼就能
+        分辨是哪条焊缝——无需在焊缝中心点画 id 文字。坐标系为【工件 mesh 系】（工件 identity 停放），
+        焊缝端点 p0_world/p1_world 与工件同框直接叠加。
+
+        ⚠ 工件 mesh 常停在远离世界原点处（如 x≈24、z≈12），而 isaacsim 默认相机看向原点，会让工件
+        显得又小又偏、焊缝圆柱也难找。故本方法会把视口相机自动对准【工件/焊缝包围盒中心】。
+
+        参数：
+          seam_ids : 只画给定 id 列表（默认 None=全部焊缝）。
+          headless : 无显示器自检（spawn 后跑几帧即退，打印摘要 + VIZ_SCENE_DONE）。
+          radius   : 焊缝圆柱半径（米）；None=按【场景尺度】自适应（约包围盒对角线的 0.4%，至少 2cm，
+                     保证在整件工件旁仍看得见）。
+
+        须在【未初始化 curobo/torch】的干净进程里调用（SimulationApp 要最先启动）。
+        """
+        import os
+        import numpy as np
+
+        scene = self.scene
+        seams = scene.seams
+        n = len(seams)
+        if n == 0:
+            raise RuntimeError("Scene 无焊缝可可视化")
+        ids = list(range(n)) if seam_ids is None else [int(i) % n for i in seam_ids]
+
+        # —— SimulationApp 必须最先启动（在 import omni 之前）——
+        try:
+            import isaacsim  # noqa: F401  注册 omni.* 模块路径
+        except ImportError:
+            pass
+        from omni.isaac.kit import SimulationApp
+        simulation_app = SimulationApp({"headless": bool(headless)})
+
+        from omni.isaac.core import World
+        from omni.isaac.core.utils.stage import add_reference_to_stage
+        from omni.isaac.core.prims import XFormPrim
+        from omni.isaac.core.utils.viewports import set_camera_view
+        import omni.usd
+        from pxr import Usd, UsdGeom, UsdPhysics, Gf
+        from scipy.spatial.transform import Rotation as Rsp
+
+        def spawn_obj_mesh(pth, obj_path):
+            import trimesh
+            tm = trimesh.load(obj_path, force="mesh")
+            verts = np.asarray(tm.vertices, float)
+            faces = np.asarray(tm.faces, np.int64).reshape(-1, 3)
+            stage = omni.usd.get_context().get_stage()
+            mesh = UsdGeom.Mesh.Define(stage, pth)
+            mesh.CreatePointsAttr([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in verts])
+            mesh.CreateFaceVertexCountsAttr([3] * len(faces))
+            mesh.CreateFaceVertexIndicesAttr(faces.flatten().tolist())
+            mesh.CreateDisplayColorAttr([Gf.Vec3f(0.72, 0.72, 0.72)])
+
+        def spawn_workpiece(pth, obj_path):
+            usd_obj = obj_path.replace("_watertight.obj", ".usd")
+            if not os.path.exists(usd_obj):
+                usd_obj = os.path.splitext(obj_path)[0] + ".usd"
+            if os.path.exists(usd_obj):
+                add_reference_to_stage(usd_path=usd_obj, prim_path=pth)
+            else:
+                spawn_obj_mesh(pth, obj_path)
+            stg = omni.usd.get_context().get_stage()
+            for pr in Usd.PrimRange(stg.GetPrimAtPath(pth)):
+                if pr.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(pr).GetCollisionEnabledAttr().Set(False)
+                if pr.HasAPI(UsdPhysics.RigidBodyAPI):
+                    UsdPhysics.RigidBodyAPI(pr).GetRigidBodyEnabledAttr().Set(False)
+
+        def spawn_seam_cylinder(path, p0, p1, rad, color=(1.0, 0.0, 0.0)):
+            """一根红色圆柱表示焊缝 p0→p1：UsdGeom.Cylinder 默认沿 +Z、中心在原点，
+            设 height=L、radius=rad，再把 Z 轴旋到 seam 方向、平移到中点。"""
+            p0 = np.asarray(p0, float); p1 = np.asarray(p1, float)
+            seg = p1 - p0
+            L = float(np.linalg.norm(seg))
+            if L < 1e-9:
+                return None
+            stage = omni.usd.get_context().get_stage()
+            cyl = UsdGeom.Cylinder.Define(stage, path)
+            cyl.CreateAxisAttr("Z")
+            cyl.CreateHeightAttr(float(L))
+            cyl.CreateRadiusAttr(float(rad))
+            cyl.CreateDisplayColorAttr([Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
+            d_hat = seg / L
+            z = np.array([0.0, 0.0, 1.0])
+            v = np.cross(z, d_hat); s = float(np.linalg.norm(v)); c = float(np.dot(z, d_hat))
+            if s < 1e-9:
+                Rm = np.eye(3) if c > 0 else Rsp.from_euler("x", 180, degrees=True).as_matrix()
+            else:
+                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                Rm = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+            q = Rsp.from_matrix(Rm).as_quat()             # xyzw
+            XFormPrim(path).set_world_pose(position=((p0 + p1) / 2.0).tolist(),
+                                           orientation=np.r_[q[3], q[0], q[1], q[2]].tolist())
+            return path
+
+        print(f"工件     : {scene.workpiece_obj}")
+        print(f"焊缝     : 共 {n} 条，本次画 {len(ids)} 条（红色圆柱，prim=/World/seam<id>）")
+
+        # —— 场景包围盒（由所有待画焊缝端点求）：用于自适应圆柱半径 + 相机对准 ——
+        pts = []
+        for sid in ids:
+            w = seams[sid]
+            pts.append(np.asarray(w["p0_world"], float))
+            pts.append(np.asarray(w["p1_world"], float))
+        pts = np.asarray(pts, float)
+        bb_min, bb_max = pts.min(0), pts.max(0)
+        center = (bb_min + bb_max) / 2.0
+        diag = float(np.linalg.norm(bb_max - bb_min)) or 1.0
+        auto_rad = max(0.02, diag * 0.004)                # 按场景尺度，至少 2cm
+
+        world = World(stage_units_in_meters=1.0)
+
+        # 地面：置于所有焊缝最低处下方 1m
+        world.scene.add_default_ground_plane(z_position=float(bb_min[2]) - 1.0)
+
+        spawn_workpiece("/World/workpiece", scene.workpiece_obj)
+
+        n_drawn = 0
+        for sid in ids:
+            w = seams[sid]
+            p0 = np.asarray(w["p0_world"], float)
+            p1 = np.asarray(w["p1_world"], float)
+            rad = float(radius) if radius else auto_rad
+            if spawn_seam_cylinder(f"/World/seam{sid}", p0, p1, rad) is not None:
+                n_drawn += 1
+
+        world.reset()
+
+        # 相机对准工件/焊缝包围盒中心（否则默认看原点，工件常在 20+m 外显得很小）
+        eye = center + np.array([diag * 0.9, -diag * 0.9, diag * 0.6], float)
+        try:
+            set_camera_view(eye=eye.tolist(), target=center.tolist())
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[viz] set_camera_view 失败（忽略，可手动调视角）: {e}")
+
+        if headless:
+            for _ in range(3):
+                world.step(render=False)
+            print(f"已 spawn 工件 + {n_drawn} 条焊缝红色圆柱（prim=/World/seam<id>）。")
+            print("VIZ_SCENE_DONE")
+            simulation_app.close()
+            return
+
+        try:
+            from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
+            _set_lighting_mode("Grey Studio")
+        except Exception:
+            pass
+
+        print(f"播放中（关闭窗口结束）：工件 + {n_drawn} 条焊缝红色圆柱；"
+              f"在 stage 树按 prim 名 /World/seam<id> 辨别是哪条焊缝。")
+        while simulation_app.is_running():
+            world.step(render=True)
+        simulation_app.close()
 
     def show_scene_isaacsim(self, headless: bool = False, goal_variant: int = 0,
                             trajectory=None, fps: int = 30, goal_arm_index: list = None,

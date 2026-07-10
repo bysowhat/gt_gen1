@@ -2112,6 +2112,35 @@ def _write_kejian2_log(log_path: str, obj_fp: str, weld_json: str,
         f.write("\n".join(lines) + "\n")
 
 
+def _init_free_region_from_cfg(cfg) -> dict:
+    """从 cfg 读【机械臂初始 FREE 起步引导空间】描述（base 系，与 Scene 起步 FREE 同源）：
+    按 cfg.init_free_method_for_init 选 box 或 cylinder。
+      box     → {"method":"box", "lo":(3,), "hi":(3,)}（[box_min_for_init, box_max_for_init] AABB）
+      cylinder→ {"method":"cylinder", "radius", "height", "z_min"}（轴过 base 原点 x=y=0）
+    供「工件+障碍 vs init_free 空间无交集」过滤（_pts_in_init_free）用。"""
+    method = getattr(cfg, "init_free_method_for_init", "box")
+    if method == "cylinder":
+        return {"method": "cylinder",
+                "radius": float(cfg.init_free_cyl_radius),
+                "height": float(cfg.init_free_cyl_height),
+                "z_min": float(getattr(cfg, "init_free_cyl_z_min", -0.02))}
+    return {"method": "box",
+            "lo": np.asarray(cfg.init_free_box_min_for_init, dtype=np.float64),
+            "hi": np.asarray(cfg.init_free_box_max_for_init, dtype=np.float64)}
+
+
+def _pts_in_init_free(pts_base, region) -> np.ndarray:
+    """pts_base (M,3) base 系点 → 布尔 (M,)：每点是否落在 init_free 区域内（box 逐轴 AABB /
+    cylinder：水平半径≤radius 且 z∈[z_min, z_min+height]）。任一点为 True ⇒ 与 init_free 有交集。"""
+    p = np.asarray(pts_base, dtype=np.float64).reshape(-1, 3)
+    if region.get("method") == "cylinder":
+        r = float(region["radius"]); zlo = float(region["z_min"]); zhi = zlo + float(region["height"])
+        rxy = np.hypot(p[:, 0], p[:, 1])
+        return (rxy <= r) & (p[:, 2] >= zlo) & (p[:, 2] <= zhi)
+    lo = np.asarray(region["lo"], dtype=np.float64); hi = np.asarray(region["hi"], dtype=np.float64)
+    return np.all((p >= lo) & (p <= hi), axis=1)
+
+
 def _kejian2_build_ctx(obj_fp: str) -> dict:
     """构建与【工件相关、与焊缝无关】的求解上下文（只需一次，可被同一工件的所有焊缝复用）：
     cfg、InitPoseLookupSolver（含工件 ESDF 体素化 ②）、joint 表（③，已存盘则复用）、
@@ -2194,6 +2223,8 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
         "ee_z_range": [float(v) for v in cfg.plan_init_ee_z_range],
         "workpiece_x_min": float(cfg.plan_init_workpiece_x_min),
         "wpx_pts": wpx_pts,
+        "init_free_region": _init_free_region_from_cfg(cfg),   # ⑤ 过滤用：工件(+障碍) vs init_free 空间无交集
+        "init_free_obstacle_pts": None,                        # 障碍点云(mesh 局部系)；Scene 在 solve 前按当前障碍填充
         "arm_collision_recheck": bool(cfg.plan_init_arm_collision_recheck),
         "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
         "mesh_v": mesh_v, "mesh_f": mesh_f,
@@ -2203,8 +2234,10 @@ def _kejian2_build_ctx(obj_fp: str) -> dict:
 
 def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Dict[str, list], dict]:
     """对单条焊缝求解（④ lookup 碰撞过滤 + ⑤ 朝向 snap/正面过滤/正反手分类），复用 ctx 里工件级的
-    solver/朝向/底座/mesh（不重建 ②③）。返回 ({"forehand":[...],"backhand":[...]}, prof_weld)，
-    prof_weld 记录 ④⑤ 耗时。per-weld 结果与原 plan_init_pose_kejian2 单焊缝逐位一致。
+    solver/朝向/底座/mesh（不重建 ②③）。返回 ({"forehand":[...],"backhand":[...]}, prof_weld, debug_steps)，
+    prof_weld 记录 ④⑤ 耗时；debug_steps 为 8 元列表，debug_steps[n-1] = 逐步过滤第 n 步【通过】的候选
+    （raw 结果 dict 列表，与合格结果同字段，可直接喂 _show_kejian2_results / show_init_poses_debug）。
+    per-weld 结果与原 plan_init_pose_kejian2 单焊缝逐位一致。
     verbose=False 时静默 lookup 明细 / solve profile 计时（求解不变；scene.py 默认走此路）；
     逐步过滤计数（① lookup→…→⑧ 复检→合格）为结果口径信息，【无条件打印】，不受 verbose 影响。"""
     import time as _time
@@ -2224,6 +2257,18 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
     z_lo, z_hi = ctx["ee_z_range"]
     wp_x_min = ctx["workpiece_x_min"]
     wpx_pts = ctx["wpx_pts"]
+    init_free_region = ctx["init_free_region"]                 # ⑤：工件(+障碍) vs init_free 空间无交集
+    obstacle_pts = ctx.get("init_free_obstacle_pts")           # 障碍点云(mesh 局部系)，None=无障碍
+    # ⑤ 过滤的稠密测试点集（mesh 局部系）= 工件体素点 ∪ 障碍点；与工件同 T 变换到 base 后逐点判在不在盒内
+    if wpx_pts is not None and obstacle_pts is not None and len(obstacle_pts):
+        free_test_pts = np.concatenate([np.asarray(wpx_pts, dtype=np.float64),
+                                        np.asarray(obstacle_pts, dtype=np.float64)], axis=0)
+    elif wpx_pts is not None:
+        free_test_pts = np.asarray(wpx_pts, dtype=np.float64)
+    elif obstacle_pts is not None and len(obstacle_pts):
+        free_test_pts = np.asarray(obstacle_pts, dtype=np.float64)
+    else:
+        free_test_pts = None
     arm_recheck = ctx["arm_collision_recheck"]
     bc_cc, bc_rr, bc_umin, bc_umax = ctx["bc_cc"], ctx["bc_rr"], ctx["bc_umin"], ctx["bc_umax"]
     mesh_v, mesh_f = ctx["mesh_v"], ctx["mesh_f"]
@@ -2243,7 +2288,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
         print("[kejian2] 逐步过滤：① lookup 候选 0 个 → 合格 0"
               "（请放宽 ee_xy_range_m/ee_z_range_m 或增大 n_per_dof）")
         prof["⑤snap+正反手分类(CPU遍历候选)"] = 0.0
-        return {"forehand": [], "backhand": []}, prof
+        return {"forehand": [], "backhand": []}, prof, [[] for _ in range(8)]
 
     _t = _time.time()
     mid_world = np.asarray(weld["mid_world"], dtype=np.float64)
@@ -2258,11 +2303,14 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
     n_hit = 0          # 朝向 snap 命中数
     n_back = 0         # 因「焊缝在背面」(bisector base-z<0) 丢弃
     n_xneg = 0         # 因「焊缝中心点 base-x<=0」丢弃
-    n_wpx = 0          # 因「工件距 base 欧氏最近点 base-x <= workpiece_x_min」丢弃
+    n_wpx = 0          # 因「工件(+障碍) 与 init_free 起步空间有交集」丢弃（⑤）
     n_overlap = 0      # 因「固定底座与工件在 base-xy 投影相交」丢弃
     n_arm_collide = 0  # 因「snap 后 retract 姿态整臂 vs 工件碰撞」丢弃（最后一步复检）
     n_dedup = 0        # 因「同朝向 + 同位置(2cm)重复」轻去重丢弃
     seen = set()
+    idx_pass_wpx = []      # 通过 ⑤「工件最近点 base-x」过滤的候选【原始索引】（供 debug 逐步存盘）
+    idx_pass_overlap = []  # 通过 ⑥「底座-工件 XY 相交」过滤的候选【原始索引】（供 debug）
+    near_by_idx = {}       # {i: p_near_base}：到达 wpx 步的候选各自「距 base 原点最近点」(base 系)
 
     # —— 向量化预筛（批量替代逐候选 scipy/几何；与逐个版逐位等价，仅 overlap+去重+组装仍按原始顺序循环）——
     Ncand = len(cands)
@@ -2313,18 +2361,23 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
         # 工件顶点变换到 base 系（供「底座-工件 XY 相交」过滤用，只算一次）
         v_base = (mesh_v @ Rv.T + t_new) if mesh_v is not None else None   # (V,3) base 系
 
-        # （req）工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量须 > workpiece_x_min，否则丢弃。
-        #   点集 wpx_pts 为工件体素中心（mesh 局部系，与三角形大小解耦）。距离对刚体变换不变，
-        #   故把 base 原点反变换到局部系一次做 argmin，只把赢家变回 base 读 x（省整批变换）。
-        p_near_base = None                                               # 赢家点 base 系坐标（供过滤+可视化）
+        # （req）⑤ 工件(+障碍) 与机械臂【init_free 起步引导空间】不能有交集：把稠密测试点(工件体素∪障碍，
+        #   mesh 局部系)按本候选 (Rv,t_new) 变换到 base 系，任一点落进 init_free 区域(box/圆柱) ⇒ 有交集 ⇒ 丢弃。
+        #   （工件与障碍同框、同 T 变换；点云为体素稠密采样，与三角形大小解耦。）
+        #   另计一个「工件距 base 原点最近点」p_near_base 仅供可视化（品红球），不参与本步判定。
+        p_near_base = None                                               # 距 base 原点最近点(base 系，可视化用)
         if wpx_pts is not None:
             o_local = -(Rv.T @ t_new)                                    # base 原点在 mesh 局部系
             d = wpx_pts - o_local
             i_near = int(np.argmin(np.einsum("vi,vi->v", d, d)))         # argmin |p|^2（省 sqrt）
-            p_near_base = Rv @ wpx_pts[i_near] + t_new                   # 离 base 原点最近的那个点（base 系）
-            if float(p_near_base[0]) <= wp_x_min:                        # 看它的 base-x
+            p_near_base = Rv @ wpx_pts[i_near] + t_new
+            near_by_idx[i] = p_near_base                                 # 记下（debug 逐步 ⑤⑥ 复用）
+        if free_test_pts is not None:
+            pts_base = free_test_pts @ Rv.T + t_new                      # (M,3) 工件∪障碍 → base
+            if _pts_in_init_free(pts_base, init_free_region).any():      # 有点落进 init_free 区域=相交
                 n_wpx += 1
                 continue
+        idx_pass_wpx.append(i)                                           # 通过 ⑤
 
         # （req）固定底座与工件在 base-xy 平面投影不能相交：相交 ⇒ 机械臂压在工件下/工件盖在底座上，丢弃。
         # 用工件【三角形投影并集】精确判定（不再用凸包近似，凹形工件也准确）；底座 AABB 粗筛保证速度。
@@ -2332,6 +2385,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
             if _base_overlaps_workpiece_tris(bc_cc, bc_rr, bc_umin, bc_umax, v_base[:, :2], mesh_f):
                 n_overlap += 1
                 continue
+        idx_pass_overlap.append(i)                                       # 通过 ⑥
 
         key = (oid, round(float(t_new[0]), 2), round(float(t_new[1]), 2), round(float(t_new[2]), 2))
         if key in seen:                              # 轻去重：同朝向 + 同位置(2cm 粒度)只留一份
@@ -2367,6 +2421,7 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
     # —— 最后一步：snap 后姿态复检。候选 R snap 到 90°整倍朝向、重算 t 会改变工件姿态，
     #   ④ 里 snap 前的碰撞过滤在此姿态下已失效；这里对最终 (Rv,t_new) 只用 retract 姿态整臂碰撞球
     #   再查一次工件 ESDF，撞则丢弃（判据同 ④：含 clearance_inflate、d<=collision_tolerance）。
+    results_pre_recheck = list(results)   # ⑦「轻去重」后、⑧ 复检前的合格候选快照（供 debug 逐步存盘）
     if arm_recheck and results:
         R_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, :3] for r in results])
         t_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, 3] for r in results])
@@ -2380,21 +2435,79 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
     after_hit = n_hit                          # ② 工作空间 + 朝向 snap 命中
     after_back = n_hit - n_back                # ③ 正面过滤（背面丢）
     after_xneg = after_back - n_xneg           # ④ 焊缝中心 base-x>0（= int(mask_survive.sum())）
-    after_wpx = after_xneg - n_wpx             # ⑤ 工件最近点 base-x>wp_x_min
+    after_wpx = after_xneg - n_wpx             # ⑤ 工件(+障碍) vs init_free 空间无交集
     after_overlap = after_wpx - n_overlap      # ⑥ 底座-工件 XY 投影不相交
     after_dedup = after_overlap - n_dedup      # ⑦ 轻去重（= 组装完、复检前的 results 数）
     n_final = len(results)                     # ⑧ snap 后 retract-工件无碰撞复检 → 合格
+    _free_desc = ("圆柱" if init_free_region.get("method") == "cylinder"
+                  else f"盒{np.round(init_free_region['lo'],2).tolist()}~{np.round(init_free_region['hi'],2).tolist()}")
+    _n_obs = 0 if obstacle_pts is None else len(obstacle_pts)
     print("[kejian2] 逐步过滤 候选初始位姿（前→后，括号内=本步丢弃）：")
     print(f"  ① lookup 候选（绕末端轴 {len(rot_x)}×{len(rot_y)}×{len(rot_z)} 采样） : {len(cands)}")
     print(f"  ② 工作空间 + 朝向snap 命中            : {len(cands)} → {after_hit}")
     print(f"  ③ 正面过滤(bisector base-z≥0)        : {after_hit} → {after_back}（背面丢 {n_back}）")
     print(f"  ④ 焊缝中心 base-x>0                   : {after_back} → {after_xneg}（x≤0 丢 {n_xneg}）")
-    print(f"  ⑤ 工件最近点 base-x>{wp_x_min}          : {after_xneg} → {after_wpx}（丢 {n_wpx}）")
+    print(f"  ⑤ 工件+障碍 vs init_free 空间无交集   : {after_xneg} → {after_wpx}（相交丢 {n_wpx}；"
+          f"init_free={_free_desc}，障碍点 {_n_obs}）")
     print(f"  ⑥ 底座-工件 XY 投影不相交            : {after_wpx} → {after_overlap}（相交丢 {n_overlap}）")
     print(f"  ⑦ 轻去重(同朝向 + 2cm 同位)          : {after_overlap} → {after_dedup}（重复丢 {n_dedup}）")
     print(f"  ⑧ snap后 retract-工件无碰撞复检      : {after_dedup} → {n_final}（碰撞丢 {n_arm_collide}）")
     print(f"  ⇒ 合格 {n_final}（正手 {len(fore)} / 反手 {len(back)}；snap_deg={snap_deg}°）")
-    return {"forehand": fore, "backhand": back}, prof
+
+    # —— debug 逐步候选：8 个步骤，各存【本步通过】的候选（raw 结果 dict，与 _show_kejian2_results 同口径） ——
+    #   ①=lookup 原始候选（未 snap，用其自带 (R,t)）；②③④=snap 后按 mask 子集；⑤⑥=循环里逐步通过的
+    #   原始索引（含最近点）；⑦=复检前合格快照；⑧=最终合格。所有 dict 均含 T_workpiece_in_base/
+    #   joint_angles/bisector_base/seam_center_base/hand（可视化所需），故可直接喂 _show_kejian2_results。
+    def _cand_raw(i):
+        R = np.asarray(cands[i]["R"], dtype=np.float64)
+        t = np.asarray(cands[i]["t"], dtype=np.float64)
+        bis_b = R @ bis_world
+        bis_b = bis_b / (np.linalg.norm(bis_b) + 1e-12)
+        seam_c = R @ mid_world + t
+        return {
+            "T_workpiece_in_base": _T(R, t),
+            "joint_angles": np.asarray(cands[i]["q"], dtype=np.float64),
+            "goal_pose7": None,                                 # 原始候选未 snap，goal 不定，可视化不读
+            "bisector_base": np.asarray(bis_b, dtype=np.float64),
+            "seam_center_base": np.asarray(seam_c, dtype=np.float64),
+            "rot_x_deg": float(cands[i]["rot_x_deg"]),
+            "rot_y_deg": float(cands[i]["rot_y_deg"]),
+            "rot_z_deg": float(cands[i]["rot_z_deg"]),
+            "orientation_id": -1,                               # 未 snap
+            "hand": "forehand" if float(bis_b[0]) < 0.0 else "backhand",
+            "wpx_near_base": None,
+        }
+
+    def _cand_snapped(i, p_near=None):
+        oid = int(oid_best[i]); Rv = Rv_arr[oid] if oid >= 0 else Rv_arr[0]
+        t_new = t_new_all[i]; bis_base = bis_all[i]; seam_center_base = seam_center_all[i]
+        R0_ee = _align_rotmat([1.0, 0.0, 0.0], bis_base)
+        goal_pose7 = np.concatenate([ee_all[i], rotmat_to_quat_wxyz(R0_ee)])
+        return {
+            "T_workpiece_in_base": _T(Rv, t_new),
+            "joint_angles": np.asarray(cands[i]["q"], dtype=np.float64),
+            "goal_pose7": goal_pose7,
+            "bisector_base": np.asarray(bis_base, dtype=np.float64),
+            "seam_center_base": np.asarray(seam_center_base, dtype=np.float64),
+            "rot_x_deg": float(cands[i]["rot_x_deg"]),
+            "rot_y_deg": float(cands[i]["rot_y_deg"]),
+            "rot_z_deg": float(cands[i]["rot_z_deg"]),
+            "orientation_id": oid,
+            "hand": "forehand" if float(bis_base[0]) < 0.0 else "backhand",
+            "wpx_near_base": (np.asarray(p_near, dtype=np.float64) if p_near is not None else None),
+        }
+
+    debug_steps = [
+        [_cand_raw(i) for i in range(Ncand)],                                        # ① lookup 候选
+        [_cand_snapped(i) for i in np.nonzero(mask_hit)[0].tolist()],                # ② 工作空间+朝向snap
+        [_cand_snapped(i) for i in np.nonzero(mask_front)[0].tolist()],              # ③ 正面过滤
+        [_cand_snapped(i) for i in np.nonzero(mask_survive)[0].tolist()],            # ④ 焊缝中心 base-x>0
+        [_cand_snapped(i, near_by_idx.get(i)) for i in idx_pass_wpx],                # ⑤ 工件最近点
+        [_cand_snapped(i, near_by_idx.get(i)) for i in idx_pass_overlap],            # ⑥ 底座-工件XY
+        list(results_pre_recheck),                                                   # ⑦ 轻去重后（复检前）
+        list(results),                                                               # ⑧ 复检后合格
+    ]
+    return {"forehand": fore, "backhand": back}, prof, debug_steps
 
 
 def _print_prof_table(prof: dict) -> None:
@@ -2430,7 +2543,7 @@ def plan_init_pose_kejian2(obj_fp: str, weld_json: str, seam_id: int = 0,
     if weld is None:
         raise IndexError(f"seam_id={seam_id} 不在 {weld_json}（共 {len(welds)} 条）")
 
-    res, prof_weld = _kejian2_solve_weld(ctx, weld)
+    res, prof_weld, _dbg = _kejian2_solve_weld(ctx, weld)
     _print_prof_table({**ctx["prof_setup"], **prof_weld})
     if viz and (res["forehand"] or res["backhand"]):
         _show_kejian2_results(ctx["cfg"], obj_fp, weld, res, stride=5)
@@ -2490,7 +2603,7 @@ def plan_init_pose_kejian2_all(obj_fp: str, weld_json: str,
     for wi, weld in enumerate(welds):
         sid = int(weld["idx"])
         print(f"\n[kejian2] ===== 焊缝 seam_id={sid}（{wi + 1}/{len(welds)}）=====")
-        res, prof_weld = _kejian2_solve_weld(ctx, weld)
+        res, prof_weld, _dbg = _kejian2_solve_weld(ctx, weld)
         _t4 = prof_weld.get("④solve_one_weld_lookup(碰撞过滤)", 0.0)
         _t5 = prof_weld.get("⑤snap+正反手分类(CPU遍历候选)", 0.0)
         print(f"[kejian2]   seam {sid}: ④={_t4:.3f}s ⑤={_t5:.3f}s "
