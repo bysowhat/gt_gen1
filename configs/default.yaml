@@ -71,7 +71,7 @@ roi:                                    # 决策 H —— ROI 盒（单一来源
                                         #   半体素(如 3.9→97.5)会触发 cuRobo CUDA/Python 栅格维度取整
                                         #   不一致 → voxel 占据沿该轴错位（见 config.roi_dims 注释）。
                                         #   config.roi_dims 会再吸附一次作兜底。
-  voxel_size_m: 0.02                    # 体素边长（米）
+  voxel_size_m: 0.04                    # 体素边长（米）
 
 goal:                                   # 末端目标相对焊缝的摆放（Step 10）
   standoff_cm: 10.0                     # 沿两面角平分方向(bisector, 背离工件)后退的 standoff 距离(cm)
@@ -79,10 +79,13 @@ goal:                                   # 末端目标相对焊缝的摆放（St
                                         # GT 轨迹终点即停在此 standoff 位姿（不再向表面靠近）。
 
 compute_goal_pose:                      # 观测位姿(goal pose) ES 优化器参数（Scene.compute_goal_pose，包 compute_goal_poses2）
-  # 除下列【方法级】3 键外，本段其余键名须与 stomp_planner/config_pose.ConfigurationPose 的属性【同名】，
+  # 除下列【方法级】4 键外，本段其余键名须与 stomp_planner/config_pose.ConfigurationPose 的属性【同名】，
   # Scene.compute_goal_pose 会逐个 setattr 到 ConfigurationPose（未列出的沿用其默认）；num_randoms_all /
   # num_envs 由 Scene 依 num_batches/num_randoms_* 自动重算，勿在此填。显式传参给方法可覆盖本段。
   include_obstacles: true               # 【方法级】是否把已放障碍并入 ScenePose2 碰撞世界（避障；open_cylinder 纯视觉跳过）
+  obstacle_buffer_m: 0.04                 # 【方法级】障碍并入碰撞世界前的膨胀量(米)：每块障碍 mesh 按 OBB 各维 +2·buffer 外扩，
+                                        # 机械臂避障留安全间隙(同 STOMP 绕行 obstacle_buffer_m 语义)。只影响碰撞世界；
+                                        # 遮挡视线(visionBlock)仍用真实尺寸避免过度保守；工件不膨胀。0=不膨胀。
   horizontal: 2                         # 【方法级】关节限位选择：0=水平 / 1=垂直 / 其它=all（全范围，最宽松）
   device: cuda                          # 【方法级】计算设备
   # —— 进化策略采样规模（⚠ 调太小会触发优化器内部假设崩溃 reshape[0,6]，见 compute_goal_poses2；默认 8×100）——
@@ -277,7 +280,7 @@ params:
     lambda_angle: 5                    # score_candidate fun 增益 vs 焊枪朝向变化代价(rad,测地角)权重（Step 9，0=关）
     version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
   loop:
-    max_rounds: 1                     # 主循环最大轮次（Step 10）
+    max_rounds: 20                     # 主循环最大轮次（Step 10）
     stuck_rounds: 5                     # 连续无进展判卡死（Step 10）
     observe_every_n: 2000000                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
@@ -310,7 +313,7 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
                                         # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
     detour_ik_position_threshold: 0.1   # 无用，ik目前的goal是写死的，仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
     detour_ik_rotation_threshold: 0.3   # 用，ik目前的goal是写死的， 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
-    obstacle_buffer_m: 0.1              # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
+    obstacle_buffer_m: 0.04              # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
                                         # ②③绕行规划用膨胀尺寸→绕行解与真实障碍留 buffer；工件不受影响。0=关闭
     obstacle_types: []                  # 空=用 obstacles.list_obstacles() 全部 15 种
     # _shape_for 的尺寸夹紧/采样区间（不写死在代码里，单一来源）

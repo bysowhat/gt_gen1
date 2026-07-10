@@ -442,6 +442,21 @@ def inflate_prims(prims, buffer_m: float):
     return out
 
 
+def inflate_trimesh_obb(tm, buffer_m: float):
+    """单块 trimesh 按【有向包围盒(OBB)】各维 +2·buffer_m 膨胀，重建为盒 trimesh；buffer_m<=0 原样返回。
+
+    用于对【无规则原语 dims】的障碍 mesh（如类型2 遮挡板的多边形棱柱）做膨胀：plate/open_box 各壁
+    这类盒形 mesh 的 OBB 即其自身、膨胀精确；triangle/trapezoid 近似成外接矩形盒（偏保守=更安全）。
+    与 inflate_prims 互补、同为障碍膨胀的单一来源（compute_goal_pose 碰撞世界 + viz 对比脚本共用）。"""
+    if not buffer_m or buffer_m <= 0:
+        return tm
+    import trimesh
+    obb = tm.bounding_box_oriented
+    ext = np.asarray(obb.primitive.extents, float) + 2.0 * float(buffer_m)
+    T = np.asarray(obb.primitive.transform, float)
+    return trimesh.creation.box(extents=ext.tolist(), transform=T)
+
+
 def build_world(workpiece_mesh, prims, buffer_m: float = 0.0, show_buffer: bool = False):
     """工件 mesh + 障碍原语 → 全 mesh 的 WorldConfig（MESH 检查器最稳）。
     buffer_m>0 时只把障碍原语膨胀一圈（工件 mesh 不变），让绕行解与真实障碍留间隙。

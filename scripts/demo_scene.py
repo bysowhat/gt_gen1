@@ -98,7 +98,7 @@ def obstacle_type2_demo_main(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
     scene = _make_scene(args)
-    scene._set_cur_seam(62)#2,24,34,47
+    scene._set_cur_seam(45)#2,24,34,47.62
     # if random.random() < 0.7:  # 70% 概率添加遮挡板
     #     scene.add_obstacle_type2()
     scene.add_obstacle_type2()
@@ -107,7 +107,7 @@ def obstacle_type2_demo_main(args):
     if num_init_pose == 0:
         scene.plan_init_pose(include_obstacles=False)
     scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    # scene.seam_ids_by_length()  25,34,35,47,62
+    # scene.seam_ids_by_length()  25,34,35,47,62,45,54,48,60,3,8,49,61,46
     fflag = scene.compute_pose_and_plan_path(hand="forehand")
     scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
     bflag = scene.compute_pose_and_plan_path(hand="backhand")
@@ -115,14 +115,14 @@ def obstacle_type2_demo_main(args):
     print(1)
 
 
-    # from gt_gen.scene import Scene
-    # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    from gt_gen.scene import Scene
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
     # Open3DSceneVisualizer(scene).show_init_poses()
-    # # Open3DSceneVisualizer(scene).show_goal_pose_collision("forehand", 0)
+    # Open3DSceneVisualizer(scene).show_goal_pose_collision("forehand", 0)
 
-    # # Open3DSceneVisualizer(scene).show_seam(62)
-    # # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=1, headless=args.headless)
+    # Open3DSceneVisualizer(scene).show_seam(62)
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
 
 
 def main():

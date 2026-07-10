@@ -874,6 +874,9 @@ class Scene:
             horizontal = int(sec.get("horizontal", 2))
         if device is None:
             device = str(sec.get("device", "cuda"))
+        # 障碍膨胀量(米,方法级)：显式 **cfg_overrides > yaml 段 > 0；只作用碰撞世界（见 _inject_obstacles_into_scenepose2）
+        obstacle_buffer_m = float(cfg_overrides.get("obstacle_buffer_m",
+                                                    sec.get("obstacle_buffer_m", 0.0)) or 0.0)
 
         cgp = _load_compute_goal_poses2()
         Configuration = cgp.Configuration
@@ -884,7 +887,7 @@ class Scene:
         cfg = Configuration()
         cfg.usd_path = ""
         cfg.pc_path = ""
-        _method_keys = {"include_obstacles", "horizontal", "device"}
+        _method_keys = {"include_obstacles", "horizontal", "device", "obstacle_buffer_m"}
         for k, v in {**sec, **cfg_overrides}.items():
             if k in _method_keys:
                 continue
@@ -917,7 +920,7 @@ class Scene:
         # reset：把工件按 piece->base_link 摆进碰撞世界并选关节限位
         robot_pose_rel = scene2.reset(robot_pose_t, int(horizontal), piece_pose_t)
         if want_obs:
-            self._inject_obstacles_into_scenepose2(scene2)     # 障碍与工件同 pose 一起进碰撞世界（避障）
+            self._inject_obstacles_into_scenepose2(scene2, buffer_m=obstacle_buffer_m)     # 障碍与工件同 pose 一起进碰撞世界（避障；buffer_m>0 膨胀）
 
         optimizer = Optimizer(cfg=cfg, scene=scene2, device=device)
         optimizer.resetSeamData(seam_line, seam_tangent, seam_limits)
@@ -1209,35 +1212,44 @@ class Scene:
             print(f"[scene] 初始 FREE 空间=圆柱 体素={n_free}")
         return vm
 
-    def _inject_obstacles_into_scenepose2(self, scene2):
+    def _inject_obstacles_into_scenepose2(self, scene2, buffer_m: float = 0.0):
         """把当前障碍实体（工件 mesh 系）按 piece->base_link 位姿并进 ScenePose2 的碰撞世界，
         并把障碍 mesh（piece 系）并进遮挡 raycast 的 warp mesh。
 
+        buffer_m>0 时【只对碰撞世界】的障碍按 OBB 各维 +2·buffer 膨胀一圈（机械臂避障留安全间隙，
+        同 STOMP 绕行 obstacle_buffer_m 语义；工件不膨胀），走 obstacle_placement.inflate_trimesh_obb
+        单一来源；遮挡 raycast(visionBlock 视线)仍用【真实尺寸】，避免视线遮挡判定过度保守而更难找位姿。
+
         两条独立路径都要喂障碍，缺一不可：
-          · 碰撞世界 rw（computeCollisionCost）：障碍与工件同 pose 摆到 base 系，机械臂避障；
-          · 遮挡 raycast _wp_mesh（visionBlock）：piece 系（piece_pos=0，不加 pose），
+          · 碰撞世界 rw（computeCollisionCost）：障碍(可膨胀)与工件同 pose 摆到 base 系，机械臂避障；
+          · 遮挡 raycast _wp_mesh（visionBlock）：piece 系(真实尺寸，piece_pos=0，不加 pose)，
             让优化器把“障碍挡住相机→焊缝视线”算进代价，否则会选出视线被障碍遮挡的位姿。
         （_obstacle_solid_trimeshes：类型2遮挡板 + 类型3 open_box；open_cylinder 纯视觉跳过。）不改 scene_pose2.py 主体逻辑。
         """
         import trimesh as _trimesh
+        from gt_gen import obstacle_placement as _opl
         obs_tms = self._obstacle_solid_trimeshes()
         if not obs_tms:
             print("[scene] compute_goal_pose：无可注入碰撞的障碍（仅工件或仅 open_cylinder）")
             return
-        merged = _trimesh.util.concatenate(obs_tms)
+        merged = _trimesh.util.concatenate(obs_tms)                       # 真实尺寸（遮挡 raycast 用）
+        # 碰撞世界用的障碍：buffer_m>0 时每块按 OBB 各维 +2·buffer 膨胀（工件不动），否则真实尺寸
+        col_tms = [_opl.inflate_trimesh_obb(t, buffer_m) for t in obs_tms] if buffer_m > 0 else obs_tms
+        merged_col = _trimesh.util.concatenate(col_tms)
         pose = scene2.robot_base_inv_pose[0].detach().cpu().tolist()    # [x,y,z, qw,qx,qy,qz]
         piece_mesh = scene2._Mesh(name="piece", vertices=scene2._verts_list,
                                   faces=scene2._faces_list, pose=pose)
         obs_mesh = scene2._Mesh(name="obstacles",
-                                vertices=np.asarray(merged.vertices, float).tolist(),
-                                faces=np.asarray(merged.faces, np.int64).reshape(-1, 3).tolist(),
+                                vertices=np.asarray(merged_col.vertices, float).tolist(),
+                                faces=np.asarray(merged_col.faces, np.int64).reshape(-1, 3).tolist(),
                                 pose=pose)
         scene2.rw.update_world(scene2._WorldConfig(mesh=[piece_mesh, obs_mesh]))
-        # 遮挡视线检测（visionBlock 的 raycast warp mesh）也并入障碍——piece 系，无需加 pose，
+        # 遮挡视线检测（visionBlock 的 raycast warp mesh）也并入障碍——piece 系、真实尺寸，无需加 pose，
         # 否则优化器眼里障碍“透明”，会选出视线被障碍挡住的观测位姿。
         scene2.set_occluders(np.asarray(merged.vertices, float),
                              np.asarray(merged.faces, np.int64).reshape(-1, 3))
-        print(f"[scene] compute_goal_pose：障碍并入碰撞世界 + 遮挡 raycast（{len(obs_tms)} 块实体）")
+        _tag = f"，碰撞膨胀 OBB +{buffer_m:.3f}m" if buffer_m > 0 else ""
+        print(f"[scene] compute_goal_pose：障碍并入碰撞世界 + 遮挡 raycast（{len(obs_tms)} 块实体{_tag}）")
 
     # ------------------------------------------------------------------
     # 障碍物（工件 mesh 系；与 weld_json 的 corrected_p0/p1/bisector 同框）
