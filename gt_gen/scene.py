@@ -335,6 +335,7 @@ class Scene:
         # plan_init_pose 产出的候选：按【焊缝】分组 {seam_id: {"forehand":[...], "backhand":[...]}}；
         # 每焊缝下再按手别分组，每组各自按【工件平移 xyz 差异】独立分数降序（差异大的排前面），两组互不混排。
         self.init_pose_candidates: Dict[int, Dict[str, List[InitPoseCandidate]]] = {}
+        self.init_pose_candidates_length: Dict[int, Dict[str, int]] = {}
         self.cur_init_pose: Optional[InitPoseCandidate] = None    # 当前选定的 init pose 候选（set_init_pose 设定）——定义工件↔base 摆放
         self.cur_init_hand: Optional[str] = None                  # 当前候选所属手别（"forehand"/"backhand"）
         self.cur_init_index: Optional[int] = None                 # 当前候选在【该手别列表】中的下标
@@ -399,6 +400,11 @@ class Scene:
         pairs = [(i, _len(self.seams[i])) for i in range(len(self.seams))]
         return sorted(pairs, key=lambda p: -p[1])
     
+    def num_init_pose(self, seam_id=None):
+        if seam_id is None:
+            seam_id = self.seam_id
+        return len(self.init_pose_candidates[seam_id]['forehand']) + len(self.init_pose_candidates[seam_id]['backhand'])
+        
 
     # ------------------------------------------------------------------
     # 初始位姿求解（包 scripts/plan_init_pose.py 的 kejian2 逻辑，算法/输入输出完全一致）
@@ -462,9 +468,15 @@ class Scene:
         # 正反手分组返回（不做数量上限挑选）：每组各自按工件平移 xyz 差异独立分数降序
         fore = [InitPoseCandidate.from_kejian2(d) for d in res.get("forehand", [])]
         back = [InitPoseCandidate.from_kejian2(d) for d in res.get("backhand", [])]
-        self.init_pose_candidates[self.seam_id] = {
-            "forehand": self._sort_by_xyz_diversity(fore),
-            "backhand": self._sort_by_xyz_diversity(back),
+        
+        history_cands = self.init_pose_candidates.get(self.seam_id, {"forehand": [], "backhand": []})
+        history_cands["forehand"].extend(self._sort_by_xyz_diversity(fore))
+        history_cands["backhand"].extend(self._sort_by_xyz_diversity(back))
+        self.init_pose_candidates[self.seam_id] = history_cands
+        
+        self.init_pose_candidates_length[self.seam_id] = {
+            "forehand": len(self.init_pose_candidates[self.seam_id]["forehand"]),
+            "backhand": len(self.init_pose_candidates[self.seam_id]["backhand"]),
         }
         return self.init_pose_candidates[self.seam_id]
 
@@ -958,6 +970,8 @@ class Scene:
             res = self.compute_goal_pose()
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
+
+            # self.save('/media/a/新加卷/tempt/4/scene1.pkl')
 
             jt = res["joints"]
             joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)

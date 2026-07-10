@@ -261,13 +261,13 @@ def world_from_voxmap_cuboid(cfg, voxmap, n: Optional[float] = None,
     lo = np.maximum(lo, 0)
     hi = np.minimum(hi, grid - 1)
     if np.any(lo > hi):
-        print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒与 ROI 无交）-> 空 world")
+        # print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒与 ROI 无交）-> 空 world")
         return WorldConfig(cuboid=[]), CollisionCheckerType.PRIMITIVE
 
     sub = mask[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1]
     n_occ = int(sub.sum())
     if n_occ == 0:
-        print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE=0）-> 空 world")
+        # print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE=0）-> 空 world")
         return WorldConfig(cuboid=[]), CollisionCheckerType.PRIMITIVE
 
     _t0 = time.perf_counter()
@@ -280,8 +280,8 @@ def world_from_voxmap_cuboid(cfg, voxmap, n: Optional[float] = None,
         bdims = (g1 - g0 + 1).astype(float) * vs
         cuboids.append(Cuboid(name=f"vox_{bi}", dims=bdims.tolist(),
                               pose=center.tolist() + [1.0, 0.0, 0.0, 0.0]))
-    print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE格={n_occ} -> 合并大盒={len(cuboids)}）"
-          f"{time.perf_counter() - _t0:.3f}s")
+    # print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE格={n_occ} -> 合并大盒={len(cuboids)}）"
+    #       f"{time.perf_counter() - _t0:.3f}s")
     return WorldConfig(cuboid=cuboids), CollisionCheckerType.PRIMITIVE
 
 
