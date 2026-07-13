@@ -13,6 +13,106 @@
             "console": "integratedTerminal"
         },
         {
+            "name": "viz_robot_spheres_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_robot_spheres_isaacsim.py",
+            "console": "integratedTerminal",
+            // 静态可视化「机械臂 URDF + cuRobo 碰撞球」核实球覆盖。
+            // 不传 --cfg/--urdf 时：机械臂与碰撞球文件都从 default.yaml 的 robot.cfg_path 读取
+            // （cfg_path 指向 ur12e_full.yml，URDF 再取该 yml 内的 urdf_path）。
+            "args": [
+                // "--joints", "1.57,-2.0,1.36,-0.96,-1.57,0", // 关节角(弧度,按 joint_names 顺序);缺省 retract
+                // "--opacity", "0.35", // 碰撞球透明度
+                // "--no-spheres",      // 只看本体不画球
+                // "--headless",        // 无显示器自检
+            ]
+        },
+        {
+            "name": "compute_goal_poses",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/compute_goal_poses.py",
+            "console": "integratedTerminal",
+            // 移植 stomp_planner 观测位姿优化器（per-seam .pkl 输入）+ Isaac Sim 可视化 goal pose 序列。
+            // --usd 默认取 pkl 同目录的 *_part.usd；num_envs = num_batches*(num_randoms_new+num_randoms_old)，优化器按此 reshape。
+            "args": [
+                // 输入：单条焊缝 pkl（gt_overall 格式：robot_pose/piece_pose/horizontal/seam_*）
+                "--seam-pkl", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_1.pkl",
+                // 工件 USD（缺省自动取 pkl 同目录 *_part.usd）：
+                "--usd", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part.usd",
+                // 进化策略并行规模（缺省 num_batches=8, num_randoms_new=100 -> num_envs=800）：
+                "--num-batches", "8",
+                "--num-randoms-new", "50", // 100
+                // 把 goal poses 存盘（之后用 viz_goal_poses_isaacsim.py 可视化）：
+                "--save", "/tmp/goal_poses/goal_poses.pkl",
+                // 无显示器（headless）：
+                "--headless",
+            ]
+        },
+        {
+            "name": "compute_goal_poses2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/compute_goal_poses2.py",
+            "console": "integratedTerminal",
+            // compute_goal_poses 的【去 Isaac】版：cuRobo + warp + trimesh 替代 isaacsim/isaaclab，无需 AppLauncher/--headless。
+            // 工件几何用 *_part.obj（替代 *_part.usd）；num_envs = num_batches*(num_randoms_new+num_randoms_old)。
+            "args": [
+                // 输入：单条焊缝 pkl（gt_overall 格式：robot_pose/piece_pose/horizontal/seam_*）
+                "--seam-pkl", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_1.pkl",
+                // 工件 obj（缺省自动取 pkl 同目录 *_part.obj）：
+                "--obj", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj",
+                // "--obj", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part.obj",
+                // 进化策略并行规模（缺省 num_batches=8, num_randoms_new=100 -> num_envs=800）：
+                "--num-batches", "8",
+                "--num-randoms-new", "50", // 100
+                // 把 goal poses 存盘（schema 与 compute_goal_poses 一致）：
+                "--save", "/tmp/goal_poses2/goal_poses.pkl",
+                // 计算设备（默认 cuda）：
+                // "--device", "cuda",
+            ]
+        },
+        {
+            "name": "viz_goal_poses_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_goal_poses_isaacsim.py",
+            "console": "integratedTerminal",
+            // 可视化 compute_goal_poses.py --save 落盘的观测位姿序列：红线=目标焊缝，视锥=各 pose 的相机。
+            "args": [
+                // 目标焊缝 pkl（提供 seam_line 红线 + piece_pose + 自动找 USD）；须与 --save 对应的 seam 一致：
+                "--seam-pkl", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_24.pkl",
+                // 工件 USD（缺省取 seam-pkl 同目录 *_part.usd）：
+                "--usd", "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part.usd",
+                // compute_goal_poses.py --save 落盘的 goal poses：
+                "--save", "/tmp/goal_poses2/seam_24.pkl",
+                // "--save", "/tmp/goal_poses2/goal_poses.pkl",
+                // 可选：第几个 robot_pose 结果 / 第几个变体 K / 视锥拉伸倍数：
+                "--result-index", "0",
+                "--variant", "0",
+                "--fov-len", "1.0",
+                // 无显示器自检（store_true）：
+                // "--headless",
+            ]
+        },
+        {
+            "name": "viz_joints_open3d",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_joints_open3d.py",
+            "console": "integratedTerminal",
+            // Open3D 同时可视化 4 组 UR12e 关节角（纯 numpy FK，不依赖 Isaac；骨架=球+柱，每组末端画相机TCP坐标系）。
+            // 关节角直接写死在脚本 DEFAULT_JOINTS；env_isaaclab 是唯一装了 open3d 的环境。
+            "args": [
+                // 无显示器自检（store_true）：只算 FK + 打印各组 TCP 位姿，不开窗：
+                // "--headless",
+                "--mode", "show",
+                "--show-arms"
+
+            ]
+        },
+        {
             "name": "viz_seam_isaacsim",
             "type": "debugpy",
             "request": "launch",
@@ -91,10 +191,126 @@
             "program": "scripts/calibrate_init_free.py",
             "console": "integratedTerminal",
             "args": [
-                "--check-workpiece", 
+                "--check-workpiece",
                 "--n-workpiece", "3",
                 "--viz"
             ]
+        },
+        {
+            "name": "plan_init_pose",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/plan_init_pose.py",
+            "console": "integratedTerminal",
+            "args": [
+               "--solve-kejian2",
+                // ② lookup 初始位姿求解：给定工件 obj + 焊缝 json，反解工件相对臂位姿 + 无碰撞构型
+                // ── 输入（必填）──
+                // "--obj", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj",          // 工件网格（顶点=world 系，建 ESDF 用）
+                // "--weld-json", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_weld_angle3.json", // 焊缝 corrected_p0/p1/bisector/boundary_dirs
+                
+                "--obj", "/media/a/新加卷/hanfeng/segment/YongFengTOD/3J_1cBPgF0009OJ4tCJGoDZOv_part_watertight.obj",
+                "--weld-json", "/media/a/新加卷/hanfeng/segment/YongFengTOD/3J_1cBPgF0009OJ4tCJGoDZOv_weld_angle3.json",
+
+                // ── 输出 ──
+                "--out-dir", "/tmp/plan_init_pose",         // pkl 输出根目录 → <out-dir>/<工件stem>/seam_<idx>.pkl
+                "--seam-id", "121",                             // 只处理前 N 条焊缝（-1=全部）
+                // "--all-seams",
+                // "--diagnostic",                             // 逐 (θ,φ) 诊断打印（safe 数 / min_d_link / min_d_ret / 撞 LINK 还是 RETRACT）
+                // "--viz",                                     // 每条成功焊缝开窗可视化（复用 init_space_geometries + 工件网格 + 焊缝线）
+                // ───────────────────────────────────────────────────────────────────────────
+                // ① 改回 init 空间可视化：删掉上面 --solve…一段，留空 args（或加 --solid / --q j0 j1 ...）
+                // 即 open3d 画整臂碰撞球 + init_free 立方体盒（box_min/max 取自 configs/default.yaml）
+                "--out", "/media/a/新加卷/tempt/1/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight/",
+                "--log", "/media/a/新加卷/tempt/1/initpose.txt",
+                "--filter-short"
+            ]
+        },
+        {
+            "name": "plan_init_pose_kejian2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/plan_init_pose_kejian2.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--solve-kejian2",
+                // ② lookup 初始位姿求解：给定工件 obj + 焊缝 json，反解工件相对臂位姿 + 无碰撞构型
+                // ── 输入（必填）──
+                "--obj", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj",          // 工件网格（顶点=world 系，建 ESDF 用）
+                "--weld-json", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_weld_angle3.json", // 焊缝 corrected_p0/p1/bisector/boundary_dirs
+                // ── 输出 ──
+                "--out-dir", "/tmp/plan_init_pose",         // pkl 输出根目录 → <out-dir>/<工件stem>/seam_<idx>.pkl
+                "--seam-id", "121",                             // 只处理前 N 条焊缝（-1=全部）
+                // "--all-seams",
+                // "--diagnostic",                             // 逐 (θ,φ) 诊断打印（safe 数 / min_d_link / min_d_ret / 撞 LINK 还是 RETRACT）
+                // "--viz",                                     // 每条成功焊缝开窗可视化（复用 init_space_geometries + 工件网格 + 焊缝线）
+                // ───────────────────────────────────────────────────────────────────────────
+                // ① 改回 init 空间可视化：删掉上面 --solve…一段，留空 args（或加 --solid / --q j0 j1 ...）
+                // 即 open3d 画整臂碰撞球 + init_free 立方体盒（box_min/max 取自 configs/default.yaml）
+                "--out", "/media/a/新加卷/tempt/1/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight/",
+                "--log", "/media/a/新加卷/tempt/1/initpose.txt",
+                "--filter-short"
+            ]
+        },
+        {
+            "name": "viz_kejian2_npy",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_kejian2_npy.py",
+            "console": "integratedTerminal",
+            // 可视化 plan_init_pose_kejian2 --out 保存的 .npy（挨个看：整臂碰撞球 + init_free 盒 + base 架 + 工件网格）。
+            // 按 C 切下一条、相机视角沿用；直接关窗退出。npy 无焊缝信息，故不画焊缝线/判据箭头。
+            "args": [
+                "--obj", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj",
+                "--npy", "/media/a/新加卷/tempt/1/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight/seam_121.npy"
+                // "--obj", "/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On_part_watertight.obj",
+                // "--npy", "/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On/seam_40.npy"
+            ]
+        },
+        {
+            "name": "viz_weld_json",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_weld_json.py",
+            "console": "integratedTerminal",
+            // 可视化工件网格 + 焊缝（不含机械臂，纯几何）：浅灰工件 + 绿焊缝线/中点 + 蓝 bisector 箭头 + 青端点。
+            // 工件停在自身 mesh 坐标，焊缝端点/bisector 与工件同框直接叠加。缺省画全部焊缝，给 --seam-id 只画一条。
+            "args": [
+                "--obj", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj",
+                "--weld-json", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_weld_angle3.json",
+                "--seam-id", "120",
+            ]
+        },
+        {
+            "name": "demo_scene",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/demo_scene.py",
+            "console": "integratedTerminal",
+            "args": [
+                // "--obj", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj",
+                // "--weld-json", "/media/a/新加卷/hanfeng/segment/A3Changfang/BEAM_1aEEYa00Ed5Z4sE34qDJKu_weld_angle3.json",
+
+                "--obj", "/media/a/新加卷/hanfeng/segment/YongFengTOD/3J_1cBPgF0009OJ4tCJGoDZOv_part_watertight.obj",
+                "--weld-json", "/media/a/新加卷/hanfeng/segment/YongFengTOD/3J_1cBPgF0009OJ4tCJGoDZOv_weld_angle3.json",
+                
+
+
+                // "--obj", "/kpfs_dataset_ssd/tempt/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj",
+                // "--weld-json", "/kpfs_dataset_ssd/tempt/BEAM_1aEEYa00Ed5Z4sE34qDJKu_weld_angle3.json",
+            ],
+            // "cwd": "${workspaceFolder}",
+            // "python": "/workspace/isaaclab/_isaac_sim/python.sh",
+            // "env": { 
+            //     "DISPLAY": ":1000.0" ,
+            //     "PYTHONPATH": "/kpfs_dataset/dataset/baiyu/code/render/curobo/src",
+            // },
+            // "python": "/workspace/isaaclab/_isaac_sim/python.sh",
+            "env": {
+                "PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT": "10",
+                // "PYTHONPATH": "/kpfs_dataset/dataset/baiyu/code/render/curobo/src",
+                // "DISPLAY": ":1000.0"
+            }
         },
         {
             "name": "verify_step8",
@@ -219,17 +435,17 @@
             "args": [
                 // 焊缝 pkl（可多条，空格分隔；或给目录/通配如 .../seam_1*.pkl）：
                 "--seam",
-                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_16.pkl",
-                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_46.pkl",
-                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_89.pkl",
-                // "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_163.pkl",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_0.pkl",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_27.pkl",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_37.pkl",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_52.pkl",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_62.pkl",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_71.pkl",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_44.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_16.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_46.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_89.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_163.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_0.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_27.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_37.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_52.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_62.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_71.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_44.pkl",
                 // n：C1/C2 抬高量、C3/C4 横挪量（cm）：
                 "--n_cm", "10",
                 // 板宽(cm)：
@@ -243,7 +459,7 @@
                 // 只看哪些候选（逗号分隔，如 C1,C2；空=全部）：
                 "--only", "C1",
                 // {plate,triangle,trapezoid}
-                "--shape", "triangle"
+                "--shape", "plate"
                 // 无显示器自检（store_true）：
                 // "--headless",
             ]
@@ -259,11 +475,12 @@
             // --obstacle open_box=开1面的盒 / open_cylinder=开1面的圆筒(圆管杯，轴=bis、开口朝bis、半径外接等效盒截面)。
             "args": [
                 // 障碍类型：open_box（默认）或 open_cylinder：
-                // "--obstacle", "open_box",
-                "--obstacle", "open_cylinder",
+                "--obstacle", "open_box",
+                // "--obstacle", "open_cylinder",
                 // 焊缝 pkl（可多条，空格分隔；或给目录/通配如 .../seam_1*.pkl），每条各套一个障碍：
                 "--seam",
-                "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_27.pkl",
+                // "/media/a/新加卷/hanfeng/segment_sub_output/钢柱_1dlcPQ0000iZ4tD30rCpGq_part/seam_27.pkl",
+                "/media/a/新加卷/hanfeng/segment_sub_output/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part/seam_16.pkl",
                 // 焊缝到盒 6 面的最近距离(cm)，顺序固定=上 下 左 右 前 后；后=开口面（dis 为正=该面在焊缝外侧 dis 处）：
                 "--dis_cm", "100", "100", "100", "100", "100", "100",
                 // 盒壁厚(cm)：
@@ -359,6 +576,37 @@
             ]
         },
         {
+            "name": "place_obstacles_to_gt2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/place_obstacles_to_gt2.py",
+            "console": "integratedTerminal",
+            // 读 scripts/demo_scene.py 的 demo_main 存的 Scene pkl（工件+障碍+机械臂起始角+焊缝+
+            // init pose + goal pose），产「边看边走」探索 GT（真值世界含工件+障碍）。
+            // goal=【相机当 ee_link】，与 scene.compute_goal_pose() 一致（不是焊枪尖 standoff）。
+            // 注意：h_truth + h_expl 两个 MotionGen 在 11.6G 本地卡会 OOM，须大显存卡上跑。
+            "args": [
+                // === 选场景：demo_scene 存的 Scene pkl ===
+                "--scene", "/media/a/新加卷/tempt/4/scene1.pkl",
+
+                // === --variant：取 goal_poses[0] 的 cam_pose(K,B,7)/joints(K,B,DOF) 第一维 K 下标 ===
+                //   K = 同一终点观测的候选变体数（本 pkl K=160）：同一焊缝观测点，相机绕视线/站位
+                //       有很多套等价机位+关节解，compute_goal_pose 全算了出来，此处选用哪一套。
+                //   不同 variant 终点相机位姿大体等价，但到达它的关节构型、以及从 cur_cfg 过去的
+                //   可达性/路径难度不同 → 若某 variant 规划不动，可换个编号再试（0..K-1，越界自动夹）。
+                "--variant", "0",
+                // === --goal-index：cam_pose/joints 第二维 B 下标 = 焊缝观测序列里第几个观测点作终点 ===
+                //   本 pkl B=1，故只能填 0（支持负索引）。
+                "--goal-index", "0",
+
+                // === 真值世界是否并入障碍（默认并入；取消注释则只放工件）===
+                // "--no-obstacles",
+
+                // === GT 存盘 pkl；缺省 <scene>_gt.pkl（把这条轨迹追加进 scene.trajectories 后另存）===
+                // "--out", "/media/a/新加卷/tempt/4/scene1_gt.pkl",
+            ]
+        },
+        {
             "name": "viz_obstacle_buffer_isaacsim",
             "type": "debugpy",
             "request": "launch",
@@ -369,6 +617,24 @@
             ]
         },
         {
+            "name": "viz_obstacle_inflate_o3d",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_obstacle_inflate_o3d.py",
+            "console": "integratedTerminal",
+            // Open3D 平铺对比各类障碍膨胀前后（辅助定 compute_goal_pose 障碍膨胀算法）：
+            // 橙实心=真实，红/蓝/绿线框=obb/normal/prims。env_isaaclab 是唯一装了 open3d 的环境。
+            "args": [
+                // 膨胀算法：obb|normal|prims|all（默认 all，同格叠加三种线框对比）：
+                "--method", "obb",
+                "--buffer", "0.04",
+                // 只看类型2/3（不画类型1 原语全景）：
+                // "--no-type1",
+                // 无显示器自检（不弹窗，打印膨胀前后 AABB + DONE）：
+                // "--headless",
+            ]
+        },
+        {
             "name": "plan_two_cfgs",
             "type": "debugpy",
             "request": "launch",
@@ -376,6 +642,98 @@
             "console": "integratedTerminal",
             "args": [
             ]
+        },
+        {
+            "name": "plan_two_cfgs_scene",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/plan_two_cfgs_scene.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--scene", "/media/a/新加卷/tempt/4/scene1.pkl"
+            ]
+        },
+        {
+            "name": "render_seam",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "render/render_seam.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--obj", "/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On_part_watertight.obj",
+                "--seam-npy", "/media/a/upan/tempt/2/柱_1JdzFk001Mz34qC38vE3On/seam_40.npy",
+                "--out", "/tmp/render_out2",
+                "--max-envs", "1",
+                // "--headless",
+                "--force-convert"
+            ]
+        },
+        {
+            "name": "visualize_render_seam_pointcloud",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "render/visualize_pointcloud.py",
+            "console": "integratedTerminal",
+            // 读 render_seam.py 某个 pose 目录（left/right rgb+depth+meta.npy），open3d 可视化左右目融合彩色点云。
+            // pose 目录 = <out>/<obj_ascii_stem>/<seam_stem>/pose_N（与上面 render_seam 的 --out 对应）。
+            "args": [
+                // "/media/a/新加卷/tempt/3/m_1JdzFk001Mz34qC38vE3On_part_watertight/seam_40/pose_2",
+                "/home/a/Downloads/render_out2/m_1JdzFk001Mz34qC38vE3On_part/m_1JdzFk001Mz34qC38vE3On_part_seam_40_pose0",
+                // 左右目融合到世界系（both）/ 单目（left|right）：
+                "--eye", "both",
+                // 丢弃 z 超过该值的点（米，0=不限）：
+                "--max-depth", "50",
+                // 体素下采样尺寸（米，0=不降采样）：
+                "--voxel", "0.0",
+                // world=用 meta 相机世界位姿融合（默认）；camera=各目自身光学系：
+                "--frame", "world",
+                // 可选：另存合并点云 / 无显示器只存不弹窗：
+                // "--save", "/tmp/render_out2/pose_0.ply",
+                // "--no-vis",
+            ]
+        },
+        {
+            "name": "viz_render_seam_isaacsim",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/viz_render_seam_isaacsim.py",
+            "console": "integratedTerminal",
+            // 【独立脚本，不依赖项目任何文件】仿 visualize_render_seam_pointcloud，但改在 Isaac Sim 里摆：
+            //   工件网格(自己解析 --obj) + 焊缝(render_info 的 seam_pose，红球+黄线+朝向轴)
+            //   + 机械臂(--robot-usd 载为 Articulation，摆到 --joint-angles 指定的初始关节角)。
+            // render_info 的 workpiece_pose7 / seam_pose 都在 base 系；机械臂根节点放世界原点 → base 系==世界系。
+            "args": [
+                // 工件 .obj（与 --render-dir 同一个工件）：
+                "--obj", "/media/a/新加卷/tempt/2/柱_1JdzFk001Mz34qC38vE3On_part_watertight.obj",
+                // render_seam.py 的 pose 目录（含 left/ 或 right/ 的 render_info.npy）：
+                "--render-dir", "/home/a/Downloads/render_out2/m_1JdzFk001Mz34qC38vE3On_part/m_1JdzFk001Mz34qC38vE3On_part_seam_40_pose0",
+                // 机械臂 USD（default.yaml 的 robot.usd_path）：
+                "--robot-usd", "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/robot_description_wo_cam_cover.usd",
+                // 初始关节角(弧度，逗号分隔，顺序同 render_info 的 joint_names)；缺省用 render_info 的 retract_config：
+                // "--joint-angles", "0,-1.57,1.57,0,1.57,0",
+                // 关节名(逗号分隔，与 --joint-angles 对应)；缺省用 render_info 的 joint_names：
+                // "--joint-names", "shoulder_pan_joint,shoulder_lift_joint,elbow_joint,wrist_1_joint,wrist_2_joint,wrist_3_joint",
+                // 焊缝点红球半径(米)：
+                // "--seam-radius", "0.008",
+                // 可选：不画焊缝朝向轴 / 不加地面(避免遮挡工件) / 无显示器只自检不弹窗：
+                // "--no-seam-frames",
+                // "--no-ground",
+                // "--headless",
+            ]
+        },
+        
+        {
+            "name": "test remote open3d vis",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "scripts/test_open3d_viz.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "/workspace/isaaclab/_isaac_sim/python.sh",
+            "env": { "DISPLAY": ":1000.0" },
+            "args": [
+            ],
+            
         },
     ]
 }
