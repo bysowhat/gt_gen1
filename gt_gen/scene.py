@@ -1316,6 +1316,10 @@ class Scene:
         板心在焊缝正上方、宽沿 ±对称。参数默认读 cfg.obstacle_placement_type2；可用关键字覆盖
         （shape/n_cm/width_cm/length_pct/length_min_cm/thickness_cm/seed）。产出的 ObstacleSpec
         （以棱柱 mesh 表示，外形由 shape 决定）追加进 self.obstacles 并返回。
+
+        数值参数（n_cm/width_cm/length_pct/length_min_cm/thickness_cm）支持区间随机：config 里
+        写 X_min + X_max（两者都有）则在 [min,max] 均匀随机取（用 seed+seam_id 决定的 rng，可复现）；
+        取值优先级 = 关键字覆盖（固定）> [X_min,X_max] 区间 > 固定 X > 内置默认。
         """
         import random
         p = dict(self.cfg.obstacle_placement_type2)
@@ -1331,10 +1335,31 @@ class Scene:
         if float(np.dot(na, bis)) < 0:
             na = -na
 
-        n = float(p["n_cm"]) / 100.0
-        width = float(p["width_cm"]) / 100.0
-        length = max(float(p["length_pct"]) / 100.0 * seam_len, float(p["length_min_cm"]) / 100.0)
-        thickness = float(p["thickness_cm"]) / 100.0
+        # rng 提前：seed+seam_id 决定，保证「同 seed / 同焊缝 → 同随机值」可复现；
+        # 既用于下面各数值参数的区间采样，也用于 profile（trapezoid 倒角）。
+        rng = random.Random(int(p.get("seed", 0)) * 100003 + self.seam_id * 101)
+
+        def _resolve(key, default):
+            """解析一个数值参数，优先级：override 固定值 > [key_min,key_max] 均匀随机 > 固定 key > default。"""
+            if overrides.get(key) is not None:           # 调用方显式传入 → 固定优先
+                return float(overrides[key])
+            kmin, kmax = p.get(f"{key}_min"), p.get(f"{key}_max")
+            if kmin is not None and kmax is not None:    # 有区间 → 在 [min,max] 均匀随机
+                return rng.uniform(float(kmin), float(kmax))
+            if p.get(key) is not None:                   # 固定值
+                return float(p[key])
+            return float(default)
+
+        n_cm = _resolve("n_cm", 10.0)
+        width_cm = _resolve("width_cm", 30.0)
+        length_pct = _resolve("length_pct", 100.0)
+        length_min_cm = _resolve("length_min_cm", 3.0)
+        thickness_cm = _resolve("thickness_cm", 2.0)
+
+        n = n_cm / 100.0
+        width = width_cm / 100.0
+        length = max(length_pct / 100.0 * seam_len, length_min_cm / 100.0)
+        thickness = thickness_cm / 100.0
         hw, hl = width / 2.0, length / 2.0
 
         # 候选 C1：板法向=na，板心=焊缝中点沿壁方向 b_dir 抬高 n；长向=切线 t，宽向=t×na
@@ -1346,12 +1371,11 @@ class Scene:
         R = np.column_stack([x_axis, y_axis, z_axis])
         apex_sign = 1.0 if float(np.dot(bis, y_axis)) >= 0 else -1.0
 
-        rng = random.Random(int(p.get("seed", 0)) * 100003 + self.seam_id * 101)
         profile = _shape_profile(shape, hw, hl, apex_sign, rng)
         mesh = _prism_mesh(anchor, R, profile, thickness, color)
         spec = ObstacleSpec(
             otype=2, kind=shape, meshes=[mesh], seam_line=seam_line, color=color,
-            meta=dict(candidate="C1", anchor=anchor, R=R, b_dir=b_dir, n_cm=float(p["n_cm"]),
+            meta=dict(candidate="C1", anchor=anchor, R=R, b_dir=b_dir, n_cm=n_cm,
                       width=width, length=length, thickness=thickness))
         self.obstacles.setdefault(self.seam_id, []).append(spec)
         return spec

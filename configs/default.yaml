@@ -326,13 +326,20 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
   type2:                                # 障碍物类型2：焊缝旁遮挡板（固定候选 C1，示例 launch.json:viz_seam_plate_candidates_isaacsim）
     # Scene.add_obstacle_type2 按本段参数据焊缝几何(切线 t / 两面表面方向 d1,d2 / 角平分线 bis)造遮挡板：
     #   固定 C1 = 水平板·焊缝正上方对称（∥地面a面、沿壁方向抬高 n_cm、板心在焊缝正上方、宽沿±对称）。
+    # 数值参数（n_cm/width_cm/length_pct/length_min_cm/thickness_cm）支持区间随机：写成
+    #   X_min + X_max（两者都有）则每次放置在 [min,max] 均匀随机取（seed+seam_id 决定，可复现）；
+    #   只写固定 X 则用定值。示例：n_cm 已改成区间，其余仍是定值——想随机哪个就把它改成 _min/_max。
     shape: plate                        # 板外形：plate=完整矩形 / triangle=角平分线三角 / trapezoid=随机倒角梯形
-    n_cm: 10.0                          # 离焊缝距离 n(cm)：C1 沿壁方向的抬高量
-    width_cm: 30.0                      # 板宽(cm)
-    length_pct: 100.0                   # 板长占焊缝弧长百分比(%)
+    n_cm_min: 8.0                       # 离焊缝距离 n(cm) 下限：C1 沿壁方向的抬高量，在 [min,max] 均匀随机
+    n_cm_max: 14.0                      # 离焊缝距离 n(cm) 上限
+    width_cm_min: 20.0                      # 板宽(cm)下限
+    width_cm_max: 40.0                      # 板宽(cm)上限
+    length_pct_min: 80.0                   # 板长占焊缝弧长百分比(%)下限
+    length_pct_max: 100.0                   # 板长占焊缝弧长百分比(%)上限
     length_min_cm: 3.0                  # 板长下限(cm)：实际板长 = max(length_pct%×焊缝弧长, 此值)
-    thickness_cm: 2.0                   # 板厚(cm)
-    seed: 0                             # trapezoid 随机倒角的种子（可复现；plate/triangle 不用）
+    thickness_cm_min: 1.5                   # 板厚(cm)下限
+    thickness_cm_max: 3.0                   # 板厚(cm)上限
+    seed: 0                             # trapezoid 随机倒角 & 数值区间采样的种子（可复现；plate/triangle 倒角不用）
 
   type3:                                # 障碍物类型3：把焊缝包住的开口障碍（示例 launch.json:viz_seam_open_box_isaacsim）
     # Scene.add_obstacle_type3 用 1 个开口障碍把焊缝那段包住；大小+焊缝在其中的位置由 6 个面到焊缝的

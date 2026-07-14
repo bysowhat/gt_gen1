@@ -505,7 +505,9 @@ class Config:
     def obstacle_placement_type2(self) -> dict:
         """障碍物类型2（焊缝旁遮挡板候选）参数段 = obstacle_placement.type2（单一来源）。
         供 Scene.add_obstacle_type2 读取；缺省与 default.yaml 一致（示例见
-        scripts/viz_seam_plate_candidates_isaacsim.py）。"""
+        scripts/viz_seam_plate_candidates_isaacsim.py）。
+        注：数值参数还支持区间随机——config 里写 X_min + X_max（如 n_cm_min/n_cm_max）会原样
+        透传给 add_obstacle_type2，由其在 [min,max] 均匀随机取（见该方法 docstring）。"""
         p = dict(self.raw.get("obstacle_placement", {}).get("type2", {}))
         p.setdefault("shape", "plate")
         p.setdefault("n_cm", 10.0)
