@@ -53,23 +53,14 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
     # _debug_viz_voxmap(voxmap, h_expl, target_cfg, truth_scene, show_unknown=True, cur_cfg=cur_cfg, cfg_show=True)
     # _debug_viz_voxmap(voxmap, h_expl, target_cfg, truth_scene, show_unknown=True, cur_cfg=cur_cfg, cfg_show=False)
     cfg = h_expl.config
-    if cfg.planner_backend == "stomp":
-        # STOMP 后端：把 voxmap 的非 FREE 区域转 STOMP 世界（mesh 或 cuboid，见 voxel_world），关节目标规划 cur->target。
-        from gt_gen import stomp_iface as si
-        world, ck = si.world_from_voxmap_auto(cfg, voxmap)
-        traj = si.plan_joint_single(cfg, cur_cfg=cur_cfg, target_cfg=target_cfg, world=world,
-                                    checker_type=ck)
-        if traj is None:
-            print("[_move_to] STOMP plan_joint 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
-            return None, None
-    else:
-        res = ci.plan_to_config(h_expl, cur_cfg, target_cfg, max_attempts=cfg.plan_max_attempts)
-        if res is None or not bool(res.success.item()):
-            # 诊断：起点/终点哪个在碰撞，还是中间连不上（区分三种成因）
-            print("[_move_to] plan_to_config 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
-            # cuRobo 实际避障的占据场（sync 后、含 inflate），看 target_cfg 整臂是否泡在障碍里
-            return None, None
-        traj = res.get_interpolated_plan().position.detach().cpu().numpy()
+    # STOMP-only：把 voxmap 的非 FREE 区转 STOMP cuboid 世界（多分辨率则 coarse+fine union），关节目标规划 cur->target。
+    from gt_gen import stomp_iface as si
+    world, ck = si.world_from_voxmap_auto(cfg, voxmap)
+    traj = si.plan_joint_single(cfg, cur_cfg=cur_cfg, target_cfg=target_cfg, world=world,
+                                checker_type=ck)
+    if traj is None:
+        print("[_move_to] STOMP plan_joint 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
+        return None, None
 
     # 沿途每 every_n 个路点拍一次（h_expl 做相机 FK，与 h_truth 同一套运动学）
     obs_flags = np.zeros(len(traj), dtype=np.int64)
@@ -84,10 +75,14 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
 
 
 def _frontier_cells(voxmap) -> np.ndarray:
-    """探索前沿：所有『自身 UNKNOWN 且 6-邻接含 FREE』的体素下标 (M,3)。"""
-    from gt_gen.voxmap import UNKNOWN, FREE
+    """探索前沿：所有『自身 UNKNOWN 且 6-邻接含 FREE』的体素下标 (M,3)。
 
-    grid = voxmap.grid
+    多分辨率：前沿是【体素下标集合】，在 coarse 索引空间算（index_grid），与 handle_stuck 的
+    raycast_reveal / voxmap.get(reveal) 同一索引空间——就近揭示兜底是启发式，不碰 GT 闸门。
+    """
+    from gt_gen.voxmap import UNKNOWN, FREE, index_grid
+
+    grid = index_grid(voxmap).grid
     unknown = (grid == UNKNOWN)
     free = (grid == FREE)
     nb = np.zeros_like(free)
@@ -110,7 +105,7 @@ def handle_stuck(h_truth, h_expl, voxmap, cur_cfg, camera_model, truth_scene, ma
     """
     from gt_gen.candidates import generate_candidates
     from gt_gen.nbv import raycast_reveal
-    from gt_gen.voxmap import UNKNOWN
+    from gt_gen.voxmap import UNKNOWN, index_grid
 
     frontier = _frontier_cells(voxmap)
     if frontier.shape[0] == 0:
@@ -120,12 +115,13 @@ def handle_stuck(h_truth, h_expl, voxmap, cur_cfg, camera_model, truth_scene, ma
     if not cands:
         return False, cur_cfg, None, None
 
+    ig = index_grid(voxmap)                                    # reveal/frontier 同在 coarse 索引空间
     best, best_gain = None, 0
     for c in cands:
         reveal = raycast_reveal(voxmap, c.cam_pose, camera_model, truth_scene)
         if reveal.shape[0] == 0:
             continue
-        gain = int((np.asarray(voxmap.get(reveal)) == UNKNOWN).sum())   # 能揭开多少未知
+        gain = int((np.asarray(ig.get(reveal)) == UNKNOWN).sum())   # 能揭开多少未知
         if gain > best_gain:
             best, best_gain = c, gain
     if best is None or best_gain <= 0:
@@ -162,20 +158,32 @@ def _debug_viz_observe(voxmap, fk_handle, q, camera_model, truth_scene, max_dept
     from verify_step8 import (_arm_mesh, _work_mesh, _cells_mesh, _draw, _roi_and_base,
                               _fov_frustum)
     from gt_gen.sensor import camera_pose_from_config
-    from gt_gen.voxmap import FREE, OCCUPIED
+    from gt_gen.voxmap import FREE, OCCUPIED, MultiResVoxelMap
+
+    # 多分辨率壳：coarse(挖空 fine 盒) 与 fine 各自按【自身 voxel_size】画立方体，否则 fine 格会被
+    # 当成 coarse 尺寸画大（_cells_mesh 用传入网格的 voxel_size）。单图则整张一次画完。
+    def _parts_by_grid(state):
+        if isinstance(voxmap, MultiResVoxelMap):
+            cc = voxmap.coarse.state_centers(state)
+            if cc.shape[0]:
+                cc = cc[~voxmap.in_fine_box(cc)]                # coarse 挖空 fine 盒内
+            return [(voxmap.coarse, cc), (voxmap.fine, voxmap.fine.state_centers(state))]
+        return [(voxmap, voxmap.state_centers(state))]
 
     M = camera_pose_from_config(fk_handle, q, camera_model)      # 构型 q 处相机 4x4 位姿
     geoms = [("work", _work_mesh(truth_scene), "lit", None),
              ("arm", _arm_mesh(fk_handle, list(q)), "lit", None)]
-    fc = voxmap.state_centers(FREE)
-    n_free = int(fc.shape[0])
-    if n_free:
-        geoms.append(("free", _cells_mesh(voxmap, fc), "fill", [0.20, 0.45, 0.95, 0.12]))
-    oc = voxmap.state_centers(OCCUPIED)
-    n_occ = int(oc.shape[0])
-    if n_occ:
-        om = _cells_mesh(voxmap, oc); om.paint_uniform_color([0.92, 0.12, 0.12])
-        geoms.append(("occ", om, "lit", None))
+    n_free = 0
+    for i, (g, fc) in enumerate(_parts_by_grid(FREE)):
+        n_free += int(fc.shape[0])
+        if fc.shape[0]:                                          # 蓝半透明，按 g.voxel_size 画
+            geoms.append((f"free{i}", _cells_mesh(g, fc), "fill", [0.20, 0.45, 0.95, 0.12]))
+    n_occ = 0
+    for i, (g, oc) in enumerate(_parts_by_grid(OCCUPIED)):
+        n_occ += int(oc.shape[0])
+        if oc.shape[0]:                                          # 红实心，按 g.voxel_size 画
+            om = _cells_mesh(g, oc); om.paint_uniform_color([0.92, 0.12, 0.12])
+            geoms.append((f"occ{i}", om, "lit", None))
     edges, cone = _fov_frustum(M, camera_model, max_depth)       # 相机视锥（紫，远面=max_depth）
     geoms.append(("fov_cone", cone, "fill", [0.6, 0.2, 0.85, 0.12]))
     geoms.append(("fov_edges", edges, "line", None))
@@ -538,25 +546,38 @@ def _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_d
     import open3d as o3d
     from verify_step8 import (_arm_mesh, _work_mesh, _cells_mesh, _draw, _roi_and_base,
                               _ball, _lines, _fov_frustum)
-    from gt_gen.voxmap import FREE, OCCUPIED
+    from gt_gen.voxmap import FREE, OCCUPIED, MultiResVoxelMap, index_grid
     from gt_gen.reach_b import compute_blocking_B
     from gt_gen.candidates import flange_origin
     from gt_gen import nbv as _nbv
 
     tag = f"R{rnd} " if rnd is not None else ""
 
+    # 多分辨率壳：coarse(挖空 fine 盒) 与 fine 各自按【自身 voxel_size】画；单图整张一次画完。
+    def _parts_by_grid(state):
+        if isinstance(voxmap, MultiResVoxelMap):
+            cc = voxmap.coarse.state_centers(state)
+            if cc.shape[0]:
+                cc = cc[~voxmap.in_fine_box(cc)]                # coarse 挖空 fine 盒内
+            return [(voxmap.coarse, cc), (voxmap.fine, voxmap.fine.state_centers(state))]
+        return [(voxmap, voxmap.state_centers(state))]
+
+    ig = index_grid(voxmap)                                     # B 所在的 coarse 索引空间 → 世界
+
     # —— 公共底图：工件 + 当前整臂 + voxmap 三态 ——
     geoms = [("work", _work_mesh(truth_scene), "lit", None),
              ("arm", _arm_mesh(h_truth, list(cur_cfg)), "lit", None)]
-    fc = voxmap.state_centers(FREE)
-    n_free = int(fc.shape[0])
-    if n_free:
-        geoms.append(("free", _cells_mesh(voxmap, fc), "fill", [0.20, 0.45, 0.95, 0.10]))
-    oc = voxmap.state_centers(OCCUPIED)
-    n_occ = int(oc.shape[0])
-    if n_occ:
-        om = _cells_mesh(voxmap, oc); om.paint_uniform_color([0.92, 0.12, 0.12])
-        geoms.append(("occ", om, "lit", None))
+    n_free = 0
+    for i, (g, fc) in enumerate(_parts_by_grid(FREE)):
+        n_free += int(fc.shape[0])
+        if fc.shape[0]:
+            geoms.append((f"free{i}", _cells_mesh(g, fc), "fill", [0.20, 0.45, 0.95, 0.10]))
+    n_occ = 0
+    for i, (g, oc) in enumerate(_parts_by_grid(OCCUPIED)):
+        n_occ += int(oc.shape[0])
+        if oc.shape[0]:
+            om = _cells_mesh(g, oc); om.paint_uniform_color([0.92, 0.12, 0.12])
+            geoms.append((f"occ{i}", om, "lit", None))
 
     # —— P* 末端轨迹（黑线，子采样的 flange 原点）+ reach_pt 处整臂碰撞球（黄） ——
     P = r.P_star
@@ -578,15 +599,15 @@ def _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_d
 
     if r.status == "ok":
         # 选中视点假设性 reveal → B 是否被覆盖（绿=覆盖/橙=没覆盖），直接看「这一步揭不揭得开 B」
-        Bw = voxmap.voxel_to_world(B) if B.shape[0] else np.empty((0, 3))
+        Bw = ig.voxel_to_world(B) if B.shape[0] else np.empty((0, 3))
         reveal = _nbv.raycast_reveal(voxmap, r.cam_pose, camera_model, truth_scene, max_depth=max_depth)
         seen = (np.array([tuple(b) in set(map(tuple, reveal)) for b in B], bool)
                 if B.shape[0] else np.zeros(0, bool))
         if B.shape[0] and (~seen).any():
-            mm = _cells_mesh(voxmap, Bw[~seen]); mm.paint_uniform_color([1.0, 0.55, 0.0])
+            mm = _cells_mesh(ig, Bw[~seen]); mm.paint_uniform_color([1.0, 0.55, 0.0])
             geoms.append(("B_miss", mm, "lit", None))                  # B 没被看到 橙
         if B.shape[0] and seen.any():
-            mm = _cells_mesh(voxmap, Bw[seen]); mm.paint_uniform_color([0.1, 0.85, 0.2])
+            mm = _cells_mesh(ig, Bw[seen]); mm.paint_uniform_color([0.1, 0.85, 0.2])
             geoms.append(("B_seen", mm, "lit", None))                  # B 被看到 绿
         # 选中视点的整臂（青）+ 相机帧/FOV/视线/目标
         am = _arm_mesh(h_truth, list(r.cfg)); am.paint_uniform_color([0.10, 0.75, 0.80])
@@ -606,7 +627,7 @@ def _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_d
                  f"|B|={r.n_B} 候选={r.n_candidates} | reveal∩B 实测覆盖={n_seen}/{r.n_B}(绿)未覆盖(橙)")
     elif r.status == "no_reachable_candidate":
         if B.shape[0]:
-            geoms.append(("B", _cells_mesh(voxmap, voxmap.voxel_to_world(B)), "fill", [1.0, 0.55, 0.0, 0.30]))  # B 全橙半透明：没有候选能看它
+            geoms.append(("B", _cells_mesh(ig, ig.voxel_to_world(B)), "fill", [1.0, 0.55, 0.0, 0.30]))  # B 全橙半透明：没有候选能看它
         title = (f"main_loop NBV {tag}status=no_reachable_candidate: |B|={r.n_B}(橙) 无可达候选 "
                  f"→ 转就近揭示兜底(常为 stuck 主因)")
     elif r.status == "corridor_confirmed":
@@ -754,12 +775,15 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
     """
     import torch
     from gt_gen import curobo_iface as ci
-    from gt_gen.collision_sync import sync_collision_world
     from gt_gen.nbv import best_next_view_using_oracle
     from gt_gen.sensor import load_camera_model
     from gt_gen.voxmap import FREE
 
     cfg = h_truth.config
+    # STOMP-only：cuRobo 不再当规划后端（VOXEL 世界/sync_collision_world 一整套已删，见方案 Row 5）。
+    # cuRobo 仍是 STOMP 的运动学地基（FK/IK/WorldConfig），h_expl 仅用于相机 FK 与 explain_endpoints。
+    assert cfg.planner_backend == "stomp", (
+        f"generate_gt 现为 STOMP-only，planner.backend 须为 'stomp'，读到 '{cfg.planner_backend}'")
     if camera_model is None:
         camera_model = load_camera_model(cfg)
     if params is None:
@@ -798,28 +822,19 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
 
     for rnd in range(max_rounds):
         torch.cuda.empty_cache()
-        # _debug_viz_voxmap(voxmap, h_truth, cur_cfg, truth_scene, every_n_layers=4)                     # voxmap 三态（sync 输入，不随 sync 变）
-        # _debug_viz_curobo(h_expl, voxmap, h_truth, cur_cfg, truth_scene, "before", every_n_layers=10)   # sync 前：cuRobo 占据应空
-        sync_collision_world(h_expl, voxmap)                 # 步0：最新「非 FREE」→ h_expl 障碍场
-        # _debug_viz_curobo(h_expl, voxmap, h_truth, cur_cfg, truth_scene, "after", every_n_layers=10)    # sync 后：仅圆柱留洞
+        # _debug_viz_voxmap(voxmap, h_truth, cur_cfg, truth_scene, every_n_layers=4)                     # voxmap 三态
 
-        # 步①：试在已确认自由区直接规划到 goal（h_expl，UNKNOWN 已当障碍）
-        if cfg.planner_backend == "stomp":
-            # STOMP：把当前 voxmap 非 FREE 区转 mesh；goal_cfg 给定→直接规划到目标关节角，否则规划到 goal 位姿。
-            from gt_gen import stomp_iface as si
-            _w1, _ck1 = si.world_from_voxmap_auto(cfg, voxmap)
-            # _debug_viz_w1(_w1, h_expl, voxmap, cur_cfg, truth_scene, goal_pose, rnd=rnd)  # 看 _w1（mesh/cuboid）+ 当前整臂（每轮弹窗；只看首轮改 if rnd==0）
-            if goal_cfg is not None:
-                seg = si.plan_joint_single(cfg, _w1, cur_cfg, goal_cfg, checker_type=_ck1)
-            else:
-                seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
-            reached_direct = seg is not None
+        # 步①：试在已确认自由区直接规划到 goal（STOMP cuboid 世界，UNKNOWN 当障碍）
+        from gt_gen import stomp_iface as si
+        _w1, _ck1 = si.world_from_voxmap_auto(cfg, voxmap)
+        # _debug_viz_w1(_w1, h_expl, voxmap, cur_cfg, truth_scene, goal_pose, rnd=rnd)  # 看 _w1 cuboid + 当前整臂
+        if goal_cfg is not None:
+            seg = si.plan_joint_single(cfg, _w1, cur_cfg, goal_cfg, checker_type=_ck1)
         else:
-            res = ci.plan_to_pose(h_expl, cur_cfg, goal_pose,
-                                  max_attempts=cfg.plan_max_attempts, pose_cost_metric=metric)
-            reached_direct = res is not None and bool(res.success.item())
-            seg = (res.get_interpolated_plan().position.detach().cpu().numpy()
-                   if reached_direct else None)
+            seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
+        # _debug_viz_w1(_w1, h_expl, voxmap, goal_cfg, truth_scene, goal_pose, rnd=rnd)
+        # _debug_viz_voxmap(voxmap, h_truth, cur_cfg, truth_scene, every_n_layers=10) 
+        reached_direct = seg is not None
         if reached_direct:
             n_seg = len(seg) - 1
             GT.extend(seg[1:])
@@ -838,7 +853,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             # （同一 3D 空间 + 同起点 retract，但这里 plan 会随机失败/位姿略差；全知阶段那条已验证可行。）
             P = np.asarray(p_star_init, dtype=np.float64)
             print(f"[step② R0] 直接用预规划 P*（--scene 绕行轨迹）{P.shape[0]} 点，跳过重新规划")
-        elif cfg.planner_backend == "stomp":
+        else:
             # STOMP：在 h_plan 对应的膨胀 MESH 世界(world_plan)上规划 P*；single 已返回最优一条
             # （等价 multi 取首条，但更简）。world_plan 由调用方按 h_plan 的 WorldConfig 传入。
             from gt_gen import stomp_iface as si
@@ -851,8 +866,6 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     P = si.plan_joint_single(cfg, world_plan, cur_cfg, goal_cfg)
                 else:
                     P = si.plan_pose_single(cfg, world_plan, cur_cfg, goal_pose)
-                    # [1.2627240419387817, -2.024371862411499, 6.27759313583374, -0.5791741609573364, -1.5592968463897705, 3.2276997566223145]
-                    # [-0.13571767508983612, -0.9203471541404724, 1.2579456567764282, -1.0674389600753784, -0.9313104748725891, -2.814171075820923]
                 if P is None:
                     print(f"[step② P*失败 R{rnd}] STOMP 在 world_plan 上未找到到 goal 的合格轨迹")
                     # STOMP 规划不出 P* → 本场景不可行，直接失败退出 generate_gt（不再进 NBV/后续轮）
@@ -861,22 +874,6 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     info["observe"] = np.asarray(OBS, dtype=np.int64)
                     info["goal"] = np.asarray(GOAL_FLAG, dtype=np.int64)
                     return np.asarray(GT, dtype=np.float64), status, info
-        else:
-            # 改走 plan_to_pose_all（= place_obstacles.detour_exists 那条成功路径）：对多条 IK 分支逐个 plan，
-            # 取第 0 条（IK 误差最小的成功解）。与 plan_to_pose 同核，但显式跑满 IK 多解、对随机失败更稳。
-            _Ps = ci.plan_to_pose_all(h_plan, cur_cfg, goal_pose, max_attempts=cfg.plan_max_attempts,
-                                      pose_cost_metric=metric, max_solutions=1, dedup_rad=0.0)
-            P = _Ps[0] if _Ps else None
-            if P is None:
-                # 诊断 P* 失败到底卡在哪（IK 无解 / 起点碰撞 / 终点碰撞 / 中段连不上）。
-                _ik = ci.solve_ik(h_plan, goal_pose, pose_cost_metric=metric, return_seeds=cfg.ik_return_seeds)
-                _cands = ci.ik_configs(h_plan, _ik)
-                if not _cands:
-                    print(f"[step② P*失败 R{rnd}] IK 完全无解：goal 在(膨胀)真值世界不可达/被障碍包住 "
-                          f"goal_pos={np.round(np.asarray(goal_pose[0], float), 3)}")
-                else:
-                    print(f"[step② P*失败 R{rnd}] IK 有 {len(_cands)} 解但 plan 全失败 → "
-                          f"{ci.explain_endpoints(h_plan, cur_cfg, _cands[0][0])}")
         # _debug_viz_pstar(h_truth, voxmap, cur_cfg, P, truth_scene, goal_pose, rnd=rnd)  # 看真值最优路 P*（注释此行可关）
         # 步③④：一轮特权 NBV（P* → reach_pt/B → 候选 → 假设性 raycast 打分 → argmax）
         r, r_list = best_next_view_using_oracle(h_truth, cur_cfg, voxmap, truth_scene, goal_pose,

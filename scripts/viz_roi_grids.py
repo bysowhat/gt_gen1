@@ -102,7 +102,7 @@ def main():
     cfg = load_config()
     h = ci.init_curobo(cfg)                      # cuRobo voxel 世界用 config ROI
     vm = build_roi_voxmap(cfg)                   # voxmap 用同一 ROI(外扩1体素)
-    vs = cfg.voxel_size_m
+    vs = cfg.voxel_size_m_coarse
 
     vm_lo, vm_hi = vm.origin, vm.upper
     vg = h.mg.world_coll_checker.get_voxel_grid(h.voxel["name"])

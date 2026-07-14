@@ -31,18 +31,23 @@ def compute_reach_pt(handle, voxmap, p_star, resolution: Optional[float] = None)
 
 def compute_blocking_B(handle, voxmap, p_star, reach_idx, k_lookahead,
                        resolution: Optional[float] = None) -> np.ndarray:
-    """reach_pt 前方 k 个路点扫掠体积里仍 UNKNOWN 的体素集合 = B。返回 (M,3) 下标。"""
-    from gt_gen.swept import swept_volume
-    from gt_gen.voxmap import UNKNOWN
+    """reach_pt 前方 k 个路点扫掠体积里仍 UNKNOWN 的体素集合 = B。返回 (M,3) 下标。
 
+    多分辨率：B 是【体素下标集合】，统一在 coarse 索引空间算（index_grid）——NBV 视点选择用，见
+    voxmap.index_grid。GT 闸门（compute_reach_pt 的 motion_stays_in_free）仍走整壳、fine 精度。
+    """
+    from gt_gen.swept import swept_volume
+    from gt_gen.voxmap import UNKNOWN, index_grid
+
+    g = index_grid(voxmap)                                    # 多分辨率壳 → coarse；单图 → 自身
     p_star = np.asarray(p_star, float)
     B = set()
     end = min(reach_idx + int(k_lookahead), len(p_star) - 1)
     for i in range(reach_idx, end):
-        cells = swept_volume(handle, voxmap, p_star[i], p_star[i + 1], resolution=resolution)
+        cells = swept_volume(handle, g, p_star[i], p_star[i + 1], resolution=resolution)
         if cells.shape[0] == 0:
             continue
-        st = np.asarray(voxmap.get(cells))
+        st = np.asarray(g.get(cells))
         for v in map(tuple, cells[st == UNKNOWN]):
             B.add(v)
     if not B:

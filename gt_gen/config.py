@@ -58,8 +58,19 @@ class Config:
         return self.raw["sensor"]["camera"]
 
     @property
-    def voxel_size_m(self) -> float:
-        return float(self.raw["roi"]["voxel_size_m"])
+    def voxel_size_m_coarse(self) -> float:
+        """粗网格体素边长（米）：覆盖整个 ROI 的探索三态图。见 default.yaml roi.voxel_size_m_coarse。"""
+        return float(self.raw["roi"]["voxel_size_m_coarse"])
+
+    @property
+    def voxel_size_m_fine(self) -> float:
+        """细网格体素边长（米）：焊缝周围 fine 盒的高分辨率子网格。见 default.yaml roi.voxel_size_m_fine。"""
+        return float(self.raw["roi"]["voxel_size_m_fine"])
+
+    @property
+    def fine_box_margin_m(self) -> float:
+        """fine 盒相对焊缝 AABB 的各方向外扩量（米）。见 default.yaml roi.fine_box_margin_cm（方案定 10cm）。"""
+        return float(self.raw.get("roi", {}).get("fine_box_margin_cm", 10.0)) / 100.0
 
     @property
     def roi_center(self) -> list:
@@ -76,7 +87,7 @@ class Config:
         会让该轴的体素索引步长差 1 → 占据沿该轴整体错位/抹开 → 规划起点假碰撞。
         取整数倍可彻底规避（见 docs/step10-precise-obstacle-notes / diag）。
         """
-        vs = self.voxel_size_m
+        vs = self.voxel_size_m_coarse
         return [int(round(float(d) / vs)) * vs for d in self.raw["roi"]["dims"]]
 
 
@@ -418,8 +429,17 @@ class Config:
 
     @property
     def voxel_inflate_voxels(self) -> int:
-        """sync_collision_world 把非 FREE 障碍向 FREE 膨胀的体素层数（保守余量，见 default.yaml）。"""
-        return int(self.raw.get("planner", {}).get("voxel_inflate_voxels", 1))
+        """sync_collision_world 把非 FREE 障碍向 FREE 膨胀的体素层数（保守余量，见 default.yaml）。
+
+        当前约定必须 =0（不膨胀）：膨胀单位是体素层数，多分辨率下同「膨 1 层」在粗/细网格
+        物理厚度不同（4cm vs 1cm），语义不一致；且细化已把 GT 闸门的 √3/2·vs 过近似缝收窄，
+        膨胀需求随之消失。若要重新启用，先想清楚多分辨率下每张网格各膨几层。
+        """
+        v = int(self.raw.get("planner", {}).get("voxel_inflate_voxels", 0))
+        assert v == 0, (
+            f"voxel_inflate_voxels 当前必须为 0，读到 {v}；"
+            f"膨胀在多分辨率下语义不一致（粗网格膨 4cm、细网格膨 1cm），已停用")
+        return v
 
     @property
     def num_trajopt_seeds(self) -> int:

@@ -34,21 +34,9 @@ def commit_observation(voxmap, free_points, occ_points, sticky_occupied: bool = 
     return {"free": int(nf), "occ": int(no)}
 
 
-def observe_and_update(voxmap, camera_pose, camera_model, truth_scene, max_depth,
-                       pixel_stride: Optional[int] = None, free_step: Optional[float] = None,
-                       sticky_occupied: bool = True) -> dict:
-    """实拍一次（warp 视锥体素雕刻）：视锥内体素连相机中心判遮挡 → 提交进 voxmap。
-
-    走 sensor.carve_observe 拿 (free_idx, occ_idx) 体素下标，按粘滞策略写状态：
-      free → 只写当前非 OCCUPIED 的格（不降级已知障碍）；occ → 无条件、且在 free 之后 → 覆盖。
-    产实心 FREE（扛得住 sync inflate=1），优于旧 trimesh 稀疏射线。返回生效体素数 dict。
-
-    pixel_stride / free_step：已废弃（旧 trimesh 路径形参），保留仅为兼容调用方，忽略。
-    """
-    from gt_gen.sensor import carve_observe
+def _commit_carve(voxmap, free_idx, occ_idx, sticky_occupied: bool = True) -> dict:
+    """把一对 (free_idx, occ_idx) 裸下标按粘滞策略写进【单张】ThreeStateVoxelMap 子网格。"""
     from gt_gen.voxmap import FREE, OCCUPIED
-
-    free_idx, occ_idx = carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth)
 
     nf = no = 0
     if free_idx.shape[0]:
@@ -59,3 +47,36 @@ def observe_and_update(voxmap, camera_pose, camera_model, truth_scene, max_depth
     if occ_idx.shape[0]:
         no = voxmap.set_many(occ_idx, OCCUPIED)                     # 无条件、free 之后 → 覆盖
     return {"free": int(nf), "occ": int(no)}
+
+
+def observe_and_update(voxmap, camera_pose, camera_model, truth_scene, max_depth,
+                       pixel_stride: Optional[int] = None, free_step: Optional[float] = None,
+                       sticky_occupied: bool = True) -> dict:
+    """实拍一次（warp 视锥体素雕刻）：视锥内体素连相机中心判遮挡 → 提交进 voxmap。
+
+    走 sensor.carve_observe 拿 (free_idx, occ_idx) 体素下标，按粘滞策略写状态：
+      free → 只写当前非 OCCUPIED 的格（不降级已知障碍）；occ → 无条件、且在 free 之后 → 覆盖。
+    产实心 FREE（扛得住 sync inflate=1），优于旧 trimesh 稀疏射线。返回生效体素数 dict。
+
+    多分辨率（MultiResVoxelMap）：对 fine（盒内全部）+ coarse（挖空 fine 盒）两子网格各雕各写回，
+    合并计数。coarse 用 exclude_box=fine 盒排除盒内体素（那块交 fine 判），与壳 in_fine_box 同一
+    半开判据 → 边界不留缝、不重复（方案 Row 4）。
+
+    pixel_stride / free_step：已废弃（旧 trimesh 路径形参），保留仅为兼容调用方，忽略。
+    """
+    from gt_gen.sensor import carve_observe
+    from gt_gen.voxmap import MultiResVoxelMap
+
+    if isinstance(voxmap, MultiResVoxelMap):
+        box = (voxmap.fine_min, voxmap.fine_max)
+        total = {"free": 0, "occ": 0}
+        for sub, excl in ((voxmap.fine, None), (voxmap.coarse, box)):
+            fi, oi = carve_observe(sub, camera_pose, camera_model, truth_scene, max_depth,
+                                   exclude_box=excl)
+            r = _commit_carve(sub, fi, oi, sticky_occupied)
+            total["free"] += r["free"]
+            total["occ"] += r["occ"]
+        return total
+
+    free_idx, occ_idx = carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth)
+    return _commit_carve(voxmap, free_idx, occ_idx, sticky_occupied)

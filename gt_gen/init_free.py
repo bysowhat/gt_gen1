@@ -28,6 +28,30 @@ from typing import Optional, Sequence
 import numpy as np
 
 
+def _iter_grids(voxmap):
+    """遍历 voxmap 的子网格：MultiResVoxelMap → [coarse, fine]；ThreeStateVoxelMap → [自身]。
+
+    init_free 四种方案本质都是「枚举/算一批体素置 FREE」，对每张子网格用它自己的
+    shape/voxel_to_world/voxel_size/set_many 各跑一遍即可。coarse 落在 fine 盒内多写的
+    FREE 会被壳查询侧（get_world/state_centers/swept）的挖空忽略，不影响正确性。
+    """
+    from gt_gen.voxmap import MultiResVoxelMap
+    if isinstance(voxmap, MultiResVoxelMap):
+        return [voxmap.coarse, voxmap.fine]
+    return [voxmap]
+
+
+def _finish_free(total, ret_list, n_grids, return_cells):
+    """统一 init_free 各函数的返回：无 return_cells 只回 n；单图回体素下标（兼容旧行为）；
+    壳（多子网格）因下标跨网格无统一意义，回世界坐标中心拼接（可视化友好）。"""
+    if not return_cells:
+        return total
+    if n_grids == 1:
+        return total, ret_list[0][0]
+    cen = [c for _, c in ret_list if c.shape[0]]
+    return total, (np.concatenate(cen, axis=0) if cen else np.empty((0, 3)))
+
+
 def set_initial_free_space(handle, voxmap, config=None,
                            retract: Optional[Sequence[float]] = None,
                            dq: Optional[float] = None,
@@ -61,22 +85,23 @@ def set_initial_free_space(handle, voxmap, config=None,
     q0 = np.asarray(retract, dtype=float)
     dq = float(dq)
 
-    chunks = []
-    for j in range(q0.shape[0]):
-        for s in (1.0, -1.0):
-            q = q0.copy()
-            q[j] += s * dq
-            cells = swept_volume(handle, voxmap, q0, q)   # 已去重、在界内
-            if cells.shape[0]:
-                chunks.append(cells)
-
-    if chunks:
-        cells = np.unique(np.concatenate(chunks, axis=0), axis=0)
-    else:
-        cells = np.empty((0, 3), dtype=np.int64)
-
-    n = voxmap.set_many(cells, FREE)
-    return (n, cells) if return_cells else n
+    # 对每张子网格（壳=coarse+fine；单图=自身）各做 retract±dq 扫掠并集置 FREE
+    total, ret_list, grids = 0, [], _iter_grids(voxmap)
+    for sub in grids:
+        chunks = []
+        for j in range(q0.shape[0]):
+            for s in (1.0, -1.0):
+                q = q0.copy()
+                q[j] += s * dq
+                cells = swept_volume(handle, sub, q0, q)   # 已去重、在界内
+                if cells.shape[0]:
+                    chunks.append(cells)
+        cells = (np.unique(np.concatenate(chunks, axis=0), axis=0)
+                 if chunks else np.empty((0, 3), dtype=np.int64))
+        total += sub.set_many(cells, FREE)
+        if return_cells:
+            ret_list.append((cells, sub.voxel_to_world(cells) if cells.shape[0] else np.empty((0, 3))))
+    return _finish_free(total, ret_list, len(grids), return_cells)
 
 
 def set_initial_free_box(handle, voxmap, config=None,
@@ -112,16 +137,18 @@ def set_initial_free_box(handle, voxmap, config=None,
     lo = np.asarray(box_min, dtype=float)
     hi = np.asarray(box_max, dtype=float)
 
-    # 枚举 voxmap 内中心落在盒内的体素（向量化）
-    nx, ny, nz = voxmap.shape
-    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
-    idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
-    c = voxmap.voxel_to_world(idx)
-    inside = np.all((c >= lo) & (c <= hi), axis=1)
-    cells = idx[inside]
-
-    n = voxmap.set_many(cells, FREE)
-    return (n, cells) if return_cells else n
+    # 对每张子网格（壳=coarse+fine；单图=自身）各枚举中心落在盒内的体素置 FREE
+    total, ret_list, grids = 0, [], _iter_grids(voxmap)
+    for sub in grids:
+        nx, ny, nz = sub.shape
+        ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+        idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
+        c = sub.voxel_to_world(idx)
+        cells = idx[np.all((c >= lo) & (c <= hi), axis=1)]
+        total += sub.set_many(cells, FREE)
+        if return_cells:
+            ret_list.append((cells, sub.voxel_to_world(cells) if cells.shape[0] else np.empty((0, 3))))
+    return _finish_free(total, ret_list, len(grids), return_cells)
     """返回刚好罩住整条 retract 机械臂的最小竖直圆柱尺寸 (radius, height)（轴过 base 原点 x=y=0）。
 
     仅作参考/默认值来源（如想让圆柱自动贴合整臂时取这个尺寸）：
@@ -178,17 +205,20 @@ def set_initial_free_cylinder(handle, voxmap, config=None,
     radius = float(radius)
     z_max = float(z_min) + float(height)
 
-    # 枚举 voxmap 内中心落在圆柱体内的体素（向量化）
-    nx, ny, nz = voxmap.shape
-    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
-    idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
-    c = voxmap.voxel_to_world(idx)
-    rxy = np.hypot(c[:, 0], c[:, 1])                      # 到 base 竖直轴(x=y=0)的水平距离
-    inside = (rxy <= radius) & (c[:, 2] >= float(z_min)) & (c[:, 2] <= z_max)
-    cells = idx[inside]
-
-    n = voxmap.set_many(cells, FREE)
-    return (n, cells) if return_cells else n
+    # 对每张子网格（壳=coarse+fine；单图=自身）各枚举中心落在圆柱内的体素置 FREE
+    total, ret_list, grids = 0, [], _iter_grids(voxmap)
+    for sub in grids:
+        nx, ny, nz = sub.shape
+        ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+        idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)
+        c = sub.voxel_to_world(idx)
+        rxy = np.hypot(c[:, 0], c[:, 1])                  # 到 base 竖直轴(x=y=0)的水平距离
+        inside = (rxy <= radius) & (c[:, 2] >= float(z_min)) & (c[:, 2] <= z_max)
+        cells = idx[inside]
+        total += sub.set_many(cells, FREE)
+        if return_cells:
+            ret_list.append((cells, sub.voxel_to_world(cells) if cells.shape[0] else np.empty((0, 3))))
+    return _finish_free(total, ret_list, len(grids), return_cells)
 
 
 def set_initial_free_swept(handle, voxmap, config=None,
@@ -228,12 +258,16 @@ def set_initial_free_swept(handle, voxmap, config=None,
         print(f"[init_free] 警告：预存 voxel_size={vs_saved} 与当前 voxmap={voxmap.voxel_size} "
               f"不一致，按当前粒度落格")
 
-    if centers.shape[0] == 0:
-        cells = np.empty((0, 3), dtype=np.int64)
-    else:
-        idx = voxmap.world_to_voxel(centers)
-        idx = idx[voxmap.in_bounds(idx)]
-        cells = np.unique(idx, axis=0) if idx.shape[0] else idx.astype(np.int64)
-
-    n = voxmap.set_many(cells, FREE)
-    return (n, cells) if return_cells else n
+    # 对每张子网格（壳=coarse+fine；单图=自身）：世界中心 → 各自下标（滤越界）置 FREE
+    total, ret_list, grids = 0, [], _iter_grids(voxmap)
+    for sub in grids:
+        if centers.shape[0] == 0:
+            cells = np.empty((0, 3), dtype=np.int64)
+        else:
+            idx = sub.world_to_voxel(centers)
+            idx = idx[sub.in_bounds(idx)]
+            cells = np.unique(idx, axis=0) if idx.shape[0] else idx.astype(np.int64)
+        total += sub.set_many(cells, FREE)
+        if return_cells:
+            ret_list.append((cells, sub.voxel_to_world(cells) if cells.shape[0] else np.empty((0, 3))))
+    return _finish_free(total, ret_list, len(grids), return_cells)

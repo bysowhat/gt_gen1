@@ -48,10 +48,15 @@ def raycast_reveal(voxmap, camera_pose, camera_model, truth_scene,
     = unique(FREE 体素 ∪ OCCUPIED 体素)，均已在 voxmap 界内。
     真值 mesh 的遮挡天然处理：被障碍挡住的体素归 UNKNOWN，不算"将确定"。
     pixel_stride 已废弃（旧 trimesh 形参），保留仅为兼容，忽略。
+
+    多分辨率：reveal 与 B（reach_b.compute_blocking_B）须在【同一】索引空间做 gain=|reveal∩B| 集合
+    运算，故都在 coarse 子网格上算（index_grid）——仅影响视点选择启发式，不碰 GT 闸门（见 index_grid）。
     """
     from gt_gen.sensor import carve_observe
+    from gt_gen.voxmap import index_grid
 
-    free_idx, occ_idx = carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth)
+    free_idx, occ_idx = carve_observe(index_grid(voxmap), camera_pose, camera_model,
+                                      truth_scene, max_depth)
     chunks = [a for a in (free_idx, occ_idx) if a.shape[0]]
     if not chunks:
         return np.empty((0, 3), dtype=np.int64)

@@ -855,6 +855,21 @@ class Scene:
         seam_limits = np.tile(np.stack([_unit(d1), _unit(d2)], axis=0)[None], (N, 1, 1))  # (N,2,3)
         return seam_line, seam_tangent, seam_limits
 
+    def fine_box_from_seam(self, margin_m: float = None):
+        """当前 init pose 下，本焊缝折线的 base 系 AABB 外扩 margin → (center(3,), dims(3,))。
+
+        供 build_roi_multires_voxmap 的 fine 盒来源：seam_line（_seam_data_arrays，工件 mesh 系）
+        经 cur_init_pose.T_workpiece_in_base（p_base=T·p_world）变换到 base 系后取 AABB。
+        margin_m 默认读 cfg.fine_box_margin_m（default.yaml roi.fine_box_margin_cm，方案定 10cm）。
+        """
+        from gt_gen.voxmap import fine_box_from_seam_points
+        if margin_m is None:
+            margin_m = self.cfg.fine_box_margin_m
+        seam_line, _, _ = self._seam_data_arrays()               # 工件 mesh 系 (N,3)
+        T = np.asarray(self.cur_init_pose.T_workpiece_in_base, dtype=np.float64)
+        pts_base = seam_line @ T[:3, :3].T + T[:3, 3]            # p_base = T · p_world
+        return fine_box_from_seam_points(pts_base, margin_m)
+
     def compute_goal_pose(self,
                           include_obstacles: bool = None,
                           horizontal: int = None,
@@ -1226,16 +1241,23 @@ class Scene:
                    cam=cam, world=world, device=device)
 
     def _fresh_explore_voxmap(self, ctx: Ctx):
-        """为一条观测位姿序列造一张【全新三态体素图 + 初始 FREE（冷启动立足之地）】。
+        """为一条观测位姿序列造一张【全新多分辨率三态体素图 + 初始 FREE（冷启动立足之地）】。
 
         同一 init pose 的每条序列（每个 variant）各调一次以重置探索状态、互不串扰；序列【内部】的多个
         pose 则共享同一张 vm 累积观测＝继承前一次规划观测到的世界（见 compute_pose_and_plan_path）。
         初始 FREE 按 cfg.init_free_method_for_init 选 box 或圆柱（与 plan_explore_path 原行为一致）。
+
+        多分辨率（方案 缝周多分辨率voxmap）：coarse=整 ROI(vs_coarse) + fine=焊缝 AABB 外扩
+        fine_box_margin(vs_fine)；init_free 各方案已支持对 coarse/fine 两子网格各标一遍（_iter_grids）。
         """
-        from gt_gen.voxmap import build_roi_voxmap
+        from gt_gen.voxmap import build_roi_multires_voxmap
         from gt_gen.init_free import set_initial_free_cylinder, set_initial_free_box
         h_truth = ctx["h_truth"]
-        vm = build_roi_voxmap(self.cfg)
+        fine_center, fine_dims = self.fine_box_from_seam()       # 当前 init pose 下焊缝 base 系 AABB 外扩
+        vm = build_roi_multires_voxmap(self.cfg, fine_center, fine_dims)
+        print(f"[scene] 多分辨率 voxmap：coarse vs={vm.coarse.voxel_size} dims={vm.coarse.shape} + "
+              f"fine vs={vm.fine.voxel_size} dims={vm.fine.shape} "
+              f"盒中心={np.round(fine_center, 3).tolist()} 尺寸={np.round(fine_dims, 3).tolist()}")
         method = self.cfg.init_free_method_for_init      # cylinder | box（default.yaml init_free.method_for_init）
         if method == "box":
             box_min, box_max = self.cfg.init_free_box_min_for_init, self.cfg.init_free_box_max_for_init

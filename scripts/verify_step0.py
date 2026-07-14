@@ -30,7 +30,7 @@ def main():
     print("关节       :", cfg.joint_names)
     print("retract    :", [round(x, 4) for x in cfg.retract_config])
     print("碰撞link数 :", len(cfg.collision_link_names))
-    print("体素分辨率 :", cfg.voxel_size_m, "m | ROI center:", cfg.roi_center, " dims:", cfg.roi_dims, "m")
+    print("体素分辨率 :", cfg.voxel_size_m_coarse, "m | ROI center:", cfg.roi_center, " dims:", cfg.roi_dims, "m")
     print("深度上限   :", cfg.max_depth_m, "m")
 
     print("\n== cuRobo MotionGen 初始化（空世界）+ warmup ==")

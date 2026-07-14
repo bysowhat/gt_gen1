@@ -256,12 +256,15 @@ def _roi_centers(voxmap):
     return cached
 
 
-def carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth=None
-                  ) -> Tuple[np.ndarray, np.ndarray]:
+def carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth=None,
+                  exclude_box=None) -> Tuple[np.ndarray, np.ndarray]:
     """warp 视锥体素雕刻：单次观测，返回应翻为 (FREE, OCCUPIED) 的体素下标。
 
     camera_pose : 4x4 base 系相机位姿（T_base_cam，[:3,2] 为 +Z 视线）。
     max_depth   : None → camera_model["max_depth"]。
+    exclude_box : None 或 (min(3,), max(3,))（world 坐标）——中心落在此半开盒 [min,max) 内的体素
+                  整体排除（不雕、不返回）。多分辨率下 coarse 子网格用它挖空 fine 盒（那块交 fine 判），
+                  与壳的 in_fine_box 同一半开判据 → 边界不留缝、不重复（方案 Row 4）。
     返回 (free_idx, occ_idx)，均为 (·,3) int64 体素下标（已在网格内）；不修改 voxmap（由调用方写）。
 
     被遮挡(r>t_hit)的体素归 UNKNOWN（不在返回里），保留三态语义；写状态/粘滞由调用方负责。
@@ -292,6 +295,11 @@ def carve_observe(voxmap, camera_pose, camera_model, truth_scene, max_depth=None
     rr = np.linalg.norm(centers_all - org, axis=1)
     infr = ((z > near) & (z <= max_depth) & (u >= 0) & (u <= W) &
             (v >= 0) & (v <= H) & (rr <= max_depth))
+    if exclude_box is not None:                                   # 挖空：中心落 fine 盒内的体素排除
+        bmin = np.asarray(exclude_box[0], dtype=np.float64).reshape(3)
+        bmax = np.asarray(exclude_box[1], dtype=np.float64).reshape(3)
+        in_box = np.all((centers_all >= bmin) & (centers_all < bmax), axis=1)
+        infr = infr & ~in_box
     idx_f = idx_all[infr]
     if idx_f.shape[0] == 0:
         return np.empty((0, 3), dtype=np.int64), np.empty((0, 3), dtype=np.int64)

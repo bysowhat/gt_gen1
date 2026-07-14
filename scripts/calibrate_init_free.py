@@ -345,7 +345,7 @@ def main():
             if cells_world is None:
                 continue
             print(f"\n== 工件安全性核查：{name} 默认参数 blob ==")
-            check_workpiece_clear(cells_world, fs, args.n_workpiece, cfg.voxel_size_m)
+            check_workpiece_clear(cells_world, fs, args.n_workpiece, cfg.voxel_size_m_coarse)
 
     print(f"\n默认参数：init_free.dq_rad={cfg.init_free_dq}  "
           f"cyl_radius_m={cfg.init_free_cyl_radius}  cyl_height_m={cfg.init_free_cyl_height}"

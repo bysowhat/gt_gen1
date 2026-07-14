@@ -146,7 +146,7 @@ def _sight_clear(voxmap, p, T) -> bool:
     if ts.size == 0:
         return True
     samples = p[None] + np.outer(ts, (T - p) / L)
-    return not bool((np.asarray(voxmap.get(voxmap.world_to_voxel(samples))) == OCCUPIED).any())
+    return not bool((np.asarray(voxmap.get_world(samples)) == OCCUPIED).any())
 
 
 def flange_origin(handle, q) -> np.ndarray:
@@ -182,7 +182,7 @@ def standoff_poses_looking_at(T, voxmap, camera_model, anchor=None,
             continue
         for u in dirs:
             p = T + d * u
-            if int(voxmap.get(voxmap.world_to_voxel(p))) != FREE:      # 必须站在确认自由区
+            if int(voxmap.get_world(p)) != FREE:      # 必须站在确认自由区（多分辨率壳按 fine/coarse 分派）
                 continue
             if not _sight_clear(voxmap, p, T):                          # 视线别被已知障碍挡
                 continue
@@ -268,6 +268,7 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
     from gt_gen.sensor import camera_pose_from_config
     from gt_gen.swept import motion_stays_in_free
     from gt_gen.joint_wrap import wrap_goal_near_start
+    from gt_gen.voxmap import index_grid
 
     nbv = handle.config.params.get("nbv", {})
     if standoff_d is None:
@@ -283,7 +284,7 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
     B = np.asarray(B).reshape(-1, 3)
     if B.shape[0] == 0:
         return []
-    Bw = voxmap.voxel_to_world(B)                              # 体素下标 → base 世界点
+    Bw = index_grid(voxmap).voxel_to_world(B)                 # 体素下标(coarse 索引空间) → base 世界点
     targets = cluster_centroids(Bw, max_clusters=max_clusters,
                                 link_dist=float(cl.get("link_dist_m", 0.15)),
                                 method=str(cl.get("method", "single")))

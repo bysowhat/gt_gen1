@@ -500,12 +500,53 @@ def _valid_candidates(infos, oracle):
     return [i for _, i in valid]
 
 
+def _diagnose_joint_failure(oracle, cur_cfg, target_cfg, infos, lower, upper, tol=1e-4):
+    """plan_to_joint_single/multi 无合格候选时，判断失败原因并返回中文说明。
+
+    起点、终点各单独用 oracle 查一次碰撞距离(>tol=碰)，并核对是否越关节限位；两端都合法时，
+    再看各 batch infos 归因于【中段路点碰撞】还是【中段越限】：
+      - 无任一 batch 做到 n_collision_steps==0  → 路点碰撞（STOMP 绕不开中段障碍）
+      - 有无碰 batch 但都越限                    → 路点越限（中段插值超关节限位）
+      - 二者各有、但没有单条同时满足            → 无单条同时满足无碰+在限位
+    """
+    q = torch.tensor([list(map(float, cur_cfg)), list(map(float, target_cfg))],
+                     device=oracle.device, dtype=torch.float32)
+    d = oracle.distance(q).detach().cpu().numpy()
+    start_hit, goal_hit = float(d[0]), float(d[1])
+    lo = np.asarray(lower, float); up = np.asarray(upper, float)
+    cur = np.asarray(list(map(float, cur_cfg)), float)
+    tgt = np.asarray(list(map(float, target_cfg)), float)
+    start_oob = bool((cur < lo - 1e-5).any() or (cur > up + 1e-5).any())
+    goal_oob = bool((tgt < lo - 1e-5).any() or (tgt > up + 1e-5).any())
+
+    reasons = []
+    if start_hit > tol:
+        reasons.append(f"起点碰撞(dist={start_hit:.4f}m)")
+    if start_oob:
+        reasons.append("起点越关节限位")
+    if goal_hit > tol:
+        reasons.append(f"终点碰撞(dist={goal_hit:.4f}m)")
+    if goal_oob:
+        reasons.append("终点越关节限位")
+    if not reasons:                                          # 两端均合法 → 中段问题
+        min_coll = min((int(i["n_collision_steps"]) for i in infos), default=-1)
+        has_collfree = any(int(i["n_collision_steps"]) == 0 for i in infos)
+        has_inlimit = any(bool(i["in_limit"]) for i in infos)
+        if not has_collfree:
+            reasons.append(f"路点碰撞(起终点均无碰,但{len(infos)}条候选最好的仍有 {min_coll} 个碰撞路点)")
+        elif not has_inlimit:
+            reasons.append("路点越关节限位(有无碰候选但中段插值越限,起终点均合法)")
+        else:
+            reasons.append("无单条候选同时满足【无碰+在限位】(起终点均合法)")
+    return "；".join(reasons)
+
+
 def plan_to_joint_single(cur_cfg, target_cfg, world, *, robot_yml=DEFAULT_ROBOT_YML,
                          checker_type=None, device="cuda", buffer=0.1, **plan_kwargs):
     """【函数1-single】当前关节角 + 目标关节角 + cuRobo 碰撞世界 -> 单条最优避障轨迹 (T,6)。
 
     只在满足 n_collision_steps==0 且 in_limit==True 的候选里，取焊枪路径最短的一条返回；
-    **不返回 info**；若没有任何候选满足，返回 None。
+    **不返回 info**；若没有任何候选满足，返回 None（并打印失败原因：起点/终点/路点碰撞或越限）。
 
     plan_kwargs  : 透传 StompPlanner.plan_joint（num_iterations/num_batch/collision_weight/...）
     """
@@ -514,6 +555,9 @@ def plan_to_joint_single(cur_cfg, target_cfg, world, *, robot_yml=DEFAULT_ROBOT_
     trajs, infos = planner.plan_joint(cur_cfg, target_cfg, **plan_kwargs)
     idx = _valid_candidates(infos, planner.oracle)
     if not idx:
+        reason = _diagnose_joint_failure(planner.oracle, cur_cfg, target_cfg, infos,
+                                         planner.lower, planner.upper)
+        print(f"[plan_joint_single][规划失败] {reason}")
         return None
     return trajs[idx[0]]
 

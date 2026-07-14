@@ -80,7 +80,7 @@ def main():
     print("\n== build_roi_voxmap ==")
     cfg = load_config()
     roi = build_roi_voxmap(cfg)                        # 默认外扩 1 体素
-    dims = np.asarray(cfg.roi_dims); vs = cfg.voxel_size_m
+    dims = np.asarray(cfg.roi_dims); vs = cfg.voxel_size_m_coarse
     exp = tuple(int(round((dims[k] + 2 * vs) / vs)) for k in range(3))
     print(f"roi center={cfg.roi_center} dims={cfg.roi_dims} voxel={vs} -> "
           f"shape={roi.shape} (~{roi.num_voxels/1e6:.2f}M voxels)")

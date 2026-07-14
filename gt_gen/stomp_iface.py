@@ -149,50 +149,6 @@ def plan_joint_multi(cfg, world, cur_cfg, target_cfg, *, buffer: Optional[float]
     return [np.asarray(t, float) for t in trajs] if trajs else []
 
 
-def world_from_voxmap(cfg, voxmap, inflate_voxels: Optional[int] = None):
-    """三态体素图的「非 FREE」(OCCUPIED ∪ UNKNOWN) 区域 → 单个 mesh 的 WorldConfig（供 STOMP 用）。
-
-    STOMP 不支持 VOXEL 碰撞检查（stomp_planning_api 只 MESH/PRIMITIVE），故把探索世界的障碍区
-    转成一个 mesh：用 marching cubes 只网格化「自由泡」边界 + ROI 外壳（面数千量级，逐体素 cuboid
-    在 UNKNOWN 占满 ROI 时不可行）。
-
-    膨胀层数 inflate_voxels 缺省取 cfg.voxel_inflate_voxels（与 collision_sync.sync_collision_world
-    同一单一来源）——保证 STOMP 与 cuRobo 在【相同障碍集】上规划，行为一致。
-
-    顶点 base 系映射：matrix_to_marching_cubes 顶点 = 原矩阵索引×voxel_size（角点在索引 0），
-    voxmap voxel i 中心在 origin+(i+0.5)·vs，故 world = origin + mc_verts + 0.5·vs（表面正好落在
-    障碍体素外缘面上，与 voxmap 占据对齐、不错位）。
-
-    返回 (WorldConfig, CollisionCheckerType.MESH)；非 FREE 全空时返回空 world（仅自碰撞）。
-    """
-    import gt_gen.compat  # noqa: F401  trimesh shim
-    gt_gen.compat.apply_trimesh_shim()
-    import trimesh
-    from curobo.geom.types import WorldConfig, Mesh
-    from curobo.geom.sdf.world import CollisionCheckerType
-
-    mask = np.asarray(voxmap.non_free_mask(), bool)
-    if inflate_voxels is None:
-        inflate_voxels = int(getattr(cfg, "voxel_inflate_voxels", 0))
-    if inflate_voxels and mask.any() and not mask.all():
-        from scipy import ndimage
-        st = ndimage.generate_binary_structure(3, 3)             # 26 邻接，覆盖对角
-        mask = ndimage.binary_dilation(mask, structure=st, iterations=int(inflate_voxels))
-    if not mask.any():
-        return WorldConfig(mesh=[]), CollisionCheckerType.MESH
-
-    vs = float(voxmap.voxel_size)
-    _t0 = time.perf_counter()
-    tm = trimesh.voxel.ops.matrix_to_marching_cubes(mask, pitch=vs)
-    verts = np.asarray(tm.vertices, float) + np.asarray(voxmap.origin, float) + 0.5 * vs
-    mesh = Mesh(name="explore_obstacles", vertices=verts.tolist(),
-                faces=np.asarray(tm.faces, np.int64).tolist(),
-                pose=[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    print(f"[计时] world_from_voxmap（非FREE体素={int(mask.sum())} -> "
-          f"mesh 顶点={len(tm.vertices)} 面={len(tm.faces)}）{time.perf_counter() - _t0:.3f}s")
-    return WorldConfig(mesh=[mesh]), CollisionCheckerType.MESH
-
-
 def _greedy_boxes(sub):
     """贪心 3D 盒分解：把 bool 子掩码 sub(nx,ny,nz) 恰好覆盖成若干轴对齐大盒（不重叠、无近似）。
 
@@ -221,79 +177,100 @@ def _greedy_boxes(sub):
     return boxes
 
 
-def world_from_voxmap_cuboid(cfg, voxmap, n: Optional[float] = None,
-                             inflate_voxels: Optional[int] = None):
-    """三态体素图「非 FREE」区 → 一批 cuRobo Cuboid 的 WorldConfig（PRIMITIVE，供 STOMP 用）。
+def _cuboids_from_grid(grid, n: float, carve_box=None, name_prefix: str = "vox") -> list:
+    """单张 ThreeStateVoxelMap 的「非 FREE」区 → 一批 cuRobo Cuboid（合并大盒），供 union。
 
-    与 world_from_voxmap(mesh 版) 并列的另一种转法：
-      - 仅转【以 base 原点(0,0,0)为心、半边长 n 的盒 [−n,n]³】与 ROI 交集内的非 FREE 体素；
-        盒外 UNKNOWN 当 FREE（可穿行）——放宽「只走确认空域」保守性换速度（见 default.yaml 注释）。
-      - 体素本就是立方体，逐格转 Cuboid 是占据的【精确】表示（无 marching-cubes 表面近似）；
-        再用 _greedy_boxes 把成片占据【合并成少量大盒】，避免 PRIMITIVE 检查器线性扫几万个 cuboid。
+    仅转【以 base 原点为心、半边长 n 的盒 [−n,n]³】与 grid ROI 交集内的非 FREE 体素（盒外 UNKNOWN
+    当 FREE，可穿行）。逐格是占据的精确表示（无 marching-cubes 近似），再 _greedy_boxes 合并成少量大盒。
 
-    n 缺省取 cfg.stomp_params['local_box_m']；inflate_voxels 缺省同 cfg.voxel_inflate_voxels（同一来源）。
-    返回 (WorldConfig(cuboid=[...]), CollisionCheckerType.PRIMITIVE)；盒内无占据时返回空 world。
+    carve_box : None 或 (min(3,), max(3,))（world 坐标）——中心落在此半开盒 [min,max) 内的占据体素
+                排除（挖空）。多分辨率下 coarse 用它挖掉 fine 盒那块（交给 fine 的细 cuboid），与壳
+                in_fine_box 同一半开判据 → 拼接不重叠、不留缝（方案 Row 2）。
+    name_prefix : Cuboid 命名前缀（union 时须唯一：coarse/fine 各用不同前缀）。
 
     盒覆盖 voxel 索引 [i0..i1] → Cuboid 中心 = origin+(i0+i1+1)/2·vs，边长 = (i1−i0+1)·vs
-    （voxel i 中心在 origin+(i+0.5)·vs，故盒面正好贴体素外缘，与 voxmap 占据精确对齐）。
+    （voxel i 中心在 origin+(i+0.5)·vs，故盒面正好贴体素外缘，与占据精确对齐）。
     """
-    import gt_gen.compat  # noqa: F401  trimesh shim
-    gt_gen.compat.apply_trimesh_shim()
-    from curobo.geom.types import WorldConfig, Cuboid
-    from curobo.geom.sdf.world import CollisionCheckerType
+    from curobo.geom.types import Cuboid
 
-    mask = np.asarray(voxmap.non_free_mask(), bool)
-    if inflate_voxels is None:
-        inflate_voxels = int(getattr(cfg, "voxel_inflate_voxels", 0))
-    if inflate_voxels and mask.any() and not mask.all():
-        from scipy import ndimage
-        st = ndimage.generate_binary_structure(3, 3)
-        mask = ndimage.binary_dilation(mask, structure=st, iterations=int(inflate_voxels))
-
-    if n is None:
-        n = float(cfg.stomp_params.get("local_box_m", 2.0))
-    vs = float(voxmap.voxel_size)
-    origin = np.asarray(voxmap.origin, float)
-    grid = np.asarray(mask.shape, int)
+    mask = np.asarray(grid.non_free_mask(), bool)
+    vs = float(grid.voxel_size)
+    origin = np.asarray(grid.origin, float)
+    gshape = np.asarray(mask.shape, int)
     # [−n, n]^3（base 原点为心）→ index 子盒，与 ROI 取交：voxel i 中心 = origin+(i+0.5)·vs ∈ [−n,n]
     lo = np.ceil((-n - origin) / vs - 0.5).astype(int)
     hi = np.floor((n - origin) / vs - 0.5).astype(int)
     lo = np.maximum(lo, 0)
-    hi = np.minimum(hi, grid - 1)
+    hi = np.minimum(hi, gshape - 1)
     if np.any(lo > hi):
-        # print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒与 ROI 无交）-> 空 world")
-        return WorldConfig(cuboid=[]), CollisionCheckerType.PRIMITIVE
+        return []
+    sub = mask[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1].copy()
+    if carve_box is not None:                                    # 挖空：中心落 carve_box 内的占据体素剔除
+        bmin = np.asarray(carve_box[0], float).reshape(3)
+        bmax = np.asarray(carve_box[1], float).reshape(3)
+        occ_ijk = np.argwhere(sub)
+        if occ_ijk.shape[0]:
+            ctr = origin + (occ_ijk + lo + 0.5) * vs
+            drop = occ_ijk[np.all((ctr >= bmin) & (ctr < bmax), axis=1)]
+            if drop.shape[0]:
+                sub[drop[:, 0], drop[:, 1], drop[:, 2]] = False
+    if int(sub.sum()) == 0:
+        return []
 
-    sub = mask[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1]
-    n_occ = int(sub.sum())
-    if n_occ == 0:
-        # print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE=0）-> 空 world")
-        return WorldConfig(cuboid=[]), CollisionCheckerType.PRIMITIVE
-
-    _t0 = time.perf_counter()
-    boxes = _greedy_boxes(sub)
     cuboids = []
-    for bi, (i0, j0, k0, i1, j1, k1) in enumerate(boxes):
+    for bi, (i0, j0, k0, i1, j1, k1) in enumerate(_greedy_boxes(sub)):
         g0 = lo + np.array([i0, j0, k0])
         g1 = lo + np.array([i1, j1, k1])
         center = origin + (g0 + g1 + 1) * 0.5 * vs
         bdims = (g1 - g0 + 1).astype(float) * vs
-        cuboids.append(Cuboid(name=f"vox_{bi}", dims=bdims.tolist(),
+        cuboids.append(Cuboid(name=f"{name_prefix}_{bi}", dims=bdims.tolist(),
                               pose=center.tolist() + [1.0, 0.0, 0.0, 0.0]))
-    # print(f"[计时] world_from_voxmap_cuboid（n={n}m 盒内非FREE格={n_occ} -> 合并大盒={len(cuboids)}）"
-    #       f"{time.perf_counter() - _t0:.3f}s")
+    return cuboids
+
+
+def world_from_voxmap_cuboid(cfg, voxmap, n: Optional[float] = None,
+                             inflate_voxels: Optional[int] = None):
+    """三态体素图「非 FREE」区 → 一批 cuRobo Cuboid 的 WorldConfig（PRIMITIVE，供 STOMP 用）。
+
+    体素本就是立方体，逐格转 Cuboid 是占据的【精确】表示（无 marching-cubes 表面近似）；再用
+    _greedy_boxes 把成片占据合并成少量大盒，避免 PRIMITIVE 检查器线性扫几万个 cuboid。
+
+    n 缺省取 cfg.stomp_params['local_box_m']。inflate_voxels 已废弃（voxel_inflate_voxels 恒 0）。
+    返回 (WorldConfig(cuboid=[...]), CollisionCheckerType.PRIMITIVE)；盒内无占据时返回空 world。
+    """
+    import gt_gen.compat  # noqa: F401  trimesh shim
+    gt_gen.compat.apply_trimesh_shim()
+    from curobo.geom.types import WorldConfig
+    from curobo.geom.sdf.world import CollisionCheckerType
+
+    if n is None:
+        n = float(cfg.stomp_params.get("local_box_m", 2.0))
+    cuboids = _cuboids_from_grid(voxmap, float(n))
     return WorldConfig(cuboid=cuboids), CollisionCheckerType.PRIMITIVE
 
 
 def world_from_voxmap_auto(cfg, voxmap, inflate_voxels: Optional[int] = None):
-    """按 cfg.stomp_params['voxel_world'] 选转法：'cuboid'→world_from_voxmap_cuboid，否则 mesh 版。
+    """探索 voxmap → STOMP 世界（PRIMITIVE cuboid）。步①/⑤ 都经此，保证两处同一种转法。
 
-    步①/步⑤ 都经此把探索 voxmap 转成 STOMP 世界，保证两处用同一种转法。
+    多分辨率（MultiResVoxelMap）：coarse 子网格（挖空 fine 盒）的粗 cuboid + fine 子网格的细 cuboid
+    union 成【一个】WorldConfig——cuRobo 一个 world 放多个不同尺寸 cuboid 合法，这是 STOMP-only 能做
+    多分辨率的根本（方案 Row 2）。单张 ThreeStateVoxelMap 走 world_from_voxmap_cuboid。
     """
-    mode = str(cfg.stomp_params.get("voxel_world", "mesh")).lower()
-    if mode == "cuboid":
-        return world_from_voxmap_cuboid(cfg, voxmap, inflate_voxels=inflate_voxels)
-    return world_from_voxmap(cfg, voxmap, inflate_voxels=inflate_voxels)
+    from gt_gen.voxmap import MultiResVoxelMap
+
+    if isinstance(voxmap, MultiResVoxelMap):
+        import gt_gen.compat  # noqa: F401  trimesh shim
+        gt_gen.compat.apply_trimesh_shim()
+        from curobo.geom.types import WorldConfig
+        from curobo.geom.sdf.world import CollisionCheckerType
+
+        n = float(cfg.stomp_params.get("local_box_m", 2.0))
+        box = (voxmap.fine_min, voxmap.fine_max)
+        cub_c = _cuboids_from_grid(voxmap.coarse, n, carve_box=box, name_prefix="coarse")
+        cub_f = _cuboids_from_grid(voxmap.fine, n, name_prefix="fine")
+        return WorldConfig(cuboid=cub_c + cub_f), CollisionCheckerType.PRIMITIVE
+
+    return world_from_voxmap_cuboid(cfg, voxmap, inflate_voxels=inflate_voxels)
 
 
 def _visualize_ik(cfg, world, goal_pose, *, checker_type=None, buffer=None,

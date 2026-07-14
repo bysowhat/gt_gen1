@@ -177,14 +177,42 @@ def _debug_viz_cells2(handle, voxmap, q_from, q_to, cells):
     _draw(geoms, f"swept 扫掠体素(单色黄): cells={n}格")
 
 
+def _motion_stays_in_free_multires(handle, mrv, q_from, q_to, resolution) -> Tuple[bool, int]:
+    """多分辨率 GT 闸门：球在 coarse/fine 两子网格各体素化+查询，保守取并（任一非 FREE 即 fail）。
+
+    挖空：coarse 上落在 fine 盒内的体素剔除（那块归 fine 判）；fine 只判盒内——球超出 fine 盒的
+    部分被 voxelize_spheres 的 in_bounds 自动丢弃，不会误当越界 UNKNOWN。故盒内由 fine、盒外由
+    coarse，跨界球两侧覆盖=取并；边界用同一半开 in_fine_box 判据 → 不留缝、不重复（边界 coarse
+    格中心在盒外但体积探进盒内会与 fine 轻微重叠，取并下只会更严、不漏，安全性不降级）。
+    resolution=None 时各子网格按自己的 vs 定插值步长（fine 细插值不漏细格，coarse 粗插值足够）。
+    """
+    from gt_gen.voxmap import FREE
+    n_nonfree = 0
+    # fine：只判盒内（越界球部分被 voxelize_spheres 的 in_bounds 丢弃）
+    cells_f = swept_volume(handle, mrv.fine, q_from, q_to, resolution=resolution)
+    if cells_f.shape[0]:
+        n_nonfree += int((np.asarray(mrv.fine.get(cells_f)) != FREE).sum())
+    # coarse：判盒外（剔除落 fine 盒内的体素=挖空）
+    cells_c = swept_volume(handle, mrv.coarse, q_from, q_to, resolution=resolution)
+    if cells_c.shape[0]:
+        cc = cells_c[~mrv.in_fine_box(mrv.coarse.voxel_to_world(cells_c))]
+        if cc.shape[0]:
+            n_nonfree += int((np.asarray(mrv.coarse.get(cc)) != FREE).sum())
+    return n_nonfree == 0, n_nonfree
+
+
 def motion_stays_in_free(handle, voxmap, q_from, q_to,
                          resolution: Optional[float] = None) -> Tuple[bool, int]:
     """该段扫掠体积是否全部落在 FREE 体素内。
 
     返回 (ok, n_nonfree)：ok=True 表示整臂扫掠 ⊆ FREE；n_nonfree = 扫掠体积内非 FREE 体素数。
     保守：扫掠体积越界(voxmap 外)的部分按 voxmap.get 约定返回 UNKNOWN → 计入非 FREE。
+    多分辨率（MultiResVoxelMap）：两子网格各体素化+查询，保守取并（见 _motion_stays_in_free_multires）。
     """
-    from gt_gen.voxmap import FREE
+    from gt_gen.voxmap import FREE, MultiResVoxelMap
+
+    if isinstance(voxmap, MultiResVoxelMap):
+        return _motion_stays_in_free_multires(handle, voxmap, q_from, q_to, resolution)
 
     cells = swept_volume(handle, voxmap, q_from, q_to, resolution=resolution)
     # _debug_viz_cells2(handle, voxmap, q_from, q_to, cells)        # 看整臂扫掠体素 cells（注释此行可关）

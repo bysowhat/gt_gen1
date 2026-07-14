@@ -71,7 +71,9 @@ roi:                                    # 决策 H —— ROI 盒（单一来源
                                         #   半体素(如 3.9→97.5)会触发 cuRobo CUDA/Python 栅格维度取整
                                         #   不一致 → voxel 占据沿该轴错位（见 config.roi_dims 注释）。
                                         #   config.roi_dims 会再吸附一次作兜底。
-  voxel_size_m: 0.04                    # 体素边长（米）
+  voxel_size_m_coarse: 0.04             # 粗网格体素边长（米）：覆盖整个 ROI 的探索三态图
+  voxel_size_m_fine: 0.02               # 细网格体素边长（米）：焊缝周围 fine 盒（焊缝 AABB 外扩 10cm）
+  fine_box_margin_cm: 10.0              # fine 盒相对焊缝 AABB 的各方向外扩量（cm）——方案定 10cm
 
 goal:                                   # 末端目标相对焊缝的摆放（Step 10）
   standoff_cm: 10.0                     # 沿两面角平分方向(bisector, 背离工件)后退的 standoff 距离(cm)
@@ -314,7 +316,7 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
                                         # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
     detour_ik_position_threshold: 0.1   # 无用，ik目前的goal是写死的，仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
     detour_ik_rotation_threshold: 0.3   # 用，ik目前的goal是写死的， 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
-    obstacle_buffer_m: 0.04              # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
+    obstacle_buffer_m: 0.00              # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
                                         # ②③绕行规划用膨胀尺寸→绕行解与真实障碍留 buffer；工件不受影响。0=关闭
     obstacle_types: []                  # 空=用 obstacles.list_obstacles() 全部 15 种
     # _shape_for 的尺寸夹紧/采样区间（不写死在代码里，单一来源）

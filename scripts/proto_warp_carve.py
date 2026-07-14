@@ -175,7 +175,7 @@ def main():
     cfg, h_truth, cam, scene = ctx["cfg"], ctx["h_truth"], ctx["cam"], ctx["scene"]
     q = list(cfg.retract_config)
     M = camera_pose_from_config(h_truth, q, cam)
-    max_depth, vs = cfg.max_depth_m, cfg.voxel_size_m
+    max_depth, vs = cfg.max_depth_m, cfg.voxel_size_m_coarse
     print(f"\nROI shape={build_roi_voxmap(cfg).shape}  voxel={vs}  max_depth={max_depth}")
     print(f"cam_org={np.round(M[:3,3],3)}  cam_axis(+Z)={np.round(M[:3,2],3)}")
 

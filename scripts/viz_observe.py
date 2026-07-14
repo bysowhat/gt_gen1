@@ -160,7 +160,7 @@ def main():
     # voxmap 只覆盖焊缝周边；3 位姿累积观测。每个位姿的命中点单独留存(按相机颜色绘制)
     from gt_gen.mapping import commit_observation
     half = 0.9
-    vm = ThreeStateVoxelMap(origin=target - half, size_xyz=(2 * half,) * 3, voxel_size=cfg.voxel_size_m)
+    vm = ThreeStateVoxelMap(origin=target - half, size_xyz=(2 * half,) * 3, voxel_size=cfg.voxel_size_m_coarse)
     print("\nvoxmap:", vm.shape, " 累积观测 3 个位姿 ...")
     zfars = []
     for c in chosen:
