@@ -275,6 +275,12 @@ def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
     B = compute_blocking_B(handle, voxmap, P, reach_idx, k)
     # _debug_viz_B(handle, voxmap, P, reach_idx, B, truth_scene)          # 看阻塞段 B（橙）（注释此行可关）
     if B.shape[0] == 0:
+        '''
+            如果B是0,说明之前的plan失败了：
+            之前的plan是在voxelmap上的plan，但是B又是0,说明oxelmap本身的voxel size太大，导致无法规划成功，
+            比如voxel map下无法规划成功（有碰撞），但是真实场景中没有碰撞
+            这样怎么observe也没用，所以这种情况直接判定失败。
+        '''
         return NBVResult("corridor_confirmed", reach_idx=reach_idx, P_star=P), []
 
     # 3) 朝 B 生成"自由区内可达"的候选

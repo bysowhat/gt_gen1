@@ -83,9 +83,10 @@ compute_goal_pose:                      # 观测位姿(goal pose) ES 优化器�
   # Scene.compute_goal_pose 会逐个 setattr 到 ConfigurationPose（未列出的沿用其默认）；num_randoms_all /
   # num_envs 由 Scene 依 num_batches/num_randoms_* 自动重算，勿在此填。显式传参给方法可覆盖本段。
   include_obstacles: true               # 【方法级】是否把已放障碍并入 ScenePose2 碰撞世界（避障；open_cylinder 纯视觉跳过）
-  obstacle_buffer_m: 0.04                 # 【方法级】障碍并入碰撞世界前的膨胀量(米)：每块障碍 mesh 按 OBB 各维 +2·buffer 外扩，
+  obstacle_buffer_m: 0.12                # 【方法级】障碍并入碰撞世界前的膨胀量(米)：每块障碍 mesh 按 OBB 各维 +2·buffer 外扩，
                                         # 机械臂避障留安全间隙(同 STOMP 绕行 obstacle_buffer_m 语义)。只影响碰撞世界；
                                         # 遮挡视线(visionBlock)仍用真实尺寸避免过度保守；工件不膨胀。0=不膨胀。
+                                        # !!!!!!!建议是roi.voxel_size_m的3倍！！！！！！！！！！！！！
   horizontal: 2                         # 【方法级】关节限位选择：0=水平 / 1=垂直 / 其它=all（全范围，最宽松）
   device: cuda                          # 【方法级】计算设备
   # —— 进化策略采样规模（⚠ 调太小会触发优化器内部假设崩溃 reshape[0,6]，见 compute_goal_poses2；默认 8×100）——
@@ -281,8 +282,8 @@ params:
     lambda_angle: 5                    # score_candidate fun 增益 vs 焊枪朝向变化代价(rad,测地角)权重（Step 9，0=关）
     version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
   loop:
-    max_rounds: 20                     # 主循环最大轮次（Step 10）
-    stuck_rounds: 5                     # 连续无进展判卡死（Step 10）
+    max_rounds: 6                     # 主循环最大轮次（Step 10）
+    stuck_rounds: 3                     # 连续无进展判卡死（Step 10）
     observe_every_n: 2000000                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
     interp_resolution_m: 0.01           # 扫掠体积插值精度（Step 6）

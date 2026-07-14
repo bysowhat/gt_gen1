@@ -21,19 +21,26 @@ from __future__ import annotations
 from gt_gen.scene import Scene, _load_plan_init_pose
 
 
-def _goal_arm_collision(scene, goal_joints, wp_pose7, T):
-    """到达 goal 观测位姿的关节角 goal_joints 的三分碰撞检测：自碰撞 / 碰工件 / 碰障碍。
+def _quat_wxyz_to_R(q):
+    """四元数 wxyz -> 3×3 旋转矩阵（归一化后）。"""
+    import numpy as np
+    w, x, y, z = [float(v) for v in q]
+    n = (w * w + x * x + y * y + z * z) ** 0.5 or 1.0
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], float)
 
-    沿用 scripts/viz_collision_isaacsim.py 套路：curobo CudaRobotModel 做 FK，得每颗碰撞球在 base 系的
-    球心+半径（球定义取 robot yml 的 collision_spheres），再：
-      · 自碰撞：球心距 < r_i+r_j（跳过同一 link 内球对 + self_collision_ignore 里成对的相邻 link）；
-      · 工件/障碍：trimesh ProximityQuery.signed_distance(球心)+半径 > 0 即球体入网格。
-    工件/障碍 mesh 均按 base 系摆放（工件用 wp_pose7、障碍实体各 apply T），与 FK 球同框
-    （robot base 在原点，故 base 系=渲染系）。须在 SimulationApp 启动【之后】调用（curobo import 顺序）。
-    返回 dict(self, workpiece, obstacle: bool; n_self, n_work, n_obs: int)。
+
+def _fk_arm_spheres(scene, joints):
+    """机械臂在关节角 joints（长度=DOF，rad）下的整臂碰撞球，**base_link 系**。
+
+    curobo CudaRobotModel 做 per-link FK，取每个 collision link 位姿，再套 robot yml 的
+    collision_spheres（各球的 center/radius，link 局部系）变换到 base 系。robot base 在原点，
+    故 base 系即渲染系。跳过 radius<=1e-4 的占位球。须在有 curobo 的进程调用。
+    返回 (centers(N,3) ndarray, radii(N,) ndarray, link_names(list[str] 长 N))。
     """
     import numpy as np
-    import trimesh
     from gt_gen import compat as _compat
     _compat.apply_trimesh_shim()                        # warp/trimesh shim（须在 curobo 前）
     import torch
@@ -41,17 +48,7 @@ def _goal_arm_collision(scene, goal_joints, wp_pose7, T):
     from curobo.types.robot import RobotConfig
     from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel
     from curobo.util_file import load_yaml
-    from gt_gen.sensor import load_truth_scene
 
-    def _quat_wxyz_to_R(q):
-        w, x, y, z = [float(v) for v in q]
-        n = (w * w + x * x + y * y + z * z) ** 0.5 or 1.0
-        w, x, y, z = w / n, x / n, y / n, z / n
-        return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]], float)
-
-    # —— FK 碰撞球（base 系）——
     rd = load_yaml(scene.cfg.robot_cfg_path)
     kin = rd["robot_cfg"]["kinematics"]
     coll_links = list(kin["collision_link_names"])
@@ -59,7 +56,7 @@ def _goal_arm_collision(scene, goal_joints, wp_pose7, T):
     kin["link_names"] = coll_links                       # 让 FK 输出所有碰撞 link 的位姿
     ta = TensorDeviceType()
     model = CudaRobotModel(RobotConfig.from_dict(rd["robot_cfg"], ta).kinematics)
-    st = model.get_state(torch.tensor([list(goal_joints)], dtype=torch.float32, device=ta.device))
+    st = model.get_state(torch.tensor([list(joints)], dtype=torch.float32, device=ta.device))
 
     centers, radii, links = [], [], []
     for ln in coll_links:
@@ -73,11 +70,29 @@ def _goal_arm_collision(scene, goal_joints, wp_pose7, T):
                 continue
             centers.append(R @ np.asarray(s["center"], float) + pos)
             radii.append(r); links.append(ln)
-    centers = np.asarray(centers, float)
-    radii = np.asarray(radii, float)
+    return np.asarray(centers, float), np.asarray(radii, float), links
+
+
+def _goal_arm_collision(scene, goal_joints, wp_pose7, T):
+    """到达 goal 观测位姿的关节角 goal_joints 的三分碰撞检测：自碰撞 / 碰工件 / 碰障碍。
+
+    curobo CudaRobotModel 做 FK 得每颗碰撞球在 base 系的球心+半径（_fk_arm_spheres），再：
+      · 自碰撞：球心距 < r_i+r_j（跳过同一 link 内球对 + self_collision_ignore 里成对的相邻 link）；
+      · 工件/障碍：trimesh ProximityQuery.signed_distance(球心)+半径 > 0 即球体入网格。
+    工件/障碍 mesh 均按 base 系摆放（工件用 wp_pose7、障碍实体各 apply T），与 FK 球同框
+    （robot base 在原点，故 base 系=渲染系）。须在 SimulationApp 启动【之后】调用（curobo import 顺序）。
+    返回 dict(self, workpiece, obstacle: bool; n_self, n_work, n_obs: int)。
+    """
+    import numpy as np
+    import trimesh
+    from curobo.util_file import load_yaml
+    from gt_gen.sensor import load_truth_scene
+
+    centers, radii, links = _fk_arm_spheres(scene, goal_joints)
     n = len(centers)
 
     # —— 自碰撞：球-球，跳过同 link + self_collision_ignore 相邻 link（对称）——
+    kin = load_yaml(scene.cfg.robot_cfg_path)["robot_cfg"]["kinematics"]
     ignore = set()
     for a, nbrs in (kin.get("self_collision_ignore") or {}).items():
         for b in nbrs:
@@ -757,6 +772,163 @@ class Open3DSceneVisualizer(SceneVisualizer):
         if compare:
             _window(np.asarray(ip.T_workpiece_in_base, float),
                     "B: 真值摆放(T_workpiece_in_base)=show_init_poses一致")
+
+    def show_goal_pose(self, hand: str = "forehand", index: int = 0,
+                       variant: int = 0, goal_index: int = 0,
+                       include_obstacles: bool = True, show_camera: bool = True):
+        """open3d 开窗可视化【compute_goal_pose 算出的最终观测位姿】：机械臂摆到 goal pose 的关节角，
+        同屏画工件 + 障碍物，按碰撞把整臂碰撞球分色，肉眼即可判断该 goal 姿态是否有碰撞。
+
+        与 show_goal_pose_collision 的区别：那个用【优化前】候选相机位姿解 IK 挑一个构型来画；本方法
+        直接取 scene.goal_poses[seam_id]["joints"][variant, goal_index]（compute_goal_pose 收敛后的
+        最终关节角）来摆臂——即真正会被规划/执行的那条观测姿态。
+
+        坐标系：整臂碰撞球由 curobo FK 出，天然在 base_link 系（robot base 在原点）；工件/障碍按当前
+        init pose 的 T_workpiece_in_base 摆到同一 base 系（= show_init_poses 的真值摆放），故与 FK 球
+        同框、碰撞判定即物理真值。碰撞判定：工件/障碍用 trimesh signed_distance(球心)+半径>0；自碰撞
+        用球-球距<半径和（跳过同 link + self_collision_ignore 相邻 link）。
+
+        参数：
+          hand/index       : 先 set_init_pose 选哪只手第几个候选（须与算 goal pose 时同一候选）。
+          variant          : joints 第一维 K（近等价变体）索引，默认 0。
+          goal_index       : joints 第二维 B（第几个观测位姿）索引，默认 0。
+          include_obstacles: 是否画障碍并计入碰撞（默认 True，与 compute_goal_pose 同口径）。
+          show_camera      : 是否在 goal 相机位姿处画蓝色镜头球 + 视线轴（cam_pose 经 T 变到 base 系）。
+
+        goal pose 结果优先取 trajectory_goal_poses[(hand,index)] 快照（该候选已成功规划过时），否则取
+        全局 scene.goal_poses[seam_id]。颜色：灰=未碰　红=碰工件/自碰低link　绿=自碰高link　橙=碰障碍；
+        蓝球+蓝线=相机镜头/视线。⚠ 会初始化 curobo/warp，须在【未启动 SimulationApp 的干净进程】里调用。
+        """
+        import numpy as np
+        import trimesh
+
+        scene = self.scene
+        ip = scene.set_init_pose(hand, index)
+        T = np.asarray(ip.T_workpiece_in_base, float)
+
+        # —— 取 goal pose 结果：优先该候选的快照，否则全局 goal_poses ——
+        key = (scene.cur_init_hand, scene.cur_init_index)
+        res = (scene.trajectory_goal_poses.get(scene.seam_id, {}) or {}).get(key)
+        if res is None:
+            res = scene.goal_poses.get(scene.seam_id)
+        if res is None:
+            raise RuntimeError(
+                "无 goal pose 可视化：请先 compute_goal_pose()（或 compute_pose_and_plan_path）")
+
+        jt = res["joints"]
+        joints_all = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
+        K, B = joints_all.shape[:2]                       # (K 变体, B 观测位姿, DOF)
+        vi = max(0, min(int(variant), K - 1))
+        bi = max(0, min(int(goal_index), B - 1))
+        q_list = [float(v) for v in joints_all[vi, bi]]
+        print(f"[viz] goal pose 关节角 variant#{vi}/{K} 观测#{bi}/{B}  q={np.round(q_list, 3).tolist()}")
+
+        # —— FK 整臂碰撞球（base 系）——
+        centers, radii, links = _fk_arm_spheres(scene, q_list)
+        S = len(centers)
+
+        # —— 自碰撞球对（跳过同 link + self_collision_ignore）；base 侧 link 红、tip 侧 link 绿 ——
+        from curobo.util_file import load_yaml
+        kin_yml = load_yaml(scene.cfg.robot_cfg_path)["robot_cfg"]["kinematics"]
+        ignore = set()
+        for a, nbrs in (kin_yml.get("self_collision_ignore") or {}).items():
+            for b in nbrs:
+                ignore.add(frozenset((a, b)))
+        rank = {}                                         # link 首次出现次序≈base→tip（_fk_arm_spheres 按 coll_links 序）
+        for ln in links:
+            rank.setdefault(ln, len(rank))
+        self_lo, self_hi, self_pairs = set(), set(), []
+        for i in range(S):
+            for j in range(i + 1, S):
+                if links[i] == links[j] or frozenset((links[i], links[j])) in ignore:
+                    continue
+                if float(np.linalg.norm(centers[i] - centers[j])) < radii[i] + radii[j]:
+                    lo, hi = (i, j) if rank[links[i]] <= rank[links[j]] else (j, i)
+                    self_lo.add(lo); self_hi.add(hi)
+                    self_pairs.append((links[lo], links[hi]))
+
+        # —— 工件 / 障碍 mesh（经 T 摆到 base 系）——
+        wp_mesh = trimesh.load(scene.workpiece_obj, force="mesh").copy()
+        wp_mesh.apply_transform(T)
+        obs_mesh = None
+        if include_obstacles and scene.obstacles.get(scene.seam_id):
+            obs_tms = scene._obstacle_solid_trimeshes()   # open_cylinder 纯视觉，已自动跳过
+            if obs_tms:
+                tms = [tm.copy() for tm in obs_tms]
+                for tm in tms:
+                    tm.apply_transform(T)
+                obs_mesh = trimesh.util.concatenate(tms) if len(tms) > 1 else tms[0]
+
+        def _hits(mesh):
+            if mesh is None or S == 0:
+                return np.zeros(S, bool)
+            sd = trimesh.proximity.ProximityQuery(mesh).signed_distance(centers)   # 网格内为正
+            return (sd + radii) > 0
+
+        hit_w, hit_o = _hits(wp_mesh), _hits(obs_mesh)
+
+        _GRAY = [0.60, 0.60, 0.62]; _RED = [0.90, 0.10, 0.10]
+        _GREEN = [0.10, 0.80, 0.20]; _ORANGE = [0.95, 0.55, 0.10]
+        cols = [list(_GRAY) for _ in range(S)]
+        for i in range(S):
+            if hit_o[i]:
+                cols[i] = list(_ORANGE)
+            if hit_w[i]:
+                cols[i] = list(_RED)
+        for i in self_lo:
+            cols[i] = list(_RED)
+        for i in self_hi:
+            cols[i] = list(_GREEN)
+
+        # —— 相机镜头/视线（cam_pose piece 系 → base 系）——
+        cam_apex = cam_axis = None
+        if show_camera and res.get("cam_pose") is not None:
+            cp = res["cam_pose"]
+            cam_all = cp.detach().cpu().numpy() if hasattr(cp, "detach") else np.asarray(cp)
+            camT = T @ _pose7_to_T(cam_all[vi, bi])       # piece/mesh 系 → base 系
+            cam_apex = camT[:3, 3]
+            cam_axis = camT[:3, 2]                         # +z = 视线方向
+
+        try:
+            import open3d as o3d
+        except Exception as e:                            # noqa: BLE001
+            print(f"[viz] open3d 不可用，跳过：{e}")
+            return
+
+        def _mesh_geom(tm, color):
+            m = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(np.asarray(tm.vertices, float)),
+                o3d.utility.Vector3iVector(np.asarray(tm.faces, np.int32)))
+            m.compute_vertex_normals(); m.paint_uniform_color(color)
+            return m
+
+        geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)]
+        geoms.append(_mesh_geom(wp_mesh, [0.72, 0.72, 0.75]))
+        if obs_mesh is not None:
+            geoms.append(_mesh_geom(obs_mesh, [0.55, 0.50, 0.35]))
+        for i in range(S):
+            ball = o3d.geometry.TriangleMesh.create_sphere(radius=max(float(radii[i]), 1e-3), resolution=8)
+            ball.translate(tuple(float(v) for v in centers[i]))
+            ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+            ls.paint_uniform_color(cols[i])
+            geoms.append(ls)
+        if cam_apex is not None:                          # 相机镜头(蓝球) + 视线轴(蓝线)
+            cb = o3d.geometry.TriangleMesh.create_sphere(radius=0.015)
+            cb.translate(tuple(float(v) for v in cam_apex)); cb.compute_vertex_normals()
+            cb.paint_uniform_color([0.1, 0.1, 0.9]); geoms.append(cb)
+            axl = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector([cam_apex, cam_apex + cam_axis * 0.4]),
+                lines=o3d.utility.Vector2iVector([[0, 1]]))
+            axl.paint_uniform_color([0.1, 0.1, 0.9]); geoms.append(axl)
+
+        n_hit_total = int(hit_w.sum()) + int(hit_o.sum()) + len(self_pairs)
+        print(f"[viz] goal pose 碰撞：碰工件球={int(hit_w.sum())}/{S}  碰障碍球={int(hit_o.sum())}  "
+              f"自碰对={len(self_pairs)}"
+              + (f"  自碰 link 对={sorted(set(self_pairs))}" if self_pairs else "")
+              + ("  → 该 goal 姿态【无碰撞】" if n_hit_total == 0 else "  → 该 goal 姿态【有碰撞】"))
+        title = (f"goal pose {scene.cur_init_hand}#{scene.cur_init_index} K#{vi} 观测#{bi}"
+                 f"（工件{int(hit_w.sum())}/障碍{int(hit_o.sum())}/自碰{len(self_pairs)}）")
+        o3d.visualization.draw_geometries(geoms, window_name=title[:70])
 
     def show_seam(self, seam_id: int):
         """在 **open3d** 中可视化【指定焊缝】：工件网格 + 该焊缝红色直线 + 障碍物（如有）。
