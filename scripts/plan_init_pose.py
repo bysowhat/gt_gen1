@@ -2422,14 +2422,17 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True) -> Tuple[Di
     #   ④ 里 snap 前的碰撞过滤在此姿态下已失效；这里对最终 (Rv,t_new) 只用 retract 姿态整臂碰撞球
     #   再查一次工件 ESDF，撞则丢弃（判据同 ④：含 clearance_inflate、d<=collision_tolerance）。
     results_pre_recheck = list(results)   # ⑦「轻去重」后、⑧ 复检前的合格候选快照（供 debug 逐步存盘）
-    if arm_recheck and results:
-        R_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, :3] for r in results])
-        t_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, 3] for r in results])
-        safe = solver.recheck_retract_collision_snapped(R_res, t_res).detach().cpu().numpy()
-        n_arm_collide = int((~safe).sum())
-        results = [r for r, s in zip(results, safe.tolist()) if s]
-        fore = [r for r in results if r["hand"] == "forehand"]
-        back = [r for r in results if r["hand"] == "backhand"]
+    # —— ⑧ snap后 retract-工件无碰撞复检：按需关闭（保留代码，勿删；要重开就取消下面整段注释）——
+    #   关闭理由：该步会把 snap 后 retract 姿态与工件相碰的候选丢掉，当前不需要此过滤。
+    #   注：关闭后 n_arm_collide 恒为 0，⑧ 计数行显示 after_dedup → n_final 不变（碰撞丢 0）。
+    # if arm_recheck and results:
+    #     R_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, :3] for r in results])
+    #     t_res = np.stack([np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, 3] for r in results])
+    #     safe = solver.recheck_retract_collision_snapped(R_res, t_res).detach().cpu().numpy()
+    #     n_arm_collide = int((~safe).sum())
+    #     results = [r for r, s in zip(results, safe.tolist()) if s]
+    #     fore = [r for r in results if r["hand"] == "forehand"]
+    #     back = [r for r in results if r["hand"] == "backhand"]
     prof["⑤snap+正反手分类(CPU遍历候选)"] = _time.time() - _t
     # —— 逐步过滤计数（前→后，括号=本步丢弃）；这是结果口径信息，无条件打印（不受 verbose 影响） ——
     after_hit = n_hit                          # ② 工作空间 + 朝向 snap 命中
