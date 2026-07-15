@@ -363,6 +363,79 @@ class Open3DSceneVisualizer(SceneVisualizer):
         pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
                                   stride=stride, extra_geoms=extra)
 
+    # 预筛三阶段的名字（与 plan_init_pose.solve_one_weld_lookup 漏斗打印一致，n 从 1 起）
+    _PREFILTER_STEP_NAMES = [
+        "端点∈工作空间",
+        "+朝向粗筛(列夹角<3θ+15°)",
+        "碰撞safe(link+retract vs 工件ESDF)",
+    ]
+
+    def show_init_pose_prefilter(self, stage, stride: int = 1,
+                                 show_init_arm: bool = True, init_joints=None,
+                                 sort_by_seam_x: bool = True):
+        """可视化【预筛阶段】随机抽到的候选位姿（plan_init_pose(diagnostic=True) 时 lookup 内各阶段
+        随机抽 ≤10 个），其余可视化与 show_init_poses / show_init_poses_debug 完全一致（画的是未 snap 的
+        lookup 原始 (R,t) 位姿，goal 不定）。
+
+        stage：阶段序号 1..3 或阶段名（见 _PREFILTER_STEP_NAMES）——
+          1=端点∈工作空间、2=+朝向粗筛(列夹角<3θ+15°)、3=碰撞safe(link+retract vs 工件ESDF)。
+        对应 solve_one_weld_lookup 打印的预筛漏斗；用于诊断候选在哪一层被筛光（如 safe=0 时看前两层）。
+        前提：先 Scene.plan_init_pose(diagnostic=True)（非诊断模式各阶段为空 → 抛错）。
+
+        与 show_init_poses 一致：正手→反手依次开窗，工件 mesh + 焊缝/中点 + standoff 落点 + 蓝色
+        bisector 轴 + lookup 关节角整臂碰撞球(红)，障碍随工件摆放、初始关节角机械臂碰撞球(异色)、
+        init_free 空间一并叠加；按 C 切下一个、直接关窗退出。stride：每隔几个抽 1 个。
+        sort_by_seam_x：True 时每手候选按焊缝中点 base-x（seam_center_base[0]）从大到小排序后开窗。"""
+        scene = self.scene
+        steps = scene.init_pose_prefilter_steps.get(scene.seam_id)
+        if not steps:
+            raise RuntimeError(
+                "无预筛抽样候选：请先 Scene.plan_init_pose(diagnostic=True)（仅诊断模式才抽样）")
+        names = self._PREFILTER_STEP_NAMES
+        if isinstance(stage, str):
+            name = stage
+            if name not in steps:
+                raise ValueError(f"未知阶段名「{stage}」，可选：{list(steps.keys())}")
+        else:
+            n = int(stage)
+            if not (1 <= n <= len(names)):
+                raise ValueError(f"stage 需在 1..{len(names)}（预筛三阶段），收到 {n}")
+            name = names[n - 1]
+        step_list = steps.get(name, [])
+        if not step_list:
+            raise RuntimeError(
+                f"预筛阶段「{name}」无抽样候选（0 个：该阶段幸存者为 0，或未开 diagnostic）")
+        pim = _load_plan_init_pose()
+        res = {"forehand": [c for c in step_list if c.get("hand") == "forehand"],
+               "backhand": [c for c in step_list if c.get("hand") == "backhand"]}
+
+        if sort_by_seam_x:
+            def _seam_x(c):
+                sc = c.get("seam_center_base")
+                return float(sc[0]) if sc is not None else float("-inf")
+            for _h in ("forehand", "backhand"):
+                res[_h].sort(key=_seam_x, reverse=True)
+
+        # extra_geoms 钩子：与 show_init_poses_debug 相同（障碍随工件摆放 + 初始臂碰撞球 + init_free 空间）
+        factories = []
+        if scene.obstacles.get(scene.seam_id):
+            factories.append(self._obstacle_o3d_factory())
+        if show_init_arm:
+            factories.append(self._init_arm_o3d_factory(init_joints))
+        factories.append(self._init_free_o3d_factory())
+        extra = None
+        if factories:
+            def extra(R, t, _fs=factories):
+                geoms = []
+                for f in _fs:
+                    geoms.extend(f(R, t))
+                return geoms
+
+        print(f"[viz] 预筛阶段「{name}」抽样候选 {len(step_list)} 个"
+              f"（正手 {len(res['forehand'])} / 反手 {len(res['backhand'])}）")
+        pim._show_kejian2_results(scene.cfg, scene.workpiece_obj, scene.seam, res,
+                                  stride=stride, extra_geoms=extra)
+
     def show_joint_table_ee(self, path=None, show_out_of_range: bool = True,
                             show_range_shell: bool = True, show_init_arm: bool = True):
         """open3d 可视化【预计算关节表】(configs/plan_init_joint_table.pt) 里落在工作空间范围内的

@@ -194,6 +194,13 @@ class Config:
         return float(self.raw.get("plan_init_pose", {}).get("voxel_size_m", 0.02))
 
     @property
+    def plan_init_solve_n_chunk(self) -> int:
+        """solve_one_weld_lookup 按候选 N 分块的块大小：Gz×N 的 pose 张量单张随 N 可达 ~GB，
+        N≈2M 时一次性算会 OOM。逐块跑完整角度扫描，峰值显存只与本值相关、与全 N 无关，结果与
+        不分块逐位一致。见 default.yaml plan_init_pose.solve_n_chunk。"""
+        return int(self.raw.get("plan_init_pose", {}).get("solve_n_chunk", 50000))
+
+    @property
     def seam_min_length_m(self) -> float:
         """焊缝长度过滤阈值（米）：corrected_p0↔p1 直线距离小于此值的焊缝在 Scene._load_seam 丢弃。
         见 default.yaml seam.min_length_cm。"""
@@ -210,6 +217,17 @@ class Config:
         的存储路径（.pt）。相对路径按项目根解析。见 default.yaml plan_init_pose.joint_table_path。"""
         p = self.raw.get("plan_init_pose", {}).get(
             "joint_table_path", "configs/plan_init_joint_table.pt")
+        return p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
+
+    @property
+    def plan_init_extra_joint_pt(self) -> str:
+        """额外候选关节角来源（.pt，如 sweep_ik_solutions.pt 里的 'q' 字段）：precompute/load
+        joint_table 后，把该文件的关节角【追加】到候选表（不再过 ee 范围过滤，作为显式候选；
+        下游逐焊缝 reach/碰撞/snap 仍会筛）。空串=关闭。相对路径按项目根解析。
+        见 default.yaml plan_init_pose.extra_joint_pt。"""
+        p = self.raw.get("plan_init_pose", {}).get("extra_joint_pt", "")
+        if not p:
+            return ""
         return p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
 
     @property

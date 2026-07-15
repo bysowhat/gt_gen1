@@ -339,6 +339,10 @@ class Scene:
         # {seam_id: [step1,…,step8]}：plan_init_pose 逐步过滤每步【通过】的候选（raw 结果 dict），
         # 供 Open3DSceneVisualizer.show_init_poses_debug(n) 单步可视化。每次 plan_init_pose 覆盖本 seam。
         self.init_pose_debug_steps: Dict[int, List[List[dict]]] = {}
+        # {seam_id: {"端点∈工作空间":[...], "+朝向粗筛...":[...], "碰撞safe...":[...]}}：
+        # plan_init_pose(diagnostic=True) 时 lookup 内三阶段各随机抽 ≤10 个幸存候选（raw dict），
+        # 供 Open3DSceneVisualizer.show_init_pose_prefilter 可视化预筛漏斗。非 diagnostic 时为空列表。
+        self.init_pose_prefilter_steps: Dict[int, Dict[str, List[dict]]] = {}
         self.cur_init_pose: Optional[InitPoseCandidate] = None    # 当前选定的 init pose 候选（set_init_pose 设定）——定义工件↔base 摆放
         self.cur_init_hand: Optional[str] = None                  # 当前候选所属手别（"forehand"/"backhand"）
         self.cur_init_index: Optional[int] = None                 # 当前候选在【该手别列表】中的下标
@@ -437,7 +441,9 @@ class Scene:
         open_cylinder 为纯视觉、不进碰撞世界。include_obstacles=False 则退回仅工件（若此前注过障碍会自动还原）。
 
         参数：
-          diagnostic       : 预留（kejian2 逐焊缝求解暂不细分诊断，当前未使用）。
+          diagnostic       : True 透传到 lookup 求解（solve_one_weld_lookup），无解时打印 637 朝向采样
+                             逐项明细（safe=/端点OK=/min_d_link/min_d_ret + [端点超范围/LINK撞/RETRACT撞]），
+                             端点全灭的采样再打端点落点 xy/z vs ee_xy_range/ee_z_range 的最近差距。默认 False。
           rebuild          : True 强制重建工件级 ctx（换工件 / 改 n_per_dof 等缓存失效时）。
           include_obstacles: True（默认）把 self.obstacles 并入碰撞世界后再求解（避障）。
           verbose          : True 打印 ESDF 并入 / solve profile 计时（诊断噪声，默认 False 静默）。
@@ -446,16 +452,22 @@ class Scene:
         返回：候选 dict {"forehand":[...], "backhand":[...]}（各组可能为空=该手别无合格解）。
 
 
-        过滤步骤：
-        ① lookup 候选（绕末端轴 13×5×5 采样） : 4834
-        ② 工作空间 + 朝向snap 命中            : 4834 → 446
-        ③ 正面过滤(bisector base-z≥0)        : 446 → 317（背面丢 129）
-        ④ 焊缝中心 base-x>0                   : 317 → 313（x≤0 丢 4）
-        # 废弃 ⑤ 工件+障碍 vs init_free 空间无交集   : 313 → 0（相交丢 313）
-        ⑤ 工件+障碍 vs init_free 空间无交集
-        ⑥ 底座-工件 XY 投影不相交            : 0 → 0（相交丢 0）
-        ⑦ 轻去重(同朝向 + 2cm 同位)          : 0 → 0（重复丢 0）
-        ⑧ snap后 retract-工件无碰撞复检      : 0 → 0（碰撞丢                           
+        预筛统计（lookup 内，前→后）：
+            总候选 = N(186901)×角度(637=13×7×7)      : 119055937
+            端点∈工作空间(xy/z range)              : 119055937 → 93730375
+            +朝向粗筛(列夹角<3θ+15°)               : 93730375 → 93730375
+            碰撞safe(link+retract vs 工件ESDF)     : 93730375 → 0
+            各角度桶取top50归并 = lookup 返回候选   : 0 → 0
+        预筛之后的过滤步骤：
+            ① lookup 候选（绕末端轴 13×5×5 采样） : 4834
+            ② 工作空间 + 朝向snap 命中            : 4834 → 446
+            ③ 正面过滤(bisector base-z≥0)        : 446 → 317（背面丢 129）
+            ④ 焊缝中心 base-x>0                   : 317 → 313（x≤0 丢 4）
+            # 废弃 ⑤ workpiece_x_min_m
+            ⑤ 工件+障碍 vs init_free 空间无交集
+            ⑥ 底座-工件 XY 投影不相交            : 0 → 0（相交丢 0）
+            ⑦ 轻去重(同朝向 + 2cm 同位)          : 0 → 0（重复丢 0）
+            # 已关闭 ⑧ snap后 retract-工件无碰撞复检      : 0 → 0（碰撞丢                           
         """
         if not self.workpiece_obj:
             raise ValueError("plan_init_pose 需要 workpiece_obj（工件 mesh）")
@@ -494,8 +506,10 @@ class Scene:
                 obs_pts = np.concatenate(chunks, axis=0)
         self._k2ctx["init_free_obstacle_pts"] = obs_pts
 
-        res, _prof, debug_steps = pim._kejian2_solve_weld(self._k2ctx, self.seam, verbose=verbose)
+        res, _prof, debug_steps, prefilter_steps = pim._kejian2_solve_weld(
+            self._k2ctx, self.seam, verbose=verbose, diagnostic=diagnostic)
         self.init_pose_debug_steps[self.seam_id] = debug_steps   # 逐步过滤每步通过候选（覆盖本 seam，供 show_init_poses_debug）
+        self.init_pose_prefilter_steps[self.seam_id] = prefilter_steps   # 预筛三阶段抽样（diagnostic 时非空，供 show_init_pose_prefilter）
 
         # 正反手分组返回（不做数量上限挑选）：每组各自按工件平移 xyz 差异独立分数降序
         fore = [InitPoseCandidate.from_kejian2(d) for d in res.get("forehand", [])]
@@ -767,6 +781,7 @@ class Scene:
             cur_cfg=list(self.cur_cfg),
             init_pose_candidates=self.init_pose_candidates,   # {seam_id: {"forehand":[...],"backhand":[...]}}（InitPoseCandidate dataclass）
             init_pose_debug_steps=self.init_pose_debug_steps,  # {seam_id: [step1..step8]} 逐步过滤每步通过候选（raw dict）
+            init_pose_prefilter_steps=self.init_pose_prefilter_steps,  # {seam_id: {阶段名: [raw dict]}} 预筛三阶段抽样（diagnostic）
             cur_init_pose=self.cur_init_pose,
             cur_init_hand=self.cur_init_hand,
             cur_init_index=self.cur_init_index,
@@ -816,6 +831,7 @@ class Scene:
         self.cur_cfg = list(state.get("cur_cfg", self.cur_cfg))
         self.init_pose_candidates = state.get("init_pose_candidates", {}) or {}
         self.init_pose_debug_steps = state.get("init_pose_debug_steps", {}) or {}
+        self.init_pose_prefilter_steps = state.get("init_pose_prefilter_steps", {}) or {}
         self.cur_init_pose = state.get("cur_init_pose")
         self.cur_init_hand = state.get("cur_init_hand",
                                        getattr(self.cur_init_pose, "hand", None))
