@@ -41,6 +41,7 @@
 
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -509,9 +510,13 @@ def plan_to_joint_single(cur_cfg, target_cfg, world, *, robot_yml=DEFAULT_ROBOT_
 
     plan_kwargs  : 透传 StompPlanner.plan_joint（num_iterations/num_batch/collision_weight/...）
     """
+    _t0 = time.perf_counter()
     planner = StompPlanner(world, robot_yml=robot_yml, checker_type=checker_type,
                            device=device, buffer=buffer)
+    _t_build = time.perf_counter()
     trajs, infos = planner.plan_joint(cur_cfg, target_cfg, **plan_kwargs)
+    _t_solve = time.perf_counter()
+    print(f"[计时·拆分] 建planner {_t_build - _t0:.3f}s | STOMP solve {_t_solve - _t_build:.3f}s")
     idx = _valid_candidates(infos, planner.oracle)
     if not idx:
         return None
