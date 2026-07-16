@@ -129,21 +129,28 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
 plan_init_pose:                         # lookup 式初始位姿求解（scripts/plan_init_pose.py --solve）的关节角过滤
   # precompute_joint_table 对 n^6 采样的关节角做 FK 后，只保留焊枪末端位姿（base_link 系）满足下列约束的：
   #   ① xy 平面到原点距离 ∈ ee_xy_range_m；② z ∈ ee_z_range_m；③ 落在 init_free.box_min_m/box_max_m 盒内。
-  ee_xy_range_m: [0.4, 1.4]             # 焊枪末端 xy 平面到 base_link 原点距离 [下限,上限]（米）
+  ee_xy_range_m: [0.4, 1.2]             # 焊枪末端在 base_link 系 x [下限,上限]（米）
   ee_z_range_m: [-0.1, 0.1]             # 焊枪末端在 base_link 系 z [下限,上限]（米）
   # n_per_dof: [12, 12, 12, 24, 24, 24]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,949,120（≈ 旧 12^6=2.99M，不易 OOM）。
   # n_per_dof: [15, 15, 15, 24, 24, 24]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,949,120（≈ 旧 12^6=2.99M，不易 OOM）。
-  n_per_dof: [12, 12, 12, 12, 12, 12]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,985,984（≈ 旧 12^6=2.99M）。
+  n_per_dof: [12,12,12,12,12,12]   # 每关节采样档数 [link1..link6]；q_table = ∏ni = 2,985,984（≈ 旧 12^6=2.99M）。
                                         #   也可填标量(如 12)=各关节同档(=n^6，旧行为)。想加精度就调大对应关节；
                                         #   显存≈幸存者数×碰撞球，先小步加。改了此值须重算关节表缓存。
   collision_tolerance_m: 0.00           # 整臂/retract 碰撞球对工件 ESDF 的允许穿透阈值（米，d<=tol 判 safe）
   clearance_inflate_m: 0.01             # 间隙膨胀量(米)：所有碰撞球半径 +此值再判碰，等效要求整臂离工件留间隙；0=关闭。
                                         #   collision_tolerance_m 不支持负数(d=穿透代价恒>=0，<=负 tol 恒 False)，
-                                        #   故"离工件留间隙"只能靠膨胀碰撞球半径实现，即本项。
+                                        #   故“离工件留间隙”只能靠膨胀碰撞球半径实现，即本项。
   voxel_size_m: 0.01                    # 工件 ESDF 体素大小（米）
+  solve_n_chunk: 50000                  # solve_one_weld_lookup 按候选 N 分块的块大小：Gz×N 的 pose 张量
+                                        #   (Rz_stack/T1/T2/R_g/cos_g) 单张随 N 可达 ~GB，N≈2M 时一次性算会 OOM。
+                                        #   逐块跑完整角度扫描，峰值显存只与本值相关、与全 N 无关；结果与不分块逐位一致。
+                                        #   越小越省显存、Python 循环开销略增；显存紧就调小（如 20000）。
   n_seg: 20                             # save_seam_pkl 的 seam_line 插值点数
   joint_table_path: "configs/plan_init_joint_table.pt"  # precompute_joint_table 结果(.pt)的存储路径(相对项目根)；
                                         # InitPoseLookupSolver.save_joint_table 写入，可复用免去 n^6 重算。
+  extra_joint_pt: "configs/sweep_ik_solutions.pt"  # 额外候选关节角来源(.pt 的 'q' 字段，如 sweep 生成)：precompute/load
+                                        #   joint_table 后【追加】到候选表(不过 ee 范围/init_free 盒过滤，作显式候选；
+                                        #   下游逐焊缝 reach/碰撞/snap 仍会筛)。""=关闭。改此文件不影响 joint_table 缓存。
   standoff_cm: 2.0                     # 焊枪头落点沿焊缝角平分线(bisector，远离工件方向)外移的 standoff 距离(cm)；
                                         # 0=落在焊缝中点。与 goal.standoff_cm 同义，但作用于初始位姿求解。
   snap_deg: 10.0                        # 候选朝向 vs 4 种允许朝向：xyz 逐轴旋转误差上限（度）；三轴全在内才保留并 snap 到该朝向
@@ -163,8 +170,8 @@ plan_init_pose:                         # lookup 式初始位姿求解（scripts
   # 即焊枪自转 roll（指向不变），绕 y/z 为 tilt（改变焊枪指向）。可视化核实见 plan_init_pose.viz_tip_frame。
   # 每行 [min,max,step]（度，闭区间含端点）；step<=0 或 min==max 表示该轴只取 min（不转）。
   rot_x_deg: [-180, 180, 30]              # 绕末端局部 +x 轴（=名义焊枪轴 -x，焊枪自转 roll）：[min,max,step]（度）
-  rot_y_deg: [-30, 30, 15]              # 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
-  rot_z_deg: [-30, 30, 15]                  # 绕末端局部 +z 轴（tilt）：[min,max,step]（度）
+  rot_y_deg: [-45, 45, 15]              # 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
+  rot_z_deg: [-45, 45, 15]                  # 绕末端局部 +z 轴（tilt）：[min,max,step]（度）
 
 plan_init_pose_kejian:                         # lookup 式初始位姿求解（scripts/plan_init_pose.py --solve）的关节角过滤
   # precompute_joint_table 对 n^6 采样的关节角做 FK 后，只保留焊枪末端位姿（base_link 系）满足下列约束的：
@@ -294,34 +301,51 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
   #   type2 = 焊缝旁遮挡板候选（Scene.add_obstacle_type2，示例 scripts/viz_seam_plate_candidates_isaacsim.py）
   #   type3 = 把焊缝包住的开口障碍（Scene.add_obstacle_type3，示例 scripts/viz_seam_open_box_isaacsim.py）
 
-  type1:                                # 障碍物类型1：走廊自动放障碍（原 obstacle_placement 全部参数原样移入此段）
-    # 底层 place_in_corridor 按参数（link/类型/尺寸/角度/位置）放 ≤M 个障碍；上层 search_placement
-    # 失败就改尺寸/角度/位置重试至 N 次。判定「合适」三条件：①默认路径碰撞 ②仍有绕行解 ③绕行明显不同。
-    max_per_scene: 1                    # M：每个场景最多障碍数（先实现 M=1）
-    max_attempts: 20                    # N：单个 (link,type) 放置失败后的最大重试次数
-    detour_max_attempts: 20             # 绕行可行性判定(detour_exists)的 plan 尝试次数。
-                                        # 独立于 planner.max_attempts(=200，那是产最终 GT 用的余量)；
-                                        # 这里只判「是否存在绕行解」，无需跑满 → 取小值大幅提速
-                                        # （障碍挡死时是最坏情况：ik_return_seeds 个候选 × 此值，全失败才返回）。
-    key_links: ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"]
-    pos_t_window: [0.25, 0.85]          # 选 anchor 的默认轨迹时间窗（避开起点 init_free 段与终点焊缝段）
+  type1:                                # 障碍物类型1：在指定 link 扫掠走廊里放 1 个障碍（Scene.add_obstacle_type1）
+    # add_obstacle_type1(link,...) → place_in_corridor 解析解放 1 个【原尺寸】障碍：与该 link 扫掠球并集有交、
+    # 且整只落在 init_free 外。放不下就在 max_attempts 内换类型/尺寸重试。不做三条件验证、不重新规划。
+    max_attempts: 20                    # 单次放置失败后换类型/尺寸的最大重试次数
+    pos_t_window: [0.25, 0.85]          # 选 anchor 的轨迹时间窗（避开起点 init_free 段与终点焊缝段）
     goal_clearance_m: 0.25              # anchor 距 goal 位置的最小距离（不要紧贴焊缝）
-    size_scale_range: [0.6, 1.6]        # 障碍尺寸相对局部走廊管半径的缩放采样区间
-    angle_jitter_deg: 180               # 角度扰动幅度（度）
-    pos_jitter_m: 0.40                  # 位置扰动幅度（米）
-    detour_min_joint_rad: 0.1           # 条件③：绕行 vs 默认的关节空间最大偏差阈值（rad）
-    detour_max_solutions: 10            # 每个场景收集多少条【互不相同】的绕行解存为多份 GT 候选：
-                                        # 对多 IK 分支各规划，按关节偏差峰值 ≥ detour_min_joint_rad 去重，
-                                        # 取前 N 条（按 IK 误差升序，第 0 条即默认优先解）。1=只存 1 条
-    detour_ik_position_threshold: 0.1   # 无用，ik目前的goal是写死的，仅 detour_exists 的 plan_pose_multi 用：绕行 IK 位置收敛门限(米)
-    detour_ik_rotation_threshold: 0.3   # 用，ik目前的goal是写死的， 仅 detour_exists 的 plan_pose_multi 用：绕行 IK 朝向收敛门限(四元数测度 sin(θ/2)≈2.9°)
-    obstacle_buffer_m: 0.04              # 仅对放置的障碍物膨胀一圈做安全间隙（米）：①碰撞判定用真实尺寸，
-                                        # ②③绕行规划用膨胀尺寸→绕行解与真实障碍留 buffer；工件不受影响。0=关闭
-    obstacle_types: []                  # 空=用 obstacles.list_obstacles() 全部 15 种
-    # _shape_for 的尺寸夹紧/采样区间（不写死在代码里，单一来源）
-    span_clip_m: [0.15, 2.2]            # 障碍主跨度 s=clip(span,·) 的[下界,上界]（米）：下界保证大到能横挡走廊，上界防塞满场景无解
-    tube_r_clip_m: [0.04, 0.20]         # 杆/管/梁截面半径 rt=clip(tube_r,·) 的[下界,上界]（米）：下界防细到漏过，上界防单管成大圆柱
+    angle_jitter_deg: 20                # 三轴随机旋转幅度(每轴±度)：+X 对齐扫掠切向后，再绕 body xyz 各随机转一次，
+                                        # 仅为姿态多样性（非优化）。20≈轻抖仍大体横挡走廊；调到 180 ≈ 全随机朝向
+    yaw_search_max_deg: 0.0             # 水平偏航求解范围(±度)：0=关闭角度优化，只做纯法线外推(ψ=0)；
+                                        # >0 才在 [-此值,+此值] 内搜「外推量最小且仍咬扫掠管」的偏航角（默认曾 90）
     thickness_range_m: [0.02, 0.05]     # 板/壁厚 th 的随机采样[下界,上界]（米，每次放置在此区间均匀取）
+    # 注：尺寸相关的 size_scale_range / span_clip_m / tube_r_clip_m 已【按类型】下放到 obstacle_params，各类型单独控制
+
+    obstacle_types:                     # 1候选障碍类型（缺省随机抽一种，用 seed+seam_id 复现）；注释掉不想要的即可
+      - plate                           # 单块钢板（法向+X，正面横挡走廊）
+      - l_bracket                       # L 型钢板（└，一竖板+一横板）
+      - u_channel                       # U 型槽（开口朝上，工件可落槽内）
+      - pipe                            # 单根圆管（横跨走廊）
+      - parallel_pipes                  # 多根平行管（护栏/管束）
+      - crossed_pipes                   # 交叉管（X 形）
+      - box_beam                        # 方管/方梁（实心方截面）
+      - rect_frame                      # 矩形管框架（中间留孔）
+      - gantry                          # 门型框架（两立柱+横梁）
+      - braced_frame                    # 斜撑框架（矩形框+对角斜梁）
+      - tripod                          # 三角支架（三杆竖立三角框）
+
+    obstacle_params:                    # 各类型的尺寸/离散选项/结构数/缩放系数(_mult)与下限(_min)，【按类型单独控制】。
+                                        # 每类型可含 3 个尺寸旋钮（缺省用行内默认）：
+                                        #   size_scale_range [lo,hi] —— 尺寸相对局部走廊管半径的缩放采样区间（span=2·tube_r·此值）
+                                        #   span_clip_m      [lo,hi] —— 主跨度 s=clip(span,·)：下界保证横挡走廊、上界防塞满场景（所有类型都用）
+                                        #   tube_r_clip_m    [lo,hi] —— 杆/管/梁截面半径 rt=clip(tube_r,·)：【仅用 rt 的类型才写】
+                                        # 尺寸主体仍随走廊自适应：s=span(clip后)、rt=tube_r(clip后)、th=thickness_range_m 取样；
+                                        # 只覆盖这里列出的键，未列的回退 _shape_for 内置默认（整段留 {} 即全用默认）。
+                                        # 注：plate/l_bracket/u_channel 不用 rt，故不写 tube_r_clip_m。
+      plate:            {size_scale_range: [0.5, 0.7], span_clip_m: [0.15, 2.2], tilt_deg: 0.0}                 # 绕 Y 倾角(度)
+      l_bracket:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2]}                               # 纯尺寸，无离散项
+      u_channel:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2], height_mult: 0.7}             # 侧板高 = s×0.7
+      pipe:             {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 1.5}    # 管轴 x/y/z；管长 = s×1.5
+      parallel_pipes:   {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], n: 3, axis: y, stack: z, length_mult: 1.5, gap_mult: 0.5} # n 根；沿 stack 以 gap=s×0.5 排开
+      crossed_pipes:    {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], cross_deg: 90.0, length_mult: 1.5}                        # 两管夹角(度)；管长 = s×1.5
+      box_beam:         {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 1.5, side_mult: 1.4, side_min: 0.06}# 方截面边长 = max(side_min, rt×side_mult)
+      rect_frame:       {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], beam_min: 0.06}               # 边框方梁截面 = max(beam_min, rt)
+      gantry:           {size_scale_range: [0.6, 2.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], post_min: 0.06, beam_min: 0.08} # 立柱/横梁截面下限
+      braced_frame:     {size_scale_range: [0.6, 2.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], beam_min: 0.06, brace_mult: 0.8, brace_min: 0.05} # 斜撑截面 = max(brace_min, rt×brace_mult)
+      tripod:           {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], base_half_mult: 0.5, rod_min: 0.05} # 底半宽 = s×0.5；杆半径 = max(rod_min, rt)
 
   type2:                                # 障碍物类型2：焊缝旁遮挡板（固定候选 C1，示例 launch.json:viz_seam_plate_candidates_isaacsim）
     # Scene.add_obstacle_type2 按本段参数据焊缝几何(切线 t / 两面表面方向 d1,d2 / 角平分线 bis)造遮挡板：

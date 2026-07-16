@@ -212,6 +212,43 @@ def _box_prim_to_trimesh(prim):
     return trimesh.creation.box(extents=dims.tolist(), transform=T)
 
 
+def _tube_prim_to_trimesh(prim):
+    """Tube 原语(轴沿局部 +Z, radius/height, pose=[x,y,z,qw,qx,qy,qz]) → 实体 trimesh 圆柱（watertight）。
+
+    trimesh.creation.cylinder 建的圆柱轴沿 +Z、居中于原点，与 gt_gen.obstacles.Tube 约定一致
+    （见 obstacle_placement._point_solid_dist2 的 Tube 判据）；再套 prim.pose 摆到位。
+    """
+    import trimesh
+    from scipy.spatial.transform import Rotation as Rsp
+    pose = np.asarray(prim.pose, float)
+    q = pose[3:7]                                # wxyz → scipy xyzw
+    T = np.eye(4)
+    T[:3, :3] = Rsp.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    T[:3, 3] = pose[:3]
+    return trimesh.creation.cylinder(radius=float(prim.radius), height=float(prim.height),
+                                     transform=T)
+
+
+def _transform_prim(prim, T):
+    """把 Box/Tube 原语的 pose 用 4×4 齐次变换 T 左乘（刚体变换；dims/radius/height 不变），返回新原语。
+
+    用于把在【base 系】放好的类型1障碍原语转回【工件 mesh 系】存储（T=inv(T_workpiece_in_base)），
+    使其与类型2/3 同框——下游 _obstacle_solid_trimeshes + workpiece_pose7 再变回 base 系时恰好落回原位。
+    """
+    import dataclasses
+    from scipy.spatial.transform import Rotation as Rsp
+    pose = np.asarray(prim.pose, float)
+    q = pose[3:7]                                # wxyz → scipy xyzw
+    M = np.eye(4)
+    M[:3, :3] = Rsp.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
+    M[:3, 3] = pose[:3]
+    M2 = np.asarray(T, float) @ M
+    qx, qy, qz, qw = Rsp.from_matrix(M2[:3, :3]).as_quat()   # scipy xyzw
+    new_pose = [float(M2[0, 3]), float(M2[1, 3]), float(M2[2, 3]),
+                float(qw), float(qx), float(qy), float(qz)]  # → wxyz
+    return dataclasses.replace(prim, pose=new_pose)
+
+
 @dataclass
 class ObstacleSpec:
     """一个已放置的障碍物（类型2/3）的可视化 + cuRobo 载荷（工件 mesh 系）。
@@ -547,6 +584,7 @@ class Scene:
     def _obstacle_solid_trimeshes(self):
         """当前 self.obstacles → 可并入碰撞 ESDF 的【实体 trimesh】列表。
 
+        · 类型1 走廊障碍：obstacles.build 的 Box/Tube 原语（工件 mesh 系）→ 各建实体 trimesh；
         · 类型2 遮挡板（plate/triangle/trapezoid）：闭合薄棱柱 mesh → 三角化实体；
         · 类型3 open_box：5 块 Box 墙各建实体 box（保留开口，机械臂可从开口伸入够焊缝）；
         · open_cylinder：纯视觉、零厚度开口管，不进碰撞世界（跳过）。
@@ -554,7 +592,14 @@ class Scene:
         """
         out = []
         for ob in self.obstacles.get(self.seam_id, []):
-            if ob.otype == 2:
+            if ob.otype == 1:
+                for prim in ob.prims:
+                    cls = type(prim).__name__       # 避免与循环变量 ob 争用 obstacles 模块名
+                    if cls == "Box":
+                        out.append(_box_prim_to_trimesh(prim))
+                    elif cls == "Tube":
+                        out.append(_tube_prim_to_trimesh(prim))
+            elif ob.otype == 2:
                 for mesh in ob.meshes:
                     tm = _polygon_mesh_to_trimesh(mesh)
                     if tm is not None:
@@ -1506,4 +1551,129 @@ class Scene:
             raise ValueError(f"未知类型3障碍 {obstacle!r}，可选 open_box/open_cylinder")
 
         self.obstacles.setdefault(self.seam_id, []).append(spec)
+        return spec
+
+    def add_obstacle_type1(self, link: str, *,
+                           hand: str = None, index: int = None, entry_index: int = -1,
+                           otype: str = None, size_scale: float = None,
+                           thickness: float = None,
+                           seed: int = 0, **overrides) -> Optional[ObstacleSpec]:
+        """障碍物类型1：在【本焊缝已算轨迹】的指定 link 扫掠空间中放 1 个障碍。
+
+        约束：障碍必须与该 link 的扫掠球并集【有交集】、且整只落在 init_free 空间【之外】
+        （init_free 是「假设无障碍」的起步引导区，按 cfg.init_free_method_for_init 取 box/圆柱）。
+
+        坐标系：扫掠球（FK）与 init_free 都在 base_link 系，故放置在 base 系里完成；随后用
+        inv(T_workpiece_in_base) 把障碍原语转回【工件 mesh 系】存储（与类型2/3 同框），下游
+        _obstacle_solid_trimeshes + workpiece_pose7 变回 base 系时恰好落回放置点。
+
+        参数：
+          link        : 用哪个 link 的扫掠空间（须在 yml collision_spheres 里有定义）。
+          hand/index  : 轨迹二级 key (手别,候选下标)；缺省用当前 init pose 的 key（_trajectory_key）。
+          entry_index : 该 key 下 entry 列表里第几段（默认 -1 取最新/合并后的一条），取其 positions。
+          otype       : 障碍具体类型（obstacles.list_obstacles() 之一）；缺省从 cfg.obstacle_placement
+                        的 obstacle_types 取（空则从全集随机抽，用 seed+seam_id 的 rng 复现）。
+          size_scale/thickness : 缺省随机采样。size_scale 从该类型
+                        obstacle_params[otype].size_scale_range 采（按类型独立控制）；
+                        thickness 从 thickness_range_m 采。障碍朝向 = +X 对齐扫掠
+                        切向后，再叠加【三轴随机旋转】（每轴 ±angle_jitter_deg，seed 复现）。
+          seed        : 随机种子（与 seam_id 一起决定 rng，可复现）。
+        产出 ObstacleSpec(otype=1) 追加进 self.obstacles[seam_id] 并返回；放不下则打印告警返回 None。
+        """
+        import random
+        from gt_gen import obstacle_placement as opl
+        from gt_gen import obstacles as _obmod
+
+        if self.cur_init_pose is None:
+            raise RuntimeError("add_obstacle_type1 需要当前 init pose：请先 set_init_pose(hand, index)")
+
+        # —— 定位轨迹 key + 取已算轨迹 positions ——
+        if hand is None or index is None:
+            key = self._trajectory_key()
+        else:
+            key = (str(hand), int(index))
+        entries = self.trajectories.get(self.seam_id, {}).get(key)
+        if not entries:
+            raise KeyError(f"焊缝 {self.seam_id} 的 init pose{key} 下无已算轨迹（先 plan_explore_path）")
+        entry = entries[entry_index]
+        traj = np.asarray(entry["positions"], float)
+        if traj.ndim != 2 or traj.shape[0] < 3:
+            raise ValueError(f"轨迹 positions 形状异常 {traj.shape}，需 (T,DOF) 且 T>=3")
+
+        # —— 该 link 沿轨迹的扫掠球（base 系）——
+        per_wp, origin = opl.compute_link_sweep(self.cfg, traj, [link])
+        if link not in per_wp:
+            raise ValueError(f"link {link!r} 无 collision_spheres 定义（可选："
+                             f"{list(self.cfg.collision_link_names)}）")
+
+        # —— goal 位置（base 系焊缝中心）：供 goal_clearance_m 用，障碍别贴焊缝 ——
+        goal_pos = np.asarray(self.cur_init_pose.seam_center_base, float)
+
+        # —— 调试可视化用：焊缝折线（工件系→base 系）+ 工件 mesh（file_path + base 系 pose7）——
+        #   place_in_corridor 内的 _debug_show_sweep（默认关）会用它们把工件/焊缝画进窗口。
+        from types import SimpleNamespace
+        T = np.asarray(self.cur_init_pose.T_workpiece_in_base, float)   # p_base = T·p_world
+        _, _, _, _, _, _, seam_line = self._seam_frame()               # (N,3) 工件 mesh 系
+        seam_base = (np.asarray(seam_line, float) @ T[:3, :3].T) + T[:3, 3]   # → base 系
+        wp_mesh_dbg = SimpleNamespace(
+            file_path=self.workpiece_obj,
+            pose=list(np.asarray(self.cur_init_pose.workpiece_pose7, float)))
+
+        # —— 采样参数（seed+seam_id 决定 rng，可复现；关键字显式传入优先）——
+        op = self.cfg.obstacle_placement
+        rng = random.Random(int(seed) * 100003 + self.seam_id * 101)
+        all_types = list(op.get("obstacle_types") or []) or _obmod.list_obstacles()
+        otype_eff = str(otype) if otype is not None else all_types[rng.randrange(len(all_types))]
+        ob_params = op.get("obstacle_params", {}) or {}   # 各类型形状参数（含各自 size_scale_range）
+        th_lo, th_hi = op["thickness_range_m"]
+        ang = float(op["angle_jitter_deg"])
+        N = int(op.get("max_attempts", 20))
+
+        # —— 解析解放置（base 系）：失败则在 N 次内换类型/尺寸重试 ——
+        placed, otype_used = None, otype_eff
+        size_before = None
+        for _ in range(max(1, N)):
+            # 尺寸缩放区间【按类型】：从 obstacle_params[otype].size_scale_range 取，未列回退内置默认
+            r_t = (ob_params.get(otype_used, {}) or {}).get("size_scale_range", [0.6, 3.6])
+            s_lo_t, s_hi_t = float(r_t[0]), float(r_t[1])
+
+            #每次循环如果失败，就缩小size
+            if size_before is not None:
+                s_hi_t = min(size_before, s_hi_t)
+
+            ss = float(size_scale) if size_scale is not None else rng.uniform(s_lo_t, s_hi_t)
+            size_before = ss
+            th = float(thickness) if thickness is not None else rng.uniform(float(th_lo), float(th_hi))
+            # 三轴随机旋转（每轴 ±angle_jitter_deg）：叠加在 +X 对齐切向的基础朝向上
+            rot = (rng.uniform(-ang, ang), rng.uniform(-ang, ang), rng.uniform(-ang, ang))
+            placed = opl.place_in_corridor(
+                per_wp, origin, link, otype_used, size_scale=ss, rot_jitter_deg=rot,
+                pos_frac=0.0, jitter_vec=np.zeros(3), thickness=th,
+                cfg=self.cfg, goal_pos=goal_pos,
+                workpiece_mesh=wp_mesh_dbg, seam_line=seam_base)
+            if placed is not None:
+                break
+            # 显式指定了类型且指定了尺寸 → 不再乱换，直接判失败
+            if otype is not None and size_scale is not None:
+                break
+            if otype is None:
+                otype_used = all_types[rng.randrange(len(all_types))]
+        if placed is None:
+            print(f"[scene] add_obstacle_type1 失败：link {link!r} 扫掠空间几乎全在 init_free 内，"
+                  f"放不下障碍（试了 {N} 次）→ 返回 None，请换 link 或轨迹")
+            return None
+        prims_base, anchor_base, meta = placed
+
+        # —— base 系 → 工件 mesh 系（inv(T)）后存储（与类型2/3 同框）——
+        T_inv = np.linalg.inv(T)
+        prims_wp = [_transform_prim(p, T_inv) for p in prims_base]
+
+        meta = dict(meta or {})
+        meta.update(traj_key=key, entry_index=int(entry_index),
+                    anchor_base=list(map(float, anchor_base)))
+        spec = ObstacleSpec(otype=1, kind=otype_used, prims=prims_wp,
+                            seam_line=seam_line, color=list(_GRAY), meta=meta)
+        self.obstacles.setdefault(self.seam_id, []).append(spec)
+        print(f"[scene] add_obstacle_type1：焊缝 {self.seam_id} link {link} 扫掠空间放置 "
+              f"{otype_used}（{len(prims_wp)} 原语），已挂 self.obstacles")
         return spec

@@ -227,6 +227,61 @@ def _signed_dist_cyl(pts, cfg) -> np.ndarray:
                              np.where(out_z, dz, np.maximum(dr, dz))))
 
 
+def _signed_dist_box(pts, cfg) -> np.ndarray:
+    """一批点 pts(...,3) 到 init_free 轴对齐立方体(AABB)的【带符号距离】（外正、内负），闭式向量化。
+
+    盒 [lo, hi]（base 系，来自 cfg.init_free_box_min_for_init / init_free_box_max_for_init）。逐轴令
+    d_lo=lo−p（低于下界时>0）、d_hi=p−hi（高于上界时>0）、over=max(d_lo,d_hi,0)（各轴外溢量）：
+      · 盒外（任一轴 over>0）→ sd = ‖over‖（点到 AABB 的精确最短距离）；
+      · 盒内（所有 over=0）→ sd = max_i max(d_lo_i, d_hi_i)（负，到最近面的距离）。
+    sd>0 即点在盒外，且其值 = 点到盒实体的最短距离（解析、无迭代；与 _signed_dist_cyl 对称）。
+    """
+    lo = np.asarray(cfg.init_free_box_min_for_init, float)
+    hi = np.asarray(cfg.init_free_box_max_for_init, float)
+    p = np.asarray(pts, float)
+    d_lo = lo - p                                        # (...,3) >0 在下界外
+    d_hi = p - hi                                        # (...,3) >0 在上界外
+    over = np.maximum(np.maximum(d_lo, d_hi), 0.0)       # (...,3) 各轴外溢
+    outside = np.any(over > 0.0, axis=-1)
+    sd_out = np.linalg.norm(over, axis=-1)               # 盒外精确距离
+    sd_in = np.max(np.maximum(d_lo, d_hi), axis=-1)      # 盒内（各轴均≤0）取最近面（负）
+    return np.where(outside, sd_out, sd_in)
+
+
+def _clears_init_free_box(prims, cfg) -> bool:
+    """整只障碍是否完全落在初始引导 FREE 立方体(AABB)之外（与 init 空间无交集）。
+
+    逐 prim 用保守包围球 (c, rb)：球心 c 到盒的带符号距离 sd（_signed_dist_box）≥ rb 才算「整球在盒外」。
+    任一 prim 的 sd<rb（含 c 在盒内 sd<0）即包围球够到盒 → 返回 False。包围球是保守外估 → 判「无交」
+    偏严（多排除一点），绝不漏判（返回 True 时整只障碍一定真在盒外；与 _clears_init_free 对称）。
+    """
+    for p in prims:
+        c, rb = _prim_bounding_sphere(p)
+        sd = float(_signed_dist_box(np.asarray(c, float).reshape(1, 3), cfg)[0])
+        if sd < rb:                                      # 包围球够到盒（或球心在盒内）→ 可能相交
+            return False
+    return True
+
+
+def _signed_dist_init_free(pts, cfg) -> np.ndarray:
+    """点到 init_free 空间的带符号距离，按 cfg.init_free_method_for_init 分派 box / 圆柱（单一来源）。
+
+    method 未配置（旧 demo）时退回圆柱，保持向后兼容。
+    """
+    method = getattr(cfg, "init_free_method_for_init", "cylinder")
+    if method == "box":
+        return _signed_dist_box(pts, cfg)
+    return _signed_dist_cyl(pts, cfg)
+
+
+def _clears_init_free_any(prims, cfg) -> bool:
+    """整只障碍是否在 init_free 空间外，按 cfg.init_free_method_for_init 分派 box / 圆柱（单一来源）。"""
+    method = getattr(cfg, "init_free_method_for_init", "cylinder")
+    if method == "box":
+        return _clears_init_free_box(prims, cfg)
+    return _clears_init_free(prims, cfg)
+
+
 # ------------------------------------------------------------------ 障碍尺寸（按走廊管半径）
 def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
                ) -> Tuple[dict, Tuple[float, float, float]]:
@@ -239,8 +294,8 @@ def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
               直径 × 尺寸缩放」——让障碍大致横穿整条走廊、挡住路径。下面记 clip 后的值为 s。
     tube_r  : 局部走廊「管半径」（米）——该路点处各碰撞球外缘到 anchor 的最大距离，描述走廊有多粗。
               主要用于定「细长杆/管/梁」类构件的截面半径或边长。下面记 clip 后的值为 rt。
-    cfg     : 配置对象；从 cfg.obstacle_placement 读 span/tube_r 的夹紧区间（span_clip_m /
-              tube_r_clip_m），不在代码里写死。
+    cfg     : 配置对象；从 cfg.obstacle_placement.obstacle_params[otype] 读该类型的 span/tube_r 夹紧
+              区间（span_clip_m / tube_r_clip_m，按类型单独控制），不在代码里写死。
     th      : 板/壁厚（米）。由调用方（place_in_corridor，值在 search_placement 按
               thickness_range_m 随机采样）传入，使每次放置的薄板/盒壁厚度有多样性。
 
@@ -262,7 +317,7 @@ def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
       （下界）尺寸趋 0 → 障碍小到挡不住路径（永远 too_weak）、或薄到生成的 mesh 退化、碰撞球穿过去；
       （上界）尺寸过大 → 障碍塞满整个场景，挡死所有绕行（永远 no_solution）、还可能与工件/基座/地面
               相交，且大 mesh 拖慢碰撞检查。
-    所以（区间从 cfg.obstacle_placement 读，便于逐机器/逐场景调，不写死在代码）：
+    所以（区间从 cfg.obstacle_placement.obstacle_params[otype] 读，按类型单独调，不写死在代码）：
       s  = clip(span,   span_clip_m[0],   span_clip_m[1])   —— 障碍主跨度：下界保证大到能横挡走廊，
                                                               上界防吞掉整个工作空间而无解。
       rt = clip(tube_r, tube_r_clip_m[0], tube_r_clip_m[1]) —— 杆/管/梁截面半径：下界防细到数值上可
@@ -271,8 +326,15 @@ def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
     既有多样性又被限定在合理薄板范围。
     """
     op = cfg.obstacle_placement
-    s_lo, s_hi = op["span_clip_m"]
-    rt_lo, rt_hi = op["tube_r_clip_m"]
+    # 该类型的形状参数（离散选项/结构数/缩放系数(_mult)/下限(_min)/夹紧区间）：从
+    # cfg.obstacle_placement.obstacle_params[otype] 读覆盖值，未列的键回退下方内置默认（单一来源在
+    # default.yaml，代码只留兜底默认）。
+    pp = dict((op.get("obstacle_params", {}) or {}).get(otype, {}) or {})
+    g = lambda k, d: pp.get(k, d)
+    # span/tube_r 夹紧区间【按类型】：span_clip_m 所有类型都用；tube_r_clip_m 仅杆/管/梁类用——
+    # 不用 rt 的类型（plate/l_bracket/u_channel…）yaml 里不写它，此处回退默认即可（rt 对其为死值，无影响）。
+    s_lo, s_hi = g("span_clip_m", [0.15, 1.2])
+    rt_lo, rt_hi = g("tube_r_clip_m", [0.04, 0.20])
     s = float(np.clip(span, float(s_lo), float(s_hi)))
     rt = float(np.clip(tube_r, float(rt_lo), float(rt_hi)))
     th = float(th)
@@ -280,42 +342,47 @@ def _shape_for(otype: str, span: float, tube_r: float, *, cfg, th: float
     table = {
         # plate: length=高(Z向), width=宽(Y向), thickness=板厚, tilt_deg=绕Y倾角
         #   → 一块 s×s 的薄板，法向(+X)对齐切向，正面横挡走廊。
-        "plate":          (dict(length=s, width=s, thickness=th, tilt_deg=0.0), O),
+        "plate":          (dict(length=s, width=s, thickness=th, tilt_deg=g("tilt_deg", 0.0)), O),
         # l_bracket: length=两板边长, width=板宽, thickness=板厚；
         #   offset=(-s/2,0,-s/2) 把 └ 的角从结构角挪到走廊中心（默认锚在 L 的拐角）。
         "l_bracket":      (dict(length=s, width=s, thickness=th), (-s / 2, 0.0, -s / 2)),
-        # u_channel: length=槽长(X), width=槽宽(Y,两侧板间距), height=侧板高(Z), thickness=壁厚；
+        # u_channel: length=槽长(X), width=槽宽(Y,两侧板间距), height=侧板高(Z,=s×height_mult), thickness=壁厚；
         #   offset=(0,0,-s·0.35) 把开口槽底压到走廊（默认锚在底板）。
-        "u_channel":      (dict(length=s, width=s, height=s * 0.7, thickness=th), (0.0, 0.0, -s * 0.35)),
-        # open_box: size=(sx,sy,sz) 盒外形, wall=壁厚, open_face="front"=缺 +X 面（开口迎着切向）。
-        "open_box":       (dict(size=(s, s, s), wall=th, open_face="front"), O),
-        # pipe: length=管长(取 s·1.5 让管足够长跨过走廊), radius=管半径(=rt), axis="y"=管轴沿 Y
-        #   （切向对齐后即垂直于路径，横拦走廊）。
-        "pipe":           (dict(length=s * 1.5, radius=rt, axis="y"), O),
-        # parallel_pipes: n=管数(3), length=管长(s·1.5), radius=rt, gap=管间距(s·0.5), axis="y"管轴,
-        #   stack="z" 沿 Z 排开 → 一排平行管像护栏。
-        "parallel_pipes": (dict(n=3, length=s * 1.5, radius=rt, gap=s * 0.5, axis="y", stack="z"), O),
-        # crossed_pipes: length=管长(s·1.5), radius=rt, cross_deg=90 → 两管在 Y-Z 面内成 X 形交叉。
-        "crossed_pipes":  (dict(length=s * 1.5, radius=rt, cross_deg=90.0), O),
-        # box_beam: length=梁长(s·1.5), side=方截面边长(≥0.06, 取 rt·1.4), axis="y" 梁沿 Y 横拦。
-        "box_beam":       (dict(length=s * 1.5, side=max(0.06, rt * 1.4), axis="y"), O),
-        # rect_frame: width=框宽(Y), height=框高(Z), beam=边框方梁截面(≥0.06,取 rt) → 中间留孔的矩形框。
-        "rect_frame":     (dict(width=s, height=s, beam=max(0.06, rt)), O),
-        # gantry: span=两立柱间距, height=立柱高, post=立柱截面(≥0.06,取 rt), beam=横梁截面(≥0.08,取 rt)；
+        "u_channel":      (dict(length=s, width=s, height=s * g("height_mult", 0.7), thickness=th), (0.0, 0.0, -s * 0.35)),
+        # open_box: size=(sx,sy,sz) 盒外形, wall=壁厚, open_face=缺哪面（默认 "front"=缺 +X，开口迎切向）。
+        "open_box":       (dict(size=(s, s, s), wall=th, open_face=g("open_face", "front")), O),
+        # pipe: length=管长(=s×length_mult，够长跨过走廊), radius=管半径(=rt), axis=管轴(默认 "y" 横拦走廊)。
+        "pipe":           (dict(length=s * g("length_mult", 1.5), radius=rt, axis=g("axis", "y")), O),
+        # parallel_pipes: n=管数, length=管长(s×length_mult), radius=rt, gap=管间距(s×gap_mult), axis=管轴,
+        #   stack=排开方向 → 一排平行管像护栏。
+        "parallel_pipes": (dict(n=g("n", 3), length=s * g("length_mult", 1.5), radius=rt,
+                                gap=s * g("gap_mult", 0.5), axis=g("axis", "y"), stack=g("stack", "z")), O),
+        # crossed_pipes: length=管长(s×length_mult), radius=rt, cross_deg=两管夹角 → Y-Z 面内成 X 形交叉。
+        "crossed_pipes":  (dict(length=s * g("length_mult", 1.5), radius=rt, cross_deg=g("cross_deg", 90.0)), O),
+        # box_beam: length=梁长(s×length_mult), side=方截面边长(=max(side_min, rt×side_mult)), axis=梁轴。
+        "box_beam":       (dict(length=s * g("length_mult", 1.5),
+                                side=max(g("side_min", 0.06), rt * g("side_mult", 1.4)), axis=g("axis", "y")), O),
+        # rect_frame: width=框宽(Y), height=框高(Z), beam=边框方梁截面(=max(beam_min, rt)) → 中间留孔的矩形框。
+        "rect_frame":     (dict(width=s, height=s, beam=max(g("beam_min", 0.06), rt)), O),
+        # gantry: span=两立柱间距, height=立柱高, post=立柱截面(=max(post_min,rt)), beam=横梁截面(=max(beam_min,rt))；
         #   offset=(0,0,-s/2) 把门架从「立柱底=锚」下移，使横梁/门洞罩住走廊（默认锚在地面平面）。
-        "gantry":         (dict(span=s, height=s, post=max(0.06, rt), beam=max(0.08, rt)), (0.0, 0.0, -s / 2)),
-        # braced_frame: width,height,beam 同 rect_frame, brace=对角斜撑截面(≥0.05,取 rt·0.8)
+        "gantry":         (dict(span=s, height=s, post=max(g("post_min", 0.06), rt),
+                                beam=max(g("beam_min", 0.08), rt)), (0.0, 0.0, -s / 2)),
+        # braced_frame: width,height,beam 同 rect_frame, brace=对角斜撑截面(=max(brace_min, rt×brace_mult))
         #   → 框+一根斜梁破坏直穿。
-        "braced_frame":   (dict(width=s, height=s, beam=max(0.06, rt), brace=max(0.05, rt * 0.8)), O),
-        # tripod: height=三角高, base_half=底边半宽, rod=杆半径(≥0.05,取 rt) → 三根杆组成的竖立三角框。
-        "tripod":         (dict(height=s, base_half=s * 0.5, rod=max(0.05, rt)), O),
-        # steps: n=台阶数(3), rise=单级升高(s·0.33), run=单级进深(s·0.4), width=台阶宽(Y)；
+        "braced_frame":   (dict(width=s, height=s, beam=max(g("beam_min", 0.06), rt),
+                                brace=max(g("brace_min", 0.05), rt * g("brace_mult", 0.8))), O),
+        # tripod: height=三角高, base_half=底边半宽(=s×base_half_mult), rod=杆半径(=max(rod_min,rt)) → 竖立三角框。
+        "tripod":         (dict(height=s, base_half=s * g("base_half_mult", 0.5), rod=max(g("rod_min", 0.05), rt)), O),
+        # steps: n=台阶数, rise=单级升高(s×rise_mult), run=单级进深(s×run_mult), width=台阶宽(Y)；
         #   offset=(-s·0.6,0,-s/2) 把楼梯主体从「第一级底角=锚」挪到走廊中心。
-        "steps":          (dict(n=3, rise=s * 0.33, run=s * 0.4, width=s), (-s * 0.6, 0.0, -s / 2)),
+        "steps":          (dict(n=g("n", 3), rise=s * g("rise_mult", 0.33), run=s * g("run_mult", 0.4), width=s),
+                           (-s * 0.6, 0.0, -s / 2)),
         # box_with_pipe: size,wall,open_face 同 open_box, pipe_radius=开口前横管半径(=rt) → 开口盒+挡管组合。
-        "box_with_pipe":  (dict(size=(s, s, s), wall=th, open_face="front", pipe_radius=rt), O),
+        "box_with_pipe":  (dict(size=(s, s, s), wall=th, open_face=g("open_face", "front"), pipe_radius=rt), O),
         # frame_with_brace: 同 braced_frame（width,height,beam,brace）——语义别名入口。
-        "frame_with_brace": (dict(width=s, height=s, beam=max(0.06, rt), brace=max(0.05, rt * 0.8)), O),
+        "frame_with_brace": (dict(width=s, height=s, beam=max(g("beam_min", 0.06), rt),
+                                  brace=max(g("brace_min", 0.05), rt * g("brace_mult", 0.8))), O),
     }
     # 其它/未知类型 → 回退成一块 plate(length=s, width=s, thickness=th)。
     return table.get(otype, (dict(length=s, width=s, thickness=th), O))
@@ -332,22 +399,360 @@ def _bounding_radius_about(prims, ctr) -> float:
     return rb
 
 
-def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos_frac,
+# ------------------------------------------------------------------ coal / hppfcl 精确分离
+_FCL_MOD = "unset"   # 惰性导入缓存："unset" 未试 / None 无库 / 模块对象
+
+
+def _fcl():
+    """导入公开碰撞库：coal(新名) 优先、hppfcl(旧名 hpp-fcl)回退；都没有返回 None（退回包围球路径）。
+
+    本番 env_isaaclab 装的是 hppfcl 2.4.4，故实际走 hppfcl 分支。结果缓存，避免每次放置重复 import。
+    """
+    global _FCL_MOD
+    if _FCL_MOD != "unset":
+        return _FCL_MOD
+    mod = None
+    for name in ("coal", "hppfcl"):
+        try:
+            mod = __import__(name)
+            break
+        except Exception:
+            mod = None
+    _FCL_MOD = mod
+    return mod
+
+
+def _fcl_T(pose7, fcl):
+    """[x,y,z,qw,qx,qy,qz](base 系) → fcl.Transform3f（旋转矩阵 + 平移）。"""
+    c = np.asarray(pose7[:3], float)
+    qw, qx, qy, qz = (float(v) for v in pose7[3:7])
+    Rm = R.from_quat([qx, qy, qz, qw]).as_matrix()       # wxyz → 矩阵
+    T = fcl.Transform3f()
+    T.setRotation(Rm)
+    T.setTranslation(c)
+    return T
+
+
+def _fcl_geom_for_prim(prim, fcl):
+    """障碍 prim → (fcl 几何, Transform3f)。Box→Box(全边长 dims)；Tube→Cylinder(radius, height，轴沿局部 +Z)。"""
+    if isinstance(prim, ob.Box):
+        g = fcl.Box(np.asarray(prim.dims, float))
+    else:                                                # Tube：轴沿局部 +Z，与 ob.build 的 Tube 约定一致
+        g = fcl.Cylinder(float(prim.radius), float(prim.height))
+    return g, _fcl_T(prim.pose, fcl)
+
+
+def _fcl_geom_init_free(cfg, fcl):
+    """init_free 空间 → (fcl 几何, Transform3f)，按 cfg.init_free_method_for_init 分派 box / 圆柱。"""
+    method = getattr(cfg, "init_free_method_for_init", "cylinder")
+    if method == "box":
+        lo = np.asarray(cfg.init_free_box_min_for_init, float)
+        hi = np.asarray(cfg.init_free_box_max_for_init, float)
+        g = fcl.Box(hi - lo)                             # 全边长
+        T = fcl.Transform3f()
+        T.setTranslation(0.5 * (lo + hi))               # AABB 中心
+        return g, T
+    R_cyl = float(cfg.init_free_cyl_radius)
+    H = float(cfg.init_free_cyl_height)
+    g = fcl.Cylinder(R_cyl, H)                           # 轴沿 +Z、全高 H
+    T = fcl.Transform3f()
+    T.setTranslation(np.array([0.0, 0.0, H / 2.0]))     # 圆柱 z∈[0,H] → 中点 H/2
+    return g, T
+
+
+def _penetration(prims, init_free_geom, fcl) -> Tuple[float, Optional[np.ndarray]]:
+    """障碍各 prim 与 init_free 的【最深贯入】(depth≥0, 单位外推法线 n̂)；全分离时 (0, None)。
+
+    对每个 prim 调 fcl.distance(init_free, prim, signed)：d<0 即贯入，|d|=贯入深度，res.normal 为
+    「从 init_free 指向 prim」的分离方向（即把 prim 推出 init_free 的方向）。取贯入最深者的 (depth, n̂)。
+    init_free_geom = _fcl_geom_init_free(cfg, fcl) 预先构好（每次 push 迭代复用，省重复构造）。
+    """
+    fg, fT = init_free_geom
+    req = fcl.DistanceRequest()
+    req.enable_signed_distance = True
+    best_depth = 0.0
+    best_n = None
+    for p in prims:
+        pg, pT = _fcl_geom_for_prim(p, fcl)
+        res = fcl.DistanceResult()
+        d = float(fcl.distance(fg, fT, pg, pT, req, res))
+        if d < -best_depth:                              # 更深的贯入（d 越负越深）
+            best_depth = -d
+            n = np.asarray(res.normal, float)
+            nn = float(np.linalg.norm(n))
+            best_n = (n / nn) if nn > 1e-9 else None
+    return best_depth, best_n
+
+
+def _clears_init_free_exact(prims, cfg, fcl, tol: float = 1e-4) -> bool:
+    """fcl 精确判据：所有 prim 与 init_free 的签名距离 ≥ −tol（实体不贯入）→ 整只在 init_free 外。"""
+    depth, _ = _penetration(prims, _fcl_geom_init_free(cfg, fcl), fcl)
+    return depth <= tol
+
+
+def _push_out_of_init_free(c_start, Rm, otype, shape, local_off, rpy, cfg, fcl,
+                           *, eps: float = 2e-3, tol: float = 1e-4, max_iter: int = 12):
+    """从 c_start 沿「最深贯入法线」迭代平移障碍，直到整只脱离 init_free（fcl 精确）。
+
+    姿态 Rm 固定（含水平偏航），仅平移 body 中心 c。每轮：造原语 → 算最深贯入 (depth,n̂) →
+    若 depth≤tol 则已清空、返回；否则 c += (depth+eps)·n̂（真实厚度外推，非包围球 R_b）。
+    返回 (v, prims, anchor)：v=累计外推向量(c_end−c_start)；max_iter 内未清空 → None。
+    """
+    init_free_geom = _fcl_geom_init_free(cfg, fcl)
+    c = np.asarray(c_start, float).copy()
+    off = np.asarray(local_off, float)
+    for _ in range(max_iter):
+        anchor = c + Rm.apply(off)                       # body 中心在 c
+        prims = ob.build(otype, anchor.tolist(), anchor_rpy_deg=rpy, **shape)
+        depth, n = _penetration(prims, init_free_geom, fcl)
+        if depth <= tol or n is None:                    # fcl 精确判定：已脱离 init_free
+            return (c - np.asarray(c_start, float)), prims, anchor
+        c = c + (depth + eps) * n                        # 沿法线最小外推
+    return None                                          # 未能在 max_iter 内推出（该姿态放不下）
+
+
+def _yaw_solve(c_k, Rm0, otype, shape, local_off, rpy0, cfg, fcl, sph, goal, gc,
+               *, yaw_max_deg: float = 90.0):
+    """绕竖直轴的水平偏航一维求解：在 [−yaw_max,+yaw_max] 找「外推量 ‖v‖ 最小、且外推后仍咬住扫掠管」的 ψ*。
+
+    对每个 ψ：Rm(ψ)=Rz(ψ)·Rm0（绕世界竖直轴，过 c_k），push 出 init_free 得 v(ψ)、prims(ψ)；
+    保交判据 _overlaps_sweep + goal 间距。粗扫(step≈15°)择优后在邻域细扫(step≈3°)精化。
+    返回 (psi*, v*, prims*, anchor*, rpy*) 或 None（任何 ψ 都无法「出 init_free 且保交」）。
+    """
+    z = np.array([0.0, 0.0, 1.0])
+
+    def _eval(psi):
+        Rm = R.from_rotvec(z * math.radians(psi)) * Rm0  # 绕世界竖直轴左乘
+        rpy = [float(v) for v in Rm.as_euler("xyz", degrees=True)]
+        out = _push_out_of_init_free(c_k, Rm, otype, shape, local_off, rpy, cfg, fcl)
+        if out is None:
+            return None
+        v, prims, anchor = out
+        if not _overlaps_sweep(prims, sph):              # 外推后脱离了扫掠管 → 不可行
+            return None
+        if float(np.linalg.norm(anchor - goal)) < gc:    # 贴焊缝 → 不可行
+            return None
+        return dict(psi=float(psi), v=v, norm=float(np.linalg.norm(v)),
+                    prims=prims, anchor=anchor, rpy=rpy)
+
+    best = None
+    coarse = np.arange(-yaw_max_deg, yaw_max_deg + 1e-6, 15.0)
+    for psi in coarse:
+        r = _eval(float(psi))
+        if r is not None and (best is None or r["norm"] < best["norm"]):
+            best = r
+    if best is None:
+        return None
+    # 邻域细扫（±15°、step 3°）精化最优 ψ
+    for psi in np.arange(best["psi"] - 15.0, best["psi"] + 15.0 + 1e-6, 3.0):
+        if abs(psi) > yaw_max_deg + 1e-6:
+            continue
+        r = _eval(float(psi))
+        if r is not None and r["norm"] < best["norm"]:
+            best = r
+    return best["psi"], best["v"], best["prims"], best["anchor"], best["rpy"]
+
+
+def _place_shrink_fallback(c_k, sd_k, t_k, tube_r0, rpy, tangent, otype, *,
+                           size_scale, rot_jitter_deg, thickness, cfg, sph, goal, gc, link):
+    """无 coal/hppfcl 库时的保守回退：以 c_k 为心的包围球 R_b 收缩尺寸（旧算法，偏严）。
+
+    保留原「同一 c_k、仅缩 span/tube_r/壁厚、最多 3 轮」逻辑，仅供缺库环境兜底（本番 env 有 hppfcl，不走此路）。
+    """
+    Rm = R.from_euler("xyz", rpy, degrees=True)
+    margin = 1.0 - 1e-2
+    scale = 1.0
+    prims = None
+    anchor_eff = c_k
+    shape = {}
+    for _ in range(3):
+        span = 2.0 * tube_r0 * float(size_scale) * scale
+        shape, local_off = _shape_for(otype, span, tube_r0 * scale, cfg=cfg, th=float(thickness) * scale)
+        anchor_eff = c_k + Rm.apply(np.asarray(local_off, float))
+        prims = ob.build(otype, anchor_eff.tolist(), anchor_rpy_deg=tuple(rpy), **shape)
+        R_b = _bounding_radius_about(prims, c_k)
+        if R_b <= sd_k * margin:
+            break
+        scale *= (sd_k * margin) / max(R_b, 1e-6)
+    if prims is None or not _clears_init_free_any(prims, cfg) or not _overlaps_sweep(prims, sph):
+        return None
+    if float(np.linalg.norm(anchor_eff - goal)) < gc:
+        return None
+    meta = dict(link=link, otype=otype, anchor=anchor_eff.tolist(), tangent=tangent.tolist(),
+                tube_r=float(tube_r0 * scale), span=float(2.0 * tube_r0 * size_scale * scale),
+                t=int(t_k), size_scale=float(size_scale), shrink_scale=float(scale),
+                sd_k=float(sd_k), rot_jitter_deg=[float(a) for a in rot_jitter_deg],
+                thickness=float(thickness) * float(scale), shape=shape, init_free_push=0.0)
+    return prims, anchor_eff, meta
+
+
+def _debug_show_sweep(per_wp, link, prims=None, *, cfg=None, anchor=None,
+                      goal_pos=None, workpiece_mesh=None, seam_line=None,
+                      sphere_stride: int = 1, title: str = "sweep-debug") -> None:
+    """【手动调用】Open3D 可视化单 link 扫掠空间：工件 + 焊缝 + 机械臂碰撞球 + 障碍物 + init_free。
+
+    - 工件 workpiece_mesh（浅灰实体）：需带 .file_path 与 .pose（[x,y,z,qw,qx,qy,qz]，base 系）；
+      按该 pose 变到 base 系画（与放置系一致）；None 则不画。
+    - 焊缝 seam_line（红色折线 + 端点红球）：(N,3)【base 系】。注意 Scene._seam_frame 给的是【工件 mesh 系】，
+      需先乘 T_workpiece_in_base 变到 base 再传入。None 则不画。
+    - 机械臂碰撞球 / 扫掠空间：per_wp[link] 的 (T,S,4)=[x,y,z,r]（base 系），逐球按真实半径画线框，
+      颜色沿轨迹时间蓝(起)→红(末)渐变，其并集即「扫掠走廊」。球太多时把 sphere_stride 调大抽稀路点。
+    - 障碍物 prims（Box/Tube，base 系）：橙色实体；prims=None（如放置前调用）则不画。
+    - init_free（青色线框）：按 cfg.init_free_method_for_init 画 box 或圆柱——障碍应完全在其外。
+    - anchor 绿球（障碍几何中心 c_k）、goal_pos 黄球（焊缝中心，goal_clearance 参照）。
+    窗口阻塞，关闭后继续；缺 open3d 或无显示时打印告警跳过，不影响主流程。
+    """
+    try:
+        import open3d as o3d
+    except Exception as e:                                   # 缺库 → 跳过
+        print(f"[debug-o3d] open3d 不可用，跳过可视化：{e}")
+        return
+
+    geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)]
+
+    # —— 工件 mesh（浅灰实体）：按 base 系 pose 变换 ——
+    has_wp = False
+    if workpiece_mesh is not None:
+        try:
+            wp = o3d.io.read_triangle_mesh(workpiece_mesh.file_path)
+            if not wp.is_empty():
+                wp.transform(_pose_to_T(workpiece_mesh.pose))
+                wp.compute_vertex_normals()
+                wp.paint_uniform_color([0.7, 0.7, 0.7])
+                geoms.append(wp)
+                has_wp = True
+        except Exception as e:
+            print(f"[debug-o3d] 工件 mesh 加载失败：{e}")
+
+    # —— 焊缝折线（红色 LineSet + 端点红球，base 系）——
+    has_seam = False
+    if seam_line is not None:
+        try:
+            sl = np.asarray(seam_line, float).reshape(-1, 3)
+            if len(sl) >= 2:
+                lines = [[i, i + 1] for i in range(len(sl) - 1)]
+                seg = o3d.geometry.LineSet(
+                    o3d.utility.Vector3dVector(sl),
+                    o3d.utility.Vector2iVector(np.asarray(lines, int)))
+                seg.paint_uniform_color([0.9, 0.05, 0.05])
+                geoms.append(seg)
+                for ep in (sl[0], sl[-1]):                   # 两端点红球，线太细时也能看清位置
+                    es = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
+                    es.translate(ep)
+                    es.compute_vertex_normals()
+                    es.paint_uniform_color([0.9, 0.05, 0.05])
+                    geoms.append(es)
+                has_seam = True
+        except Exception as e:
+            print(f"[debug-o3d] 焊缝折线可视化失败：{e}")
+
+    # —— 机械臂碰撞球 / 扫掠空间：逐球线框（真实半径），颜色沿时间蓝→红 ——
+    sph = None if per_wp is None else per_wp.get(link)
+    n_ball = 0
+    if sph is not None and len(sph):
+        arr = np.asarray(sph, float)                        # (T,S,4)
+        Tn = arr.shape[0]
+        step = max(1, int(sphere_stride))
+        for ti in range(0, Tn, step):
+            frac = ti / max(Tn - 1, 1)
+            col = [frac, 0.15, 1.0 - frac]                  # 蓝(起)→红(末)
+            for c in arr[ti]:
+                cx, cy, cz, r = (float(v) for v in c)
+                if r <= 1e-4:
+                    continue
+                ball = o3d.geometry.TriangleMesh.create_sphere(radius=r, resolution=6)
+                ball.translate((cx, cy, cz))
+                ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+                ls.paint_uniform_color(col)
+                geoms.append(ls)
+                n_ball += 1
+
+    # —— 障碍物原语（橙色实体）：Box→create_box（角在原点需居中）；Tube→create_cylinder（已居中、轴 Z）——
+    n_prim = 0
+    for p in (prims or []):
+        if isinstance(p, ob.Box):
+            dx, dy, dz = (float(v) for v in p.dims)
+            g = o3d.geometry.TriangleMesh.create_box(dx, dy, dz)
+            g.translate((-dx / 2, -dy / 2, -dz / 2))
+        else:                                               # Tube
+            g = o3d.geometry.TriangleMesh.create_cylinder(float(p.radius), float(p.height))
+        g.transform(_pose_to_T(p.pose))
+        g.compute_vertex_normals()
+        g.paint_uniform_color([0.95, 0.55, 0.15])
+        geoms.append(g)
+        n_prim += 1
+
+    # —— init_free 引导空间：按 method 画 box 或圆柱（亮青线框 + 角点小球，在成片扫掠球线框中也醒目）——
+    #   legacy draw_geometries 不支持半透明实体，故用「线框 + 角点」表达这块「空间」；障碍应完全在其外。
+    has_free = False
+    if cfg is not None:
+        try:
+            method = getattr(cfg, "init_free_method_for_init", "cylinder")
+            corners = None
+            if method == "box":
+                lo = np.asarray(cfg.init_free_box_min_for_init, float)
+                hi = np.asarray(cfg.init_free_box_max_for_init, float)
+                d = hi - lo
+                box = o3d.geometry.TriangleMesh.create_box(float(d[0]), float(d[1]), float(d[2]))
+                box.translate(lo)                            # create_box 角在原点 → 平移到 lo
+                ls = o3d.geometry.LineSet.create_from_triangle_mesh(box)
+                corners = np.array([[lo[0] if a else hi[0], lo[1] if b else hi[1], lo[2] if c else hi[2]]
+                                    for a in (1, 0) for b in (1, 0) for c in (1, 0)], float)
+            else:
+                cyl_r = float(cfg.init_free_cyl_radius)
+                cyl_h = float(cfg.init_free_cyl_height)
+                cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=cyl_r, height=cyl_h,
+                                                                resolution=32)
+                cyl.translate((0.0, 0.0, cyl_h / 2.0))       # 居中于原点 → 抬到 z∈[0,h]
+                ls = o3d.geometry.LineSet.create_from_triangle_mesh(cyl)
+            ls.paint_uniform_color([0.0, 0.95, 0.95])        # 亮青
+            geoms.append(ls)
+            for cp in (corners if corners is not None else []):   # box 8 角点小球，锚定这块空间
+                m = o3d.geometry.TriangleMesh.create_sphere(radius=0.03)
+                m.translate(cp)
+                m.compute_vertex_normals()
+                m.paint_uniform_color([0.0, 0.95, 0.95])
+                geoms.append(m)
+            has_free = True
+        except Exception as e:
+            print(f"[debug-o3d] init_free 可视化失败：{e}")
+
+    # —— anchor（绿球）+ goal（黄球）——
+    if anchor is not None:
+        a = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        a.translate(np.asarray(anchor, float))
+        a.compute_vertex_normals()
+        a.paint_uniform_color([0.1, 0.8, 0.2])
+        geoms.append(a)
+    if goal_pos is not None:
+        gsp = o3d.geometry.TriangleMesh.create_sphere(radius=0.04)
+        gsp.translate(np.asarray(goal_pos, float))
+        gsp.compute_vertex_normals()
+        gsp.paint_uniform_color([0.95, 0.9, 0.1])
+        geoms.append(gsp)
+
+    print(f"[debug-o3d]「{title}」link={link}：工件 {'有' if has_wp else '无'}、焊缝 {'有' if has_seam else '无'}、"
+          f"init_free {'有' if has_free else '无'}、碰撞球 {n_ball} 个、障碍原语 {n_prim} 个（关闭窗口继续）")
+    o3d.visualization.draw_geometries(geoms, window_name=title)
+
+
+def place_in_corridor(per_wp, origin, link, otype, *, size_scale, rot_jitter_deg, pos_frac,
                       jitter_vec, thickness, cfg, goal_pos,
-                      workpiece_mesh=None, retract=None, debug_show: bool = False):
-    """【解析解】直接算出与 init 圆柱无交、与扫掠并集有交的障碍 pose（无任何「放→测→换」试探）。
+                      workpiece_mesh=None, retract=None, seam_line=None, debug_show: bool = False):
+    """【解析解】把 1 个【原尺寸】障碍摆到「与 init_free 无交、与该 link 扫掠并集有交」的位姿。
 
-    算法（见对话确认）：
-      1. 时间窗 [i0,i1] 内，对该 link 所有扫掠球心闭式算到 init 圆柱的带符号距离 sd（_signed_dist_cyl），
-         剔除离 goal < goal_clearance 的；取 sd 最大的球心 c_k —— 离 init「最深的外部扫掠点」，给障碍
-         最大尺寸余量。c_k 即障碍几何中心 → 障碍实体含 (c_k,r_k) 的球心 → 与扫掠并集必相交（构造性保证）。
-      2. 朝向：对齐 c_k 处局部切向（origin 前后差分）+ angle_deg 自转。尺寸 desired=2·tube_r·size_scale。
-      3. 自动缩到放下：若障碍以 c_k 为心的外接半径 R_b > sd(c_k)，按比例缩 span/tube_r/壁厚（同一 c_k，
-         仅缩尺寸、不动位置，最多 3 轮收敛；_shape_for 的 clip 下界撑住时无法再缩）→ 保证整只在圆柱外。
-      4. 兜底断言 _clears_init_free + _overlaps_sweep；通过则返回 (prims, anchor_eff, meta)，否则 None
-         （仅当尺寸 clip 下界 > sd(c_k)，即该 link/类型在最深点都塞不进 init 外余量——上层换 link/类型）。
+    自由度 = xyz 平移 + 绕竖直轴的水平偏航 ψ（竖直姿态不变）。用 coal/hppfcl 精确贯入深度 + 接触法线
+    做最小外推，取代旧「以 c_k 为心的包围球 R_b」过度外推→收缩尺寸的做法（障碍保持参数原尺寸）。
+    详见 docs/障碍物类型1-place_in_corridor重构-coal求解.md。
 
-    注：位置由几何唯一确定（argmax sd），故 pos_frac / jitter_vec 不参与定位（保留入参仅为签名兼容）。
+    阶段：
+      1. 选锚：时间窗内取「球面探出 init_free（sd(c_i)+r_i≥0）且离 goal 够远」的扫掠球，argmax sd → c_k；
+      2. 朝向：+X 对齐 c_k 处切向后，叠加三轴随机旋转 rot_jitter_deg=(rx,ry,rz)（body 系，Rm0）；
+      3. 造原尺寸障碍（不缩）：span=2·tube_r0·size_scale，_shape_for 内部按 clip 区间夹紧；
+      4. coal 水平偏航求解：在 ±yaw_max 内找「外推 ‖v‖ 最小、且外推后仍咬住扫掠管」的 ψ*；
+      5. 兜底断言 + 返回；无 coal/hppfcl 库时退回旧包围球收缩路径（_place_shrink_fallback）。
+
+    位置由几何确定（argmax sd + 外推），pos_frac / jitter_vec 不参与定位（保留入参仅为签名兼容）。
     """
     op = cfg.obstacle_placement
     if link not in per_wp:
@@ -363,60 +768,75 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, angle_deg, pos
     if i1 < i0:
         i0, i1 = i1, i0
 
-    # —— 1. 闭式 argmax sd：窗口内离 init 圆柱最深、且离 goal 够远的扫掠球心 c_k ——
+    # —— 【手动可视化】放置前肉眼核对该 link 的机械臂碰撞球 / 扫掠走廊 / init_free（默认注释关）——
+    # _debug_show_sweep(per_wp, link, prims=None, cfg=cfg, goal_pos=goal_pos,
+    #                   workpiece_mesh=workpiece_mesh, seam_line=seam_line,
+    #                   title=f"{link} sweep (放置前)")
+
+    # —— 1. 选锚：窗口内「球面探出 init_free（sd+r≥0）且离 goal 够远」的扫掠球，argmax sd → c_k ——
     win = sph[i0:i1 + 1]                                 # (Tw,S,4)
     centers = win[..., :3]                               # (Tw,S,3)
-    sd = _signed_dist_cyl(centers, cfg)                  # (Tw,S)
+    radii = win[..., 3]                                  # (Tw,S)
+    sd = _signed_dist_init_free(centers, cfg)            # (Tw,S) 按 method 分派 box/圆柱
     goal = np.asarray(goal_pos, float)
     gc = float(op["goal_clearance_m"])
     far = np.linalg.norm(centers - goal, axis=-1) >= gc  # 离焊缝够远
-    sd_m = np.where(far, sd, -np.inf)
-    if not np.isfinite(sd_m).any() or float(np.max(sd_m)) <= 0.0:
-        return None                                      # 窗口内无「圆柱外且离 goal 够远」的扫掠点
-    tw, s_idx = np.unravel_index(int(np.argmax(sd_m)), sd_m.shape)
+    in_B = (sd + radii) >= 0.0                           # 球面探出 init_free（含半径，即属于 B）
+    cand = in_B & far
+    if not cand.any():
+        return None                                      # 该段扫掠几乎全埋在 init_free 内 → 上层换 link/窗口
+    sd_masked = np.where(cand, sd, -np.inf)
+    tw, s_idx = np.unravel_index(int(np.argmax(sd_masked)), sd_masked.shape)
     t_k = i0 + int(tw)
-    c_k = centers[tw, s_idx].astype(float).copy()
+    c_k = centers[tw, s_idx].astype(float).copy()        # 锚：B 候选中离 init_free 最深（外推最小）
     sd_k = float(sd[tw, s_idx])
 
-    # —— 2. 局部走廊管半径（t_k 簇，相对 c_k）+ 切向 → 朝向 ——
+    # —— 2. 局部走廊管半径（t_k 簇，相对 c_k）+ 切向 → 初始朝向 Rm0 ——
     ck_centers = sph[t_k, :, :3]
     ck_radii = sph[t_k, :, 3]
     tube_r0 = float(np.max(np.linalg.norm(ck_centers - c_k, axis=1) + ck_radii))
     tangent = org[min(t_k + 1, T - 1)] - org[max(t_k - 1, 0)]
     if np.linalg.norm(tangent) < 1e-6:
         tangent = np.array([1.0, 0.0, 0.0])
-    rpy = _rpy_align_x_to(tangent, roll_deg=angle_deg)
-    Rm = R.from_euler("xyz", rpy, degrees=True)
+    # +X 对齐切向为基础朝向，再叠加三轴随机旋转（body 系 Rz·Ry·Rx），仅为姿态多样性
+    rpy_align = _rpy_align_x_to(tangent, roll_deg=0.0)   # +X 横挡走廊（不含滚转）
+    Rm0 = R.from_euler("xyz", rpy_align, degrees=True) * R.from_euler("xyz", rot_jitter_deg, degrees=True)
+    rpy0 = [float(v) for v in Rm0.as_euler("xyz", degrees=True)]
 
-    # —— 3. 闭式造障碍 + 自动缩到放下（同一 c_k，仅缩尺寸）——
-    margin = 1.0 - 1e-2                                  # 留 1% 余量，避免贴壁数值误差
-    scale = 1.0
-    prims = None
-    anchor_eff = c_k
-    shape = {}
-    for _ in range(3):
-        span = 2.0 * tube_r0 * float(size_scale) * scale
-        shape, local_off = _shape_for(otype, span, tube_r0 * scale, cfg=cfg, th=float(thickness) * scale)
-        anchor_eff = c_k + Rm.apply(np.asarray(local_off, float))   # body 中心落在 c_k
-        prims = ob.build(otype, anchor_eff.tolist(), anchor_rpy_deg=tuple(rpy), **shape)
-        R_b = _bounding_radius_about(prims, c_k)
-        if R_b <= sd_k * margin:
-            break
-        scale *= (sd_k * margin) / max(R_b, 1e-6)        # 闭式缩放因子（线性几何一轮到位，floor 时多收敛一两轮）
+    # —— 3. 造【原尺寸】障碍形状（不再收缩；_shape_for 内部对 span/tube_r 做 clip）——
+    span = 2.0 * tube_r0 * float(size_scale)
+    shape, local_off = _shape_for(otype, span, tube_r0, cfg=cfg, th=float(thickness))
 
-    # —— 4. 兜底断言（构造性保证下应恒成立；clip 下界撑住放不下时 → None 由上层换 link/类型）——
-    if prims is None or not _clears_init_free(prims, cfg) or not _overlaps_sweep(prims, sph):
+    # —— 4/5. coal 精确外推 + 水平偏航求解；无库退回旧包围球收缩路径 ——
+    fcl = _fcl()
+    if fcl is None:
+        return _place_shrink_fallback(c_k, sd_k, t_k, tube_r0, rpy0, tangent, otype,
+                                      size_scale=size_scale, rot_jitter_deg=rot_jitter_deg,
+                                      thickness=thickness, cfg=cfg, sph=sph, goal=goal, gc=gc, link=link)
+
+    yaw_max = float(op.get("yaw_search_max_deg", 90.0))
+    solved = _yaw_solve(c_k, Rm0, otype, shape, local_off, rpy0, cfg, fcl, sph, goal, gc,
+                        yaw_max_deg=yaw_max)
+    if solved is None:
+        return None                                      # 任何 ψ 都无法「原尺寸出 init_free 且仍咬住扫掠管」
+    psi, v, prims, anchor_eff, rpy = solved
+
+    # —— 兜底断言（fcl 精确 clear + 保交 + goal 间距；构造性应恒成立）——
+    if not _clears_init_free_exact(prims, cfg, fcl) or not _overlaps_sweep(prims, sph):
         return None
-    if float(np.linalg.norm(anchor_eff - goal)) < gc:    # body 偏置后再核一次 goal 间距
+    if float(np.linalg.norm(anchor_eff - goal)) < gc:
         return None
 
     meta = dict(link=link, otype=otype, anchor=anchor_eff.tolist(), tangent=tangent.tolist(),
-                tube_r=float(tube_r0 * scale), span=float(2.0 * tube_r0 * size_scale * scale), t=int(t_k),
-                size_scale=float(size_scale), shrink_scale=float(scale), sd_k=float(sd_k),
-                angle_deg=float(angle_deg), thickness=float(thickness) * float(scale),
-                shape=shape, init_free_push=0.0)
-    # _debug_show_scene(workpiece_mesh, prims, per_wp, link, anchor_eff,
-    #                     cfg=cfg, retract=retract, title=f"{link}/{otype} t={t_k}(解析解)")
+                tube_r=float(tube_r0), span=float(span), t=int(t_k),
+                size_scale=float(size_scale), sd_k=float(sd_k),
+                rot_jitter_deg=[float(a) for a in rot_jitter_deg],
+                thickness=float(thickness), shape=shape, yaw_deg=float(psi),
+                push_vec=[float(x) for x in v], push_norm=float(np.linalg.norm(v)))
+    # —— 【手动可视化】放置后连障碍一起看（默认注释关）——
+    _debug_show_sweep(per_wp, link, prims, cfg=cfg, anchor=anchor_eff, goal_pos=goal_pos,
+                      workpiece_mesh=workpiece_mesh, seam_line=seam_line,
+                      title=f"{link}/{otype} t={t_k}(放置后)")
     return prims, anchor_eff, meta
 
 
@@ -711,7 +1131,8 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
     """对 (link, otype) 反复试放，失败按原因自适应改尺寸/角度/位置，至多 N 次。返回 result dict。"""
     op = cfg.obstacle_placement
     N = int(op["max_attempts"] if n_attempts is None else n_attempts)
-    s_lo, s_hi = op["size_scale_range"]
+    # size_scale_range 已改为按类型放 obstacle_params[otype]（无全局键）；此旧 demo 路径按 otype 取，缺省回退默认。
+    s_lo, s_hi = ((op.get("obstacle_params", {}) or {}).get(otype, {}) or {}).get("size_scale_range", [0.6, 1.6])
     ang = float(op["angle_jitter_deg"])
     pj = float(op["pos_jitter_m"])
     th_lo, th_hi = op["thickness_range_m"]
@@ -720,13 +1141,13 @@ def search_placement(handle, workpiece_mesh, per_wp, origin, link, otype,
     size_scale = rng.uniform(s_lo, s_hi)
     last = None
     for attempt in range(N):
-        angle_deg = rng.uniform(-ang, ang)
+        rot_jitter = (rng.uniform(-ang, ang), rng.uniform(-ang, ang), rng.uniform(-ang, ang))
         pos_frac = rng.uniform(0.0, 1.0)
         jitter_vec = np.array([rng.uniform(-pj, pj) for _ in range(3)])
         thickness = rng.uniform(float(th_lo), float(th_hi))
 
         placed = place_in_corridor(per_wp, origin, link, otype, size_scale=size_scale,
-                                   angle_deg=angle_deg, pos_frac=pos_frac,
+                                   rot_jitter_deg=rot_jitter, pos_frac=pos_frac,
                                    jitter_vec=jitter_vec, thickness=thickness,
                                    cfg=cfg, goal_pos=goal_pose[0],
                                    workpiece_mesh=workpiece_mesh, retract=retract,

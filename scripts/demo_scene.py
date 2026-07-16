@@ -102,14 +102,13 @@ def obstacle_type2_demo_main(args):
     # seg = replay("plan_joint_case.pkl")
 
 
-
-    # scene = _make_scene(args)
-    # scene._set_cur_seam(106)#
-    # # if random.random() < 0.7:  # 70% 概率添加遮挡板
-    # #     scene.add_obstacle_type2()
-    # scene.add_obstacle_type2()
-    # scene.plan_init_pose(include_obstacles=False, diagnostic=True)
-    # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    scene = _make_scene(args)
+    scene._set_cur_seam(106)#
+    # if random.random() < 0.7:  # 70% 概率添加遮挡板
+    #     scene.add_obstacle_type2()
+    scene.add_obstacle_type2()
+    scene.plan_init_pose(include_obstacles=False, diagnostic=True)
+    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
 
     # # scene.plan_init_pose()
     # # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
@@ -150,6 +149,58 @@ def obstacle_type2_demo_main(args):
     # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
 
 
+def obstacle_type1_demo_main(args):
+    '''
+        先规划出一条轨迹
+        在扫掠空间中添加障碍物type1
+        重新规划1条轨迹
+    '''
+    import random
+    from gt_gen.scene import Scene
+    from gt_gen.scene_viz import Open3DSceneVisualizer
+
+    # # from gt_gen.repro_plan_joint import replay
+    # # seg = replay("plan_joint_case.pkl")
+
+    scene = _make_scene(args)
+    scene._set_cur_seam(39)#
+    scene.plan_init_pose()
+    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+
+
+    # scene.seam_ids_by_length()  89,39,58,92
+    fflag = scene.compute_pose_and_plan_path(hand="forehand")
+    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    bflag = scene.add_obstacle_type1(link='Link3', 
+                             hand='forehand', 
+                             index=0, 
+                             entry_index=0,
+                             otype='l_bracket')
+    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    fflag = scene.compute_pose_and_plan_path(hand="forehand")
+    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+
+    print(1)
+
+
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    # Open3DSceneVisualizer(scene).show_init_poses()
+    # Open3DSceneVisualizer(scene).show_joint_table_ee()
+
+    # # Open3DSceneVisualizer(scene).show_init_poses_debug(4, sort_by_seam_x=True)
+    # # Open3DSceneVisualizer(scene).show_goal_pose_collision("backhand", 0)
+    # # Open3DSceneVisualizer(scene).show_goal_pose(hand="backhand", variant=0, goal_index=1)
+    # Open3DSceneVisualizer(scene).show_init_pose_prefilter(stage=2)#stage=1/2/3
+
+
+    # Open3DSceneVisualizer(scene).show_seam(106)
+    # # Open3DSceneVisualizer(scene).show_seam_all_isaacsim()
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
+
 def main():
     ap = argparse.ArgumentParser(description="Scene API demo：初始位姿求解 / 障碍物类型2 / 障碍物类型3 + isaacsim 可视化")
     ap.add_argument("--obj", default=DEFAULT_OBJ, help="工件 mesh（_part.obj / _watertight.obj）")
@@ -171,7 +222,8 @@ def main():
     # demo_init_pose(args)
     # demo_init_poses(args)   # 多候选初始位姿同屏铺网格（先另进程 plan_init_pose + save）
 
-    obstacle_type2_demo_main(args)
+    obstacle_type1_demo_main(args)
+    # obstacle_type2_demo_main(args)
 
 if __name__ == "__main__":
     main()

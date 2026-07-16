@@ -627,7 +627,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
         （板 mesh + open_cylinder mesh 走前者，open_box 的 Box 原语走后者），再转 o3d、染 ObstacleSpec.color。"""
         import numpy as np
         import open3d as o3d
-        from gt_gen.scene import _polygon_mesh_to_trimesh, _box_prim_to_trimesh
+        from gt_gen.scene import (_polygon_mesh_to_trimesh, _box_prim_to_trimesh,
+                                   _tube_prim_to_trimesh)
 
         obstacles = list(self.scene.obstacles.get(self.scene.seam_id, []))
 
@@ -644,7 +645,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
                     if tm is not None:
                         tms.append(tm)
                 for prim in ob.prims:
-                    tms.append(_box_prim_to_trimesh(prim))
+                    tms.append(_tube_prim_to_trimesh(prim) if hasattr(prim, "radius")
+                               else _box_prim_to_trimesh(prim))
                 for tm in tms:
                     m = o3d.geometry.TriangleMesh(
                         o3d.utility.Vector3dVector(np.asarray(tm.vertices, float)),
@@ -1015,7 +1017,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
         import numpy as np
         import open3d as o3d
         import trimesh
-        from gt_gen.scene import _polygon_mesh_to_trimesh, _box_prim_to_trimesh
+        from gt_gen.scene import (_polygon_mesh_to_trimesh, _box_prim_to_trimesh,
+                                   _tube_prim_to_trimesh)
 
         scene = self.scene
         seams = scene.seams
@@ -1069,7 +1072,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 if t is not None:
                     tms.append(t)
             for prim in ob.prims:
-                tms.append(_box_prim_to_trimesh(prim))
+                tms.append(_tube_prim_to_trimesh(prim) if hasattr(prim, "radius")
+                           else _box_prim_to_trimesh(prim))
             for t in tms:
                 m = o3d.geometry.TriangleMesh(
                     o3d.utility.Vector3dVector(np.asarray(t.vertices, float)),
@@ -1401,13 +1405,24 @@ class Open3DSceneVisualizer(SceneVisualizer):
                               seam_pts[si], seam_pts[si + 1], color, thick)
 
         def spawn_box_prim(path, name, prim, color):
-            """Box 原语（mesh 系 pose）经 T 变到渲染系。"""
+            """障碍原语（mesh 系 pose）经 T 变到渲染系。Box→立方体，Tube→圆柱。"""
             pose7 = _compose_pose7(np.asarray(prim.pose, float))
-            _cuboid.VisualCuboid(prim_path=path, name=name,
-                                 position=pose7[:3],
-                                 orientation=pose7[3:7],           # wxyz
-                                 size=1.0, scale=np.asarray(prim.dims, float),
-                                 color=np.asarray(color, float))
+            if hasattr(prim, "dims"):                             # Box
+                _cuboid.VisualCuboid(prim_path=path, name=name,
+                                     position=pose7[:3],
+                                     orientation=pose7[3:7],       # wxyz
+                                     size=1.0, scale=np.asarray(prim.dims, float),
+                                     color=np.asarray(color, float))
+            else:                                                 # Tube（轴沿局部 +Z）
+                stage = omni.usd.get_context().get_stage()
+                cyl = UsdGeom.Cylinder.Define(stage, path)
+                cyl.CreateAxisAttr("Z")
+                cyl.CreateHeightAttr(float(prim.height))
+                cyl.CreateRadiusAttr(float(prim.radius))
+                cyl.CreateDisplayColorAttr(
+                    [Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
+                XFormPrim(path).set_world_pose(position=pose7[:3].tolist(),
+                                               orientation=pose7[3:7].tolist())
 
         def spawn_mesh(path, mesh):
             """棱柱/圆筒 mesh（mesh 系 points）经 T 变到渲染系。"""
@@ -1913,10 +1928,21 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         def spawn_box_prim(path, name, prim, color, R_T, t_T):
             pose7 = compose_pose7(np.asarray(prim.pose, float), R_T, t_T)
-            _cuboid.VisualCuboid(prim_path=path, name=name,
-                                 position=pose7[:3], orientation=pose7[3:7],
-                                 size=1.0, scale=np.asarray(prim.dims, float),
-                                 color=np.asarray(color, float))
+            if hasattr(prim, "dims"):                             # Box
+                _cuboid.VisualCuboid(prim_path=path, name=name,
+                                     position=pose7[:3], orientation=pose7[3:7],
+                                     size=1.0, scale=np.asarray(prim.dims, float),
+                                     color=np.asarray(color, float))
+            else:                                                 # Tube（轴沿局部 +Z）
+                stage = omni.usd.get_context().get_stage()
+                cyl = UsdGeom.Cylinder.Define(stage, path)
+                cyl.CreateAxisAttr("Z")
+                cyl.CreateHeightAttr(float(prim.height))
+                cyl.CreateRadiusAttr(float(prim.radius))
+                cyl.CreateDisplayColorAttr(
+                    [Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
+                XFormPrim(path).set_world_pose(position=pose7[:3].tolist(),
+                                               orientation=pose7[3:7].tolist())
 
         def spawn_mesh(path, mesh, R_T, t_T):
             stage = omni.usd.get_context().get_stage()

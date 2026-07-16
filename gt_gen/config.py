@@ -507,15 +507,13 @@ class Config:
                       ["Link2", "Link3", "Link4", "Link5", "Link6", "xiaoyu_accessory_link"])
         op.setdefault("pos_t_window", [0.25, 0.85])
         op.setdefault("goal_clearance_m", 0.25)
-        op.setdefault("size_scale_range", [0.6, 1.6])
         op.setdefault("angle_jitter_deg", 30.0)
         op.setdefault("pos_jitter_m", 0.10)
         op.setdefault("detour_min_joint_rad", 0.30)
         op.setdefault("detour_ik_position_threshold", 0.005)
         op.setdefault("detour_ik_rotation_threshold", 0.05)
         op.setdefault("obstacle_types", [])
-        op.setdefault("span_clip_m", [0.15, 1.2])
-        op.setdefault("tube_r_clip_m", [0.04, 0.20])
+        op.setdefault("obstacle_params", {})   # size_scale_range/span_clip_m/tube_r_clip_m 已按类型放这里
         op.setdefault("thickness_range_m", [0.02, 0.05])
         return op
 
