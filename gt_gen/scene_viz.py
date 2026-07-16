@@ -1142,10 +1142,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
             mesh.CreateDisplayColorAttr([Gf.Vec3f(0.72, 0.72, 0.72)])
 
         def spawn_workpiece(pth, obj_path):
-            usd_obj = obj_path.replace("_watertight.obj", ".usd")
-            if not os.path.exists(usd_obj):
-                usd_obj = os.path.splitext(obj_path)[0] + ".usd"
-            if os.path.exists(usd_obj):
+            # 只在真存在 .usd 时才 reference；否则一律 trimesh（详见 show_scene_isaacsim 内同名函数注释）。
+            usd_cands = []
+            if obj_path.endswith("_watertight.obj"):
+                usd_cands.append(obj_path[: -len("_watertight.obj")] + ".usd")
+            usd_cands.append(os.path.splitext(obj_path)[0] + ".usd")
+            usd_obj = next((c for c in usd_cands
+                            if c.endswith(".usd") and os.path.exists(c)), None)
+            if usd_obj is not None:
                 add_reference_to_stage(usd_path=usd_obj, prim_path=pth)
             else:
                 spawn_obj_mesh(pth, obj_path)
@@ -1362,10 +1366,17 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         def spawn_workpiece(pth, obj_path, pose7):
             """工件摆到渲染系 pose7（关物理当纯视觉）。usd 缺失则 trimesh 建 Mesh。"""
-            usd_obj = obj_path.replace("_watertight.obj", ".usd")
-            if not os.path.exists(usd_obj):
-                usd_obj = os.path.splitext(obj_path)[0] + ".usd"
-            if os.path.exists(usd_obj):
+            # 候选 .usd：优先去掉 _watertight 后缀那份（如 _part_watertight.obj → _part.usd），
+            # 再退回同名 .usd。只有【真正存在且后缀为 .usd】才走 add_reference；否则一律 trimesh。
+            # 不能用 replace("_watertight.obj",".usd") 直接当结果——对 _part.obj 这类不含 _watertight
+            # 的名字 replace 是 no-op，会把 .obj 本身当 usd 传给 add_reference（加载不出几何=工件消失）。
+            usd_cands = []
+            if obj_path.endswith("_watertight.obj"):
+                usd_cands.append(obj_path[: -len("_watertight.obj")] + ".usd")
+            usd_cands.append(os.path.splitext(obj_path)[0] + ".usd")
+            usd_obj = next((c for c in usd_cands
+                            if c.endswith(".usd") and os.path.exists(c)), None)
+            if usd_obj is not None:
                 add_reference_to_stage(usd_path=usd_obj, prim_path=pth)
             else:
                 spawn_obj_mesh(pth, obj_path)
@@ -1876,10 +1887,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
             mesh.CreateDisplayColorAttr([Gf.Vec3f(0.72, 0.72, 0.72)])
 
         def spawn_workpiece(pth, obj_path, pose7):
-            usd_obj = obj_path.replace("_watertight.obj", ".usd")
-            if not os.path.exists(usd_obj):
-                usd_obj = os.path.splitext(obj_path)[0] + ".usd"
-            if os.path.exists(usd_obj):
+            # 只在真存在 .usd 时才 reference；否则一律 trimesh（详见 show_scene_isaacsim 内同名函数注释）。
+            usd_cands = []
+            if obj_path.endswith("_watertight.obj"):
+                usd_cands.append(obj_path[: -len("_watertight.obj")] + ".usd")
+            usd_cands.append(os.path.splitext(obj_path)[0] + ".usd")
+            usd_obj = next((c for c in usd_cands
+                            if c.endswith(".usd") and os.path.exists(c)), None)
+            if usd_obj is not None:
                 add_reference_to_stage(usd_path=usd_obj, prim_path=pth)
             else:
                 spawn_obj_mesh(pth, obj_path)
