@@ -101,9 +101,21 @@ class FreeSpaceStomp:
                  control_cost_weight=0.1, exponentiated_cost_sensitivity=2.0,
                  noise_scale=1.0, filter_scale=2.0,
                  initialization_method=TrajectoryInitializations.LINEAR_INTERPOLATION,
-                 post_filter=True, pre_filter=False):
+                 post_filter=True, pre_filter=False,
+                 early_stop=True, early_stop_patience=5, early_stop_min_iters=20,
+                 early_stop_rel_tol=1e-3, early_stop_min_delta=1e-4,
+                 early_stop_state_tol=1e-3):
         self.device = device
         self.num_batch = num_batch
+        # 早停：已出现「无碰撞」候选(state_cost≈0，与 API 的 n_collision_steps==0 同判据)
+        # 且其总代价进入平台期(连续 patience 轮改进 < 阈值) → 提前收敛退出，省下剩余迭代。
+        self.early_stop = early_stop
+        self.early_stop_patience = early_stop_patience
+        self.early_stop_min_iters = early_stop_min_iters
+        self.early_stop_rel_tol = early_stop_rel_tol
+        self.early_stop_min_delta = early_stop_min_delta
+        self.early_stop_state_tol = early_stop_state_tol
+        self.iterations_run = num_iterations
         self.num_dimensions = 6
         # 单段规划：init 段 = next 段 = 整条轨迹
         self.num_timesteps_init = num_timesteps
@@ -182,11 +194,32 @@ class FreeSpaceStomp:
     def solve(self, fixed_pts: torch.Tensor):
         self.resetVariables(fixed_pts)
         self.InitializeTrajectory(fixed_pts)
-        for _ in range(self.num_iterations):
+        self.iterations_run = self.num_iterations
+        prev_best = None            # 无碰撞候选中的最优总代价（用于判平台期）
+        stall = 0                   # 连续「改进不足」的轮数
+        for it in range(self.num_iterations):
             self.generateNoisyRollouts()
             self.computeNoisyRolloutsCosts()
             self.computeProbabilities()
             self.updateParameters()
+            if not self.early_stop or (it + 1) < self.early_stop_min_iters:
+                continue
+            # 至少一条 batch 已无碰撞（state_cost≈0）才允许考虑退出，护住成功率
+            free_mask = self.parameters_state_cost <= self.early_stop_state_tol
+            if not bool(free_mask.any()):
+                stall = 0
+                prev_best = None
+                continue
+            best_free = float(self.parameters_total_cost[free_mask].min().item())
+            if prev_best is not None and (prev_best - best_free) <= (
+                    self.early_stop_min_delta + self.early_stop_rel_tol * abs(prev_best)):
+                stall += 1
+            else:
+                stall = 0
+            prev_best = best_free
+            if stall >= self.early_stop_patience:
+                self.iterations_run = it + 1
+                break
         return self.parameters_optimized, self.parameters_total_cost.clone()
 
     def InitializeTrajectory(self, fixed_pts: torch.Tensor):

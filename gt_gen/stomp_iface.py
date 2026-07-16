@@ -47,6 +47,12 @@ def _plan_kwargs(cfg, buffer, checker_type):
         num_iterations=int(sp["num_iterations"]), num_batch=int(sp["num_batch"]),
         num_timesteps=int(sp["num_timesteps"]), delta_t=float(sp["delta_t"]),
         collision_weight=float(sp["collision_weight"]),
+        early_stop=bool(sp["early_stop"]),
+        early_stop_patience=int(sp["early_stop_patience"]),
+        early_stop_min_iters=int(sp["early_stop_min_iters"]),
+        early_stop_rel_tol=float(sp["early_stop_rel_tol"]),
+        early_stop_min_delta=float(sp["early_stop_min_delta"]),
+        early_stop_state_tol=float(sp["early_stop_state_tol"]),
     )
 
 

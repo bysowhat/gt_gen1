@@ -520,6 +520,13 @@ class Config:
         sp.setdefault("buffer_m", 0.001)
         sp.setdefault("voxel_world", "mesh")     # 兜底=mesh(保持原行为)；yaml 可设 cuboid
         sp.setdefault("local_box_m", 2.0)        # cuboid 模式：base 原点为心、半边长(米)的转换盒
+        # 早停（Layer3 提速）：有无碰撞候选且总代价平台期就提前退出，省剩余迭代
+        sp.setdefault("early_stop", True)
+        sp.setdefault("early_stop_patience", 5)
+        sp.setdefault("early_stop_min_iters", 20)
+        sp.setdefault("early_stop_rel_tol", 1e-3)
+        sp.setdefault("early_stop_min_delta", 1e-4)
+        sp.setdefault("early_stop_state_tol", 1e-3)
         return sp
 
     @property

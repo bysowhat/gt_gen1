@@ -144,7 +144,9 @@ class StompPlanner:
     # --------------------------- 函数1：到关节角 --------------------------- #
     def plan_joint(self, cur_cfg, target_cfg, *, num_timesteps=51, num_iterations=80,
                    num_batch=4, delta_t=0.1, collision_weight=80.0, noise_scale=1.5,
-                   filter_scale=2.0):
+                   filter_scale=2.0, early_stop=True, early_stop_patience=5,
+                   early_stop_min_iters=20, early_stop_rel_tol=1e-3,
+                   early_stop_min_delta=1e-4, early_stop_state_tol=1e-3):
         """规划 cur_cfg -> target_cfg 的避障关节轨迹（**所有 batch 候选都返回**）。
 
         返回 (trajs, infos)：
@@ -170,7 +172,10 @@ class StompPlanner:
             oracle=self.oracle, collision_cost_weight=collision_weight,
             lower_limit=self.lower, upper_limit=self.upper, device=self.device,
             num_batch=num_batch, num_timesteps=num_timesteps, delta_t=delta_t,
-            num_iterations=num_iterations, noise_scale=noise_scale, filter_scale=filter_scale)
+            num_iterations=num_iterations, noise_scale=noise_scale, filter_scale=filter_scale,
+            early_stop=early_stop, early_stop_patience=early_stop_patience,
+            early_stop_min_iters=early_stop_min_iters, early_stop_rel_tol=early_stop_rel_tol,
+            early_stop_min_delta=early_stop_min_delta, early_stop_state_tol=early_stop_state_tol)
 
         cur = torch.tensor(cur_cfg, device=self.device)
         target = torch.tensor(target_cfg, device=self.device)
@@ -178,6 +183,8 @@ class StompPlanner:
         fixed_pts = torch.stack([cur, target], dim=0).unsqueeze(0).repeat(num_batch, 1, 1)
 
         traj_all, total_cost = stomp.solve(fixed_pts)            # (B,D,T), (B,)
+        if early_stop and stomp.iterations_run < num_iterations:
+            print(f"[早停] STOMP 实跑 {stomp.iterations_run}/{num_iterations} 轮收敛退出")
         state_cost = stomp.parameters_state_cost                 # (B,)
         B = traj_all.shape[0]
         lower = np.array(self.lower)
