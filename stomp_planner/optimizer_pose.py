@@ -11,6 +11,7 @@ import torch
 import numpy as np
 
 import random
+import time
 
 from config_pose import ConfigurationPose as Configuration
 import opt_utils_pose as opt_utils
@@ -242,10 +243,17 @@ class OptimizerPose:
         """
         Args:
         """
+        def _sync():
+            if str(self.device).startswith("cuda"):
+                torch.cuda.synchronize()
+
+        self._n_cost_calls = 0                       # computeCosts 调用次数（每次=1 次 UR12e_t 重建 + IK/碰撞）
+        _t_all = time.perf_counter()
         # 定义变量值
         self.defineVariables()
         # 初始化相机位姿
         self.initializePose()
+        _sync(); _t_init = time.perf_counter()
         # print("init:", self.pos_optimized_cost + self.rot_optimized_cost)
         i = 1
         # iteration block
@@ -259,14 +267,44 @@ class OptimizerPose:
             if self.stop:
                 break
             i += 1
+        _sync(); _t_main = time.perf_counter()
+        _main_iters = i
+        _cost_calls_main = self._n_cost_calls
         self.selectOutputs()
         # print(self.cam_pose_select)
         # print(self.joints_select)
         if self.cam_pose_select is None:
+            _sync()
+            print(f"[计时][pose] 无解：init={_t_init - _t_all:.3f}s "
+                  f"主循环={_t_main - _t_init:.3f}s/{_main_iters}轮 "
+                  f"(num_batches={self.num_batches} num_randoms_all={self.num_randoms_all} "
+                  f"eval={_cost_calls_main}次) 总={time.perf_counter() - _t_all:.3f}s")
             return None, None, None, None
         else:
+            _sync(); _t_select = time.perf_counter()
+            A0, B0 = self.cam_pose_select.shape[:2]
+            _cost_calls_refine = self._n_cost_calls
             if self.refine:
                 self.refineOutputs()
+            _sync(); _t_refine = time.perf_counter()
+            print(f"[计时][pose] init={_t_init - _t_all:.3f}s "
+                  f"主循环={_t_main - _t_init:.3f}s/{_main_iters}轮(eval={_cost_calls_main}次) "
+                  f"select={_t_select - _t_main:.3f}s "
+                  f"refine={_t_refine - _t_select:.3f}s/{self.max_iterations_refine}轮"
+                  f"(A0={A0} B={B0} K={self.cam_pose_select.shape[0]} eval={self._n_cost_calls - _cost_calls_refine}次) "
+                  f"总={_t_refine - _t_all:.3f}s")
+            try:
+                import scene_pose2 as _sp
+                if _sp._PROF["n"]:
+                    _p = _sp._PROF
+                    print(f"[计时][pose-getJoints] 累计{_p['n']}次 "
+                          f"build={_p['build']:.3f}s ik={_p['ik']:.3f}s coll={_p['coll']:.3f}s | "
+                          f"每次 build={_p['build']/_p['n']*1000:.1f}ms "
+                          f"ik={_p['ik']/_p['n']*1000:.1f}ms "
+                          f"coll={_p['coll']/_p['n']*1000:.1f}ms")
+                    _p.update(build=0.0, ik=0.0, coll=0.0, n=0)
+            except Exception:
+                pass
             # Convert inverted-seam indices to original-seam indices.
             # initializePose builds 8 seam variants: even indices (0,2,4,6) use the original
             # seam, odd indices (1,3,5,7) use seam_line.flip(0). The start/end_pts stored
@@ -718,6 +756,7 @@ class OptimizerPose:
         Args:
             cam_poses: (B, N, 7)
         """
+        self._n_cost_calls = getattr(self, "_n_cost_calls", 0) + 1   # 计时用：统计 IK/碰撞评估次数
         # compute collision costs
         collision_costs, joints = self.scene.computeCollisionCost(cam_poses, self.joints_optimized)     # (B, R')
         # collision_costs = torch.zeros((cam_poses.shape[:2]), dtype=torch.float, device=self.device)

@@ -30,9 +30,17 @@ for _p in (_THIS, _ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import time
+
 import opt_math_pose as math
 from config_pose import ConfigurationPose as Configuration
 from ik_cam_pose import UR12e_t
+
+# getJoints 细分埋点（默认关；设环境变量 POSE_PROFILE=1 才启用）。
+# 开启后每次 getJoints 段间会 torch.cuda.synchronize() 累加三段耗时 —— 绝对值会因
+# 频繁 sync 偏大，但 build/ik/coll 三段【相对占比】准确，用于定位每次 eval ~130ms 花在哪。
+_PROFILE = bool(os.environ.get("POSE_PROFILE"))
+_PROF = {"build": 0.0, "ik": 0.0, "coll": 0.0, "n": 0}
 
 
 # field 圆锥几何（与 scene_pose.ScenePoseCfg.field 一致）：相机正前方的「视野禁区」锥
@@ -301,7 +309,21 @@ class ScenePose2:
         cam_quat, cam_pos = math.tf_combine(robot_inv_pose[:, 3:], robot_inv_pose[:, :3], poses[:, 3:], poses[:, :3])
 
         # 解析 IK（与 ScenePose 一致）
-        ik_solver = UR12e_t(num_envs=M, device=self.device)
+        # 缓存 UR12e_t 实例：其 IK 路径 solve_fairino_ec 只读 cam_inv/da/dd/all_idx（init 后不改，
+        # 与 FK 写的 dh_params[:,:,0] 无关），故同一 (M, device) 可跨 eval 复用 —— 免去每次
+        # load_config 读两次 yaml + GPU 建 tensor（原占 compute_goal_pose 约 88% 耗时）。数值零影响。
+        if _PROFILE:
+            torch.cuda.synchronize(); _t0 = time.perf_counter()
+        _ik_cache = self.__dict__.setdefault("_ik_solver_cache", {})
+        _key = (int(M), str(self.device))
+        ik_solver = _ik_cache.get(_key)
+        if ik_solver is None:
+            ik_solver = UR12e_t(num_envs=M, device=self.device)
+            _ik_cache[_key] = ik_solver
+            if _PROFILE:
+                print(f"[计时][pose-getJoints] 新建 UR12e_t(M={M})，缓存实例数={len(_ik_cache)}")
+        if _PROFILE:
+            torch.cuda.synchronize(); _t1 = time.perf_counter()
         # ⚠ ik_cam_pose 的解析 IK/FK 其 DH 根是「靠上底座」(base_link 上抬 0.26m + 绕 z 转 90°)，
         #   不是 base_link。上面 cam_quat/cam_pos 在 base_link 系，直接喂 solve_fairino_ec 会因
         #   base_transform(0.26m+90°) 缺失而令关节角整体错转 90°（表现：回放轨迹手臂对不准视锥）。
@@ -331,8 +353,16 @@ class ScenePose2:
         cam_axis = math.matrix_from_quat(cam_quat)[:, :, 2]                       # 相机 +z（视线方向）
         axis = cam_axis.unsqueeze(1).expand(M, K, 3).reshape(M * K, 3)            # (M*K,3)
 
+        if _PROFILE:
+            torch.cuda.synchronize(); _t2 = time.perf_counter()
         collided = self._collided_batch(joints_all_ik, apex, axis)               # (M*K,) int
         cost = cost + collided
+        if _PROFILE:
+            torch.cuda.synchronize(); _t3 = time.perf_counter()
+            _PROF["build"] += _t1 - _t0
+            _PROF["ik"] += _t2 - _t1
+            _PROF["coll"] += _t3 - _t2
+            _PROF["n"] += 1
 
         cost = (cost > 0.1).int().reshape(M, K)
         joints_all_ik = joints_all_ik.reshape(M, K, 6)
