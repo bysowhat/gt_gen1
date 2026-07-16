@@ -408,6 +408,8 @@ class Scene:
         self._k2ctx = None          # kejian2 工件级求解上下文（solver/ESDF/joint表/允许朝向/底座圆/mesh）
         self._k2ctx_key = None      # workpiece_obj：_k2ctx 复用标识
         self._k2ctx_injected = False  # solver 碰撞世界当前是否已并入障碍（避障态标记）
+        self._fastctx = None        # plan_init_pose_fast 工件级几何上下文（放平朝向/底座圆/mesh/点集，无 solver）
+        self._fastctx_key = None    # workpiece_obj：_fastctx 复用标识
         self._dirty: set = set()    # {"worlds","truth_scene","goal"} 缓存失效标记
 
     # ------------------------------------------------------------------
@@ -557,6 +559,78 @@ class Scene:
         history_cands["backhand"].extend(self._sort_by_xyz_diversity(back))
         self.init_pose_candidates[self.seam_id] = history_cands
         
+        self.init_pose_candidates_length[self.seam_id] = {
+            "forehand": len(self.init_pose_candidates[self.seam_id]["forehand"]),
+            "backhand": len(self.init_pose_candidates[self.seam_id]["backhand"]),
+        }
+        return self.init_pose_candidates[self.seam_id]
+
+    def plan_init_pose_fast(self,
+                            rebuild: bool = False,
+                            include_obstacles: bool = True,
+                            verbose: bool = False) -> Dict[str, List[InitPoseCandidate]]:
+        """计算「工件 ↔ 机械臂」的候选初始位姿【快速几何版】（本焊缝 self.seam）。
+
+        与 plan_init_pose 目标一致（求初始位姿、支持障碍、返回同格式），但**不做任何 IK / 可达性 /
+        整臂碰撞**，纯几何摆放，故极快（复用 scripts/plan_init_pose.py 的 _fast_build_ctx / _fast_solve_weld）：
+          ① 放平：lay_flat（与 plan_init_pose 同一份放平逻辑，长轴→+X、贴 z=0、90°整倍旋转）；
+          ② 朝向：保持放平的 8 种 = {绕竖直 Z 0/90/180/270} × {沿长轴翻面 0/180}（工件始终躺平）；
+          ③ 平移：焊缝中点在 (plan_init_pose_fast.ee_xy_range_m 径向环 × ee_z_range_m) 内，按 xy_step_m /
+             z_step_m 网格采样，平移工件使中点恰落每个网格点；
+          ④ 过滤（严格 4 条）：两端点都在范围 → 底座-工件 XY 投影不相交 → 工件+障碍 vs init_free 无交集
+             → 轻去重(同朝向 + 2cm 同位)。**不做**「正面 / 焊缝中心 base-x>0」过滤。
+        配置全部读 default.yaml 的 plan_init_pose_fast 段。
+
+        **避障**：include_obstacles=True（默认）且 self.obstacles 非空时，把已放障碍体素化成点云，
+        仅并入「工件+障碍 vs init_free 无交集」这一条过滤（本版无碰撞世界/ESDF，障碍不参与整臂碰撞）。
+
+        字段说明：R/t/goal_pose7/bisector_base/seam_center_base/orientation_id/hand 均几何算出；
+        rot_x/y/z_deg=0；joint_angles 无 IK 可解 → 填 retract_config 占位（下游仅 scene_viz "reach"
+        可视化模式读它，其余只用 workpiece_pose7/goal_pose7）。
+
+        返回：候选 dict {"forehand":[...], "backhand":[...]}（各组随机排序），
+        并按手别分组写入 self.init_pose_candidates[self.seam_id]（与 plan_init_pose 同结构）。
+        """
+        if not self.workpiece_obj:
+            raise ValueError("plan_init_pose_fast 需要 workpiece_obj（工件 mesh）")
+        pim = _load_plan_init_pose()
+
+        # —— 工件级几何 ctx：按工件复用（放平朝向/底座圆/mesh/点集，无 solver/ESDF/joint 表，构建也很轻） ——
+        if rebuild or self._fastctx is None or self._fastctx_key != self.workpiece_obj:
+            self._fastctx = pim._fast_build_ctx(self.workpiece_obj)
+            self._fastctx_key = self.workpiece_obj
+
+        # —— 障碍点云（mesh 局部系，与工件同框、同 T）：仅供「工件+障碍 vs init_free 无交集」过滤 ——
+        #   每次都重设（含 None），避免上一条焊缝的障碍点残留。
+        obs_pts = None
+        if include_obstacles and self.obstacles.get(self.seam_id):
+            chunks = []
+            for tm in self._obstacle_solid_trimeshes():
+                p = pim._voxelize_mesh_points(np.asarray(tm.vertices, dtype=np.float64),
+                                              np.asarray(tm.faces, dtype=np.int64).reshape(-1, 3),
+                                              self.cfg.plan_init_fast_workpiece_x_voxel)
+                if p is not None and len(p):
+                    chunks.append(np.asarray(p, dtype=np.float64))
+            if chunks:
+                obs_pts = np.concatenate(chunks, axis=0)
+        self._fastctx["fast_obstacle_pts"] = obs_pts
+
+        res, _prof, debug_steps, prefilter_steps = pim._fast_solve_weld(
+            self._fastctx, self.seam, verbose=verbose)
+        self.init_pose_debug_steps[self.seam_id] = debug_steps
+        self.init_pose_prefilter_steps[self.seam_id] = prefilter_steps
+
+        fore = [InitPoseCandidate.from_kejian2(d) for d in res.get("forehand", [])]
+        back = [InitPoseCandidate.from_kejian2(d) for d in res.get("backhand", [])]
+
+        import random
+        history_cands = self.init_pose_candidates.get(self.seam_id, {"forehand": [], "backhand": []})
+        fore_shuffled = random.sample(fore, len(fore))   # 随机排序（替代 xyz 差异排序）
+        back_shuffled = random.sample(back, len(back))
+        history_cands["forehand"].extend(fore_shuffled)
+        history_cands["backhand"].extend(back_shuffled)
+        self.init_pose_candidates[self.seam_id] = history_cands
+
         self.init_pose_candidates_length[self.seam_id] = {
             "forehand": len(self.init_pose_candidates[self.seam_id]["forehand"]),
             "backhand": len(self.init_pose_candidates[self.seam_id]["backhand"]),

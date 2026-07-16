@@ -277,6 +277,46 @@ class Config:
         见 default.yaml plan_init_pose.arm_collision_recheck。"""
         return bool(self.raw.get("plan_init_pose", {}).get("arm_collision_recheck", True))
 
+    # ---- plan_init_pose_fast（快速几何版：lay_flat + 8 种放平朝向 + 平移网格 + 4 条几何过滤，无 IK/可达） ----
+    @property
+    def _fast(self) -> dict:
+        return self.raw.get("plan_init_pose_fast", {})
+
+    @property
+    def plan_init_fast_ee_xy_range(self) -> list:
+        """焊缝点在 base_link 系 xy 平面到原点【径向距离】的 [下限,上限]（米）。见 plan_init_pose_fast.ee_xy_range_m。"""
+        return list(self._fast.get("ee_xy_range_m", [0.4, 1.0]))
+
+    @property
+    def plan_init_fast_ee_z_range(self) -> list:
+        """焊缝点在 base_link 系 z 的 [下限,上限]（米）。见 plan_init_pose_fast.ee_z_range_m。"""
+        return list(self._fast.get("ee_z_range_m", [-0.1, 0.1]))
+
+    @property
+    def plan_init_fast_xy_step(self) -> float:
+        """焊缝中点平移网格 xy 步长（米）。见 plan_init_pose_fast.xy_step_m。"""
+        return float(self._fast.get("xy_step_m", 0.10))
+
+    @property
+    def plan_init_fast_z_step(self) -> float:
+        """焊缝中点平移网格 z 步长（米）。见 plan_init_pose_fast.z_step_m。"""
+        return float(self._fast.get("z_step_m", 0.05))
+
+    @property
+    def plan_init_fast_standoff(self) -> float:
+        """goal 落点沿 bisector（远离工件方向）外移的 standoff 距离（米）。见 plan_init_pose_fast.standoff_cm。"""
+        return float(self._fast.get("standoff_cm", 0.0)) / 100.0
+
+    @property
+    def plan_init_fast_base_overlap_filter(self) -> bool:
+        """是否启用「固定底座 vs 工件 base-xy 投影相交」过滤。见 plan_init_pose_fast.base_overlap_filter。"""
+        return bool(self._fast.get("base_overlap_filter", True))
+
+    @property
+    def plan_init_fast_workpiece_x_voxel(self) -> float:
+        """工件/障碍稠密点集体素粒度（米），供「工件+障碍 vs init_free 无交集」过滤用。见 plan_init_pose_fast.workpiece_x_voxel_m。"""
+        return float(self._fast.get("workpiece_x_voxel_m", 0.03))
+
     # ---- plan_init_pose_kejian（新逻辑：固定朝向 + 平移网格 + STOMP 可达，见 scripts/plan_init_pose_kejian.py） ----
     @property
     def _kejian(self) -> dict:

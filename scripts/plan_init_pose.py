@@ -898,10 +898,9 @@ class InitPoseLookupSolver:
         with torch.no_grad():
             R0 = batch_align_rotation(bisector, axis_q)  # (N,3,3)
 
-        # 结果按【角度组合】分桶累积：N 分块后，每块每角度取 top50 入桶，最后每桶再取 top50 归并。
-        # 与不分块「全 N 每角度 top50」逐位一致：全 N 第 k(≤50)名必在其所在块的块内 top50 里（同块里若有
-        # ≥50 个更优者，那些更优者也被保留），故各角度最终 top50 的集合与顺序都不变；返回的 best 亦不变。
-        per_angle = {}     # (ix,iy,iz) -> list[sol dict]（跨块累积，每块贡献块内 top50）
+        # 结果按【角度组合】分桶累积：N 分块后，每块每角度取 top50-by-align 入桶（块内预筛，省显存/CPU）。
+        # 所有块跑完后不再每桶取 top50，而是【合并全部桶的候选 → 按差异度(FPS)取前 50】(见下方归并处)。
+        per_angle = {}     # (ix,iy,iz) -> list[sol dict]（跨块累积，每块贡献块内 top50-by-align）
         diag_acc = {}      # (ix,iy,iz) -> 聚合 dict（n_safe/n_ep 跨块累加、dl/dr 取全局 min）
         # 预筛可视化抽样（仅 diagnostic）：三阶段（端点 / +朝向粗筛 / 碰撞safe）各跨全部 chunk×角度
         # 均匀随机保留 ≤K 个幸存者位姿，供 show_init_pose_prefilter 画出来。用「随机键 + 全局取最小 K」
@@ -1149,11 +1148,11 @@ class InitPoseLookupSolver:
                         if profile:
                             _pf["评分+取解.cpu"] += _pnow() - _mark; _mark = _pnow()
 
-        # —— 各角度桶再取 top50 归并成全量候选（与不分块「全 N 每角度 top50」逐位一致）——
-        all_solutions = []
-        for bucket in per_angle.values():
-            bucket.sort(key=lambda s: -s["combined_score"])
-            all_solutions.extend(bucket[:50])
+        # —— 全部角度桶合并后按【差异度】(FPS：旋转为主、平移为次) 取前 50 ——
+        #   （原先是每桶各取 top50-by-align 归并；现改为先合并所有桶的候选，再挑最铺得开的 50 个。
+        #    块内仍保留 top50-by-align 预筛，故合并池 = 各 chunk×角度已按对齐初筛的候选。）
+        merged = [s for bucket in per_angle.values() for s in bucket]
+        all_solutions = _select_diverse_poses(merged, k=50)
 
         # 预筛抽样池（diagnostic 时非空；否则空 dict）→ 供 _kejian2_solve_weld 转 raw dict 可视化。
         self.last_prefilter_samples = prefilter_samples or {"ep": [], "prefilter": [], "safe": []}
@@ -1172,7 +1171,7 @@ class InitPoseLookupSolver:
 
         # —— 预筛统计（lookup 内部，前→后；无条件打印，与 _kejian2_solve_weld 的「逐步过滤」计数配套）——
         #   总候选 = N(=n_per_dof^6) × 角度组合(len(rot_x)×len(rot_y)×len(rot_z))；
-        #   逐级：端点∈工作空间 → +朝向粗筛 → 碰撞safe（跨全角度全块累计）→ 各角度桶取 top50 归并=lookup 返回候选。
+        #   逐级：端点∈工作空间 → +朝向粗筛 → 碰撞safe（跨全角度全块累计）→ 合并全部桶后按差异度取前50=lookup 返回候选。
         _nx, _ny, _nz = len(rot_x_deg), len(rot_y_deg), len(rot_z_deg)
         _n_ang = _nx * _ny * _nz
         _total_combos = N * _n_ang
@@ -1185,7 +1184,7 @@ class InitPoseLookupSolver:
         print(f"  端点∈工作空间(xy/z range)              : {_total_combos} → {_sum_ep_only}")
         print(f"  +朝向粗筛(列夹角<3θ+15°)               : {_sum_ep_only} → {_sum_prefilter}")
         print(f"  碰撞safe(link+retract vs 工件ESDF)     : {_sum_prefilter} → {_sum_safe}")
-        print(f"  各角度桶取top50归并 = lookup 返回候选   : {_sum_safe} → {_n_returned}")
+        print(f"  合并全部桶后按差异度取前50 = lookup 返回候选 : {_sum_safe} → {_n_returned}")
 
         if diagnostic:
             # 逐角度明细（用跨块聚合值，N=全 N、safe=总数、min=全局 min，与不分块打印一致）
@@ -1277,7 +1276,7 @@ class InitPoseLookupSolver:
 # ---- 求解结果可视化（复用 init_space_geometries） ----
 def _lookup_solution_geoms(cfg, obj_fp: str, weld: Dict, sol: Dict):
     """构建单个解的可视化几何体列表（不开窗）：init_space_geometries（整臂碰撞球 + init_free
-    盒 + base 架）+ 按 T_workpiece_in_base 摆放的工件网格（浅灰半透）+ 绿色焊缝线 + 焊枪头落点小球。"""
+    盒 + base 架）+ 按 T_workpiece_in_base 摆放的工件网格（浅灰半透）+ 绿色焊缝线 + 红色焊缝圆柱 + 焊枪头落点小球。"""
     import open3d as o3d
 
     geoms, _ = init_space_geometries(cfg, q=sol["q"])
@@ -1299,12 +1298,22 @@ def _lookup_solution_geoms(cfg, obj_fp: str, weld: Dict, sol: Dict):
     # 焊缝线 p0→p1（绿色）+ 焊缝中点（绿球）+ 焊枪头实际落点（红球，= standoff 落枪点，应贴在 ee_pos）
     def _to_base(p):
         return (R @ np.asarray(p, float) + t).tolist()
-    p0b, p1b = _to_base(weld["p0_world"]), _to_base(weld["p1_world"])
+    p0b, p1b = np.asarray(_to_base(weld["p0_world"]), float), np.asarray(_to_base(weld["p1_world"]), float)
     ls = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector([p0b, p1b]),
+        points=o3d.utility.Vector3dVector([p0b.tolist(), p1b.tolist()]),
         lines=o3d.utility.Vector2iVector([[0, 1]]))
     ls.paint_uniform_color([0.1, 0.85, 0.1])
     geoms.append(ls)
+    # 焊缝红色圆柱（比细线醒目）：默认沿 +Z 的圆柱 → 转到 p0→p1 方向 → 平移到中点
+    seg = p1b - p0b
+    L = float(np.linalg.norm(seg))
+    if L > 1e-6:
+        cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=0.008, height=L, resolution=16)
+        cyl.rotate(_align_rotmat([0.0, 0.0, 1.0], seg / L), center=(0.0, 0.0, 0.0))
+        cyl.translate(((p0b + p1b) * 0.5).tolist())
+        cyl.compute_vertex_normals()
+        cyl.paint_uniform_color([0.9, 0.1, 0.1])
+        geoms.append(cyl)
     tip = o3d.geometry.TriangleMesh.create_sphere(radius=0.02)
     tip.translate(_to_base(weld["mid_world"]))
     tip.compute_vertex_normals()
@@ -2201,11 +2210,23 @@ def _select_diverse_poses(items: list, k: int = 15) -> list:
 
     距离优先级：先旋转差距（两工件姿态 R 的测地夹角，度），再平移差距（t 的欧氏距离，米）。
     用 d = rot_deg*1000 + trans_m 把旋转设为主序、平移设为次序（旋转相同才比平移）。
-    ≤k 个时原样返回；否则 FPS：从第 0 个起，每次选「到已选集合最小距离最大」的那个。"""
+    ≤k 个时原样返回；否则 FPS：从第 0 个起，每次选「到已选集合最小距离最大」的那个。
+    每项的工件位姿 R/t：优先读 T_workpiece_in_base(4×4)，缺则回退读 R(3×3)/t(3,) 字段
+    （lookup 求解桶用后者，_kejian2 合格结果用前者）。"""
     if len(items) <= k:
         return items
-    Rs = [np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, :3] for r in items]
-    ts = [np.asarray(r["T_workpiece_in_base"], dtype=np.float64)[:3, 3] for r in items]
+
+    def _Rt(r):
+        T = r.get("T_workpiece_in_base")
+        if T is not None:
+            T = np.asarray(T, dtype=np.float64)
+            return T[:3, :3], T[:3, 3]
+        return (np.asarray(r["R"], dtype=np.float64),
+                np.asarray(r["t"], dtype=np.float64).reshape(3))
+
+    Rt = [_Rt(r) for r in items]
+    Rs = [x[0] for x in Rt]
+    ts = [x[1] for x in Rt]
     n = len(items)
 
     def _dist(i, j):
@@ -2783,6 +2804,238 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True,
         list(results),                                                               # ⑧ 复检后合格
     ]
     return {"forehand": fore, "backhand": back}, prof, debug_steps, prefilter_steps
+
+
+# ============================================================================
+# ④ 快速几何版：lay_flat + 保持放平 8 朝向 + 平移网格 + 4 条几何过滤（--fast / Scene.plan_init_pose_fast）
+# ----------------------------------------------------------------------------
+# 与 kejian2 完全不同：不做 IK / 可达性 / 整臂碰撞复检，纯几何摆放，故极快。
+#   · 放平：复用 lay_flat（长轴→+X、贴 z=0，90°整倍旋转）；
+#   · 朝向：保持放平的 8 种 = {绕竖直 Z: 0/90/180/270} × {沿长轴翻面: 0/180}（工件始终躺平，非侧立/竖立）；
+#   · 平移：焊缝中点在 (ee_xy_range 径向环 × ee_z_range) 内按 xy_step/z_step 网格采样，t 使中点恰落网格点；
+#   · 过滤（严格 4 条，全部复用 kejian2 的几何 helper）：① 两端点在范围 → ② 底座-工件 XY 不相交
+#     → ③ 工件+障碍 vs init_free 无交集 → ④ 轻去重(同朝向 + 2cm 同位)；
+#   · 不做 kejian2 的「正面(bisector base-z≥0)」「焊缝中心 base-x>0」过滤（按需求确认）。
+# 产出 dict 字段与 _kejian2_solve_weld 完全一致（供 InitPoseCandidate.from_kejian2 / 可视化复用）；
+# joint_angles 无 IK 可解 → 填 retract_config 占位（下游仅 scene_viz "reach" 模式读它）；rot_*_deg=0。
+# 参数走 default.yaml 的 plan_init_pose_fast 段（cfg.plan_init_fast_*）。
+# ============================================================================
+def _fast_orientations(R_flat: np.ndarray) -> List[np.ndarray]:
+    """保持放平的 8 种允许朝向（3×3，p_base = R·p_obj 的旋转部分）。
+
+    以 lay_flat 的 R_flat（长轴→世界 +X、贴 z=0）为基：R = Rz(yaw)·Rx(flip)·R_flat，
+    yaw∈{0,90,180,270}（绕竖直轴，长轴在 +X/+Y 间切换、始终水平），flip∈{0,180}（沿长轴翻面，
+    交换上下大面、仍贴地）。共 4×2=8 种；按矩阵四舍五入去重（对称工件可能少于 8）。"""
+    R_flat = np.asarray(R_flat, dtype=np.float64)
+    orients: List[np.ndarray] = []
+    seen = set()
+    for yaw in (0.0, 90.0, 180.0, 270.0):
+        for flip in (0.0, 180.0):
+            R = _Rz(np.deg2rad(yaw)) @ _Rx(np.deg2rad(flip)) @ R_flat
+            key = tuple(np.round(R.reshape(-1), 3).tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            orients.append(R)
+    return orients
+
+
+def _fast_grid(xy_range, z_range, xy_step: float, z_step: float) -> np.ndarray:
+    """焊缝中点候选落点网格 (G,3)（base 系）：xy 在径向环 [xy_lo,xy_hi] 内按 xy_step 采样、
+    z 在 [z_lo,z_hi] 内按 z_step 采样。xy 网格覆盖 [-xy_hi,xy_hi]²（含 0，360° 全环），
+    保留径向距离 ∈[xy_lo,xy_hi] 的点；z<=0 步长时退化为只取 z_lo。"""
+    xy_lo, xy_hi = float(xy_range[0]), float(xy_range[1])
+    z_lo, z_hi = float(z_range[0]), float(z_range[1])
+    eps = 1e-9
+    axis = np.arange(-xy_hi, xy_hi + xy_step * 0.5, xy_step) if xy_step > 0 else np.array([0.0])
+    X, Y = np.meshgrid(axis, axis, indexing="ij")
+    r = np.hypot(X, Y)
+    m = (r >= xy_lo - eps) & (r <= xy_hi + eps)
+    xy = np.stack([X[m], Y[m]], axis=1)                        # (P,2)
+    zs = (np.arange(z_lo, z_hi + z_step * 0.5, z_step) if z_step > 0
+          else np.array([z_lo], dtype=np.float64))
+    if len(xy) == 0 or len(zs) == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    g = np.column_stack([np.repeat(xy, len(zs), axis=0),
+                         np.tile(zs, len(xy))]).astype(np.float64)   # (P*Z, 3)
+    return g
+
+
+def _fast_build_ctx(obj_fp: str) -> dict:
+    """构建快速版【工件相关、焊缝无关】的求解上下文（可被同工件所有焊缝复用）：
+    cfg、放平 8 朝向、工件顶点/三角形 + 稠密点集、固定底座圆、init_free 区域、ee 范围/步长/standoff、
+    retract 占位关节角。无 solver / 无 joint 表 / 无 ESDF，故构建也很轻。"""
+    from gt_gen.config import load_config
+    cfg = load_config()
+    T_lay = lay_flat(obj_fp, viz=False)
+    R_flat = np.asarray(T_lay, dtype=np.float64)[:3, :3]
+    orientations = _fast_orientations(R_flat)
+
+    mesh_v, mesh_f = _load_mesh_vf(obj_fp)
+    if mesh_v is None:
+        print("[fast] 警告：读不到工件顶点，「底座-工件 XY 相交」「工件 vs init_free」过滤将退化/跳过")
+    wpx_pts = _voxelize_mesh_points(mesh_v, mesh_f, cfg.plan_init_fast_workpiece_x_voxel)
+
+    if cfg.plan_init_fast_base_overlap_filter:
+        base_circles = _fixed_base_xy_circles(cfg)
+        bc_cc, bc_rr, bc_umin, bc_umax = _base_circles_to_arrays(base_circles)
+        if not base_circles:
+            print("[fast] 警告：取不到固定底座碰撞球，跳过「底座-工件 XY 相交」过滤")
+    else:
+        bc_cc = bc_rr = bc_umin = bc_umax = None
+        print("[fast] base_overlap_filter=false：已关闭「底座-工件 XY 相交」过滤")
+
+    return {
+        "obj_fp": obj_fp, "cfg": cfg,
+        "orientations": orientations,
+        "ee_xy_range": [float(v) for v in cfg.plan_init_fast_ee_xy_range],
+        "ee_z_range": [float(v) for v in cfg.plan_init_fast_ee_z_range],
+        "xy_step": float(cfg.plan_init_fast_xy_step),
+        "z_step": float(cfg.plan_init_fast_z_step),
+        "standoff": float(cfg.plan_init_fast_standoff),
+        "wpx_pts": wpx_pts,
+        "init_free_region": _init_free_region_from_cfg(cfg),   # ③ 工件+障碍 vs init_free 无交集
+        "fast_obstacle_pts": None,                             # 障碍点云(mesh 局部系)；Scene 在 solve 前按当前障碍填充
+        "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
+        "mesh_v": mesh_v, "mesh_f": mesh_f,
+        "retract_q": np.asarray(cfg.retract_config, dtype=np.float64),
+    }
+
+
+def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
+    """对单条焊缝几何求解，复用 ctx 的工件级预备（不重建）。返回
+    ({"forehand":[...],"backhand":[...]}, prof, debug_steps, prefilter_steps)：
+    结果 dict 字段与 _kejian2_solve_weld 逐位一致；debug_steps = [①端点后, ②底座后, ③init_free后, ④合格]
+    每步【通过】的候选（raw dict）；prefilter_steps 恒为 {}（快速版无预筛阶段）。"""
+    import time as _time
+
+    p0 = np.asarray(weld["p0_world"], dtype=np.float64)
+    p1 = np.asarray(weld["p1_world"], dtype=np.float64)
+    mid = np.asarray(weld["mid_world"], dtype=np.float64)
+    bis = np.asarray(weld["bisector_world"], dtype=np.float64)
+    bis = bis / (np.linalg.norm(bis) + 1e-12)
+
+    xy_lo, xy_hi = ctx["ee_xy_range"]
+    z_lo, z_hi = ctx["ee_z_range"]
+    standoff = ctx["standoff"]
+    region = ctx["init_free_region"]
+    bc_cc, bc_rr, bc_umin, bc_umax = ctx["bc_cc"], ctx["bc_rr"], ctx["bc_umin"], ctx["bc_umax"]
+    mesh_v, mesh_f = ctx["mesh_v"], ctx["mesh_f"]
+    retract_q = ctx["retract_q"]
+
+    # ③ 过滤稠密测试点（mesh 局部系）= 工件体素点 ∪ 障碍点（与工件同 T 变换到 base 后逐点判在不在 init_free）
+    wpx_pts = ctx["wpx_pts"]
+    obs_pts = ctx.get("fast_obstacle_pts")
+    if wpx_pts is not None and obs_pts is not None and len(obs_pts):
+        free_test = np.concatenate([np.asarray(wpx_pts, dtype=np.float64),
+                                    np.asarray(obs_pts, dtype=np.float64)], axis=0)
+    elif wpx_pts is not None:
+        free_test = np.asarray(wpx_pts, dtype=np.float64)
+    elif obs_pts is not None and len(obs_pts):
+        free_test = np.asarray(obs_pts, dtype=np.float64)
+    else:
+        free_test = None
+
+    g = _fast_grid(ctx["ee_xy_range"], ctx["ee_z_range"], ctx["xy_step"], ctx["z_step"])  # (G,3)
+    n_orient = len(ctx["orientations"])
+    n_grid = len(g)
+
+    def _inrange(pb):                                          # (M,3) → 布尔 (M,)：径向 ∈xy_range 且 z ∈z_range
+        r = np.hypot(pb[:, 0], pb[:, 1])
+        return (r >= xy_lo) & (r <= xy_hi) & (pb[:, 2] >= z_lo) & (pb[:, 2] <= z_hi)
+
+    _t = _time.time()
+    results = []
+    dbg_ep, dbg_overlap, dbg_free = [], [], []
+    n_ep = n_overlap = n_free = n_dedup = 0
+    n_orient_kept = 0                                          # 正面过滤后保留的朝向数
+    seen = set()
+
+    for oid, R in enumerate(ctx["orientations"]):
+        d0 = R @ (p0 - mid)                                    # p0_base = g + d0（工件中点落 g）
+        d1 = R @ (p1 - mid)
+        Rmid = R @ mid
+        bis_base = R @ bis
+        bis_base = bis_base / (np.linalg.norm(bis_base) + 1e-12)
+        # 正面过滤：bis_base 与朝向 R 绑定、与平移无关 ⇒ 朝向级闸门。base-z<0 ⇒ 焊缝朝下=背面，整组丢弃
+        # （与 _kejian2_solve_weld 一致：保留 bis_z ≥ 0）
+        if float(bis_base[2]) < 0.0:
+            continue
+        n_orient_kept += 1
+        hand = "forehand" if float(bis_base[0]) < 0.0 else "backhand"
+        goal_quat = rotmat_to_quat_wxyz(_align_rotmat([1.0, 0.0, 0.0], bis_base))
+        vR = (mesh_v @ R.T) if mesh_v is not None else None    # (V,3) 旋转部分，per-candidate 只 + t
+        fR = (free_test @ R.T) if free_test is not None else None
+
+        # ① 两端点都在范围（向量化 over 全网格）
+        m_ep = _inrange(g + d0) & _inrange(g + d1)
+        idx_ep = np.nonzero(m_ep)[0]
+        n_ep += int(idx_ep.size)
+
+        for k in idx_ep.tolist():
+            gk = g[k]
+            t = gk - Rmid                                      # seam_center_base = gk（精确）
+            ee_pos = gk + standoff * bis_base                  # goal 位置（沿 bisector 外移 standoff）
+            T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
+            cand = {
+                "workpiece_pose7": mat44_to_pose7(T),
+                "T_workpiece_in_base": T,
+                "goal_pose7": np.concatenate([ee_pos, goal_quat]),
+                "joint_angles": np.asarray(retract_q, dtype=np.float64),   # 无 IK，retract 占位
+                "rot_x_deg": 0.0, "rot_y_deg": 0.0, "rot_z_deg": 0.0,
+                "bisector_base": np.asarray(bis_base, dtype=np.float64),
+                "seam_center_base": np.asarray(gk, dtype=np.float64),
+                "wpx_near_base": None,
+                "orientation_id": int(oid),
+                "hand": hand,
+            }
+            dbg_ep.append(cand)
+
+            # ② 固定底座 vs 工件 base-xy 投影相交 → 丢弃
+            if bc_cc is not None and vR is not None and mesh_f is not None:
+                if _base_overlaps_workpiece_tris(bc_cc, bc_rr, bc_umin, bc_umax, (vR + t)[:, :2], mesh_f):
+                    n_overlap += 1
+                    continue
+            dbg_overlap.append(cand)
+
+            # ③ 工件+障碍 与 init_free 起步空间有交集 → 丢弃
+            if fR is not None:
+                if _pts_in_init_free(fR + t, region).any():
+                    n_free += 1
+                    continue
+            dbg_free.append(cand)
+
+            # ④ 轻去重：同朝向 + 2cm 同位
+            key = (oid, round(float(t[0]), 2), round(float(t[1]), 2), round(float(t[2]), 2))
+            if key in seen:
+                n_dedup += 1
+                continue
+            seen.add(key)
+            results.append(cand)
+
+    fore = [r for r in results if r["hand"] == "forehand"]
+    back = [r for r in results if r["hand"] == "backhand"]
+    prof = {"fast_solve(几何摆放+4过滤)": _time.time() - _t}
+
+    after_overlap = n_ep - n_overlap
+    after_free = after_overlap - n_free
+    n_final = len(results)
+    _free_desc = ("圆柱" if region.get("method") == "cylinder"
+                  else f"盒{np.round(region['lo'], 2).tolist()}~{np.round(region['hi'], 2).tolist()}")
+    _n_obs = 0 if obs_pts is None else len(obs_pts)
+    print("[fast] 逐步过滤 候选初始位姿（前→后，括号内=本步丢弃）：")
+    print(f"  ① 网格候选（{n_orient} 朝向 × {n_grid} 网格点）        : {n_orient * n_grid}")
+    print(f"  ② 正面过滤(bisector 垂直分量 base-z≥0)     : {n_orient} → {n_orient_kept} 朝向"
+          f"（背面丢 {n_orient - n_orient_kept}）→ 候选 {n_orient_kept * n_grid}")
+    print(f"  ③ 两端点都在范围(径向∈xy_range, z∈z_range) : {n_orient_kept * n_grid} → {n_ep}")
+    print(f"  ④ 底座-工件 XY 投影不相交                  : {n_ep} → {after_overlap}（相交丢 {n_overlap}）")
+    print(f"  ⑤ 工件+障碍 vs init_free 空间无交集        : {after_overlap} → {after_free}"
+          f"（相交丢 {n_free}；init_free={_free_desc}，障碍点 {_n_obs}）")
+    print(f"  ⑥ 轻去重(同朝向 + 2cm 同位)                : {after_free} → {n_final}（重复丢 {n_dedup}）")
+    print(f"  ⇒ 合格 {n_final}（正手 {len(fore)} / 反手 {len(back)}；朝向 {n_orient_kept} 种）")
+
+    debug_steps = [list(dbg_ep), list(dbg_overlap), list(dbg_free), list(results)]
+    return {"forehand": fore, "backhand": back}, prof, debug_steps, {}
 
 
 def _print_prof_table(prof: dict) -> None:

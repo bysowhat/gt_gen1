@@ -163,8 +163,8 @@ def obstacle_type1_demo_main(args):
     # # seg = replay("plan_joint_case.pkl")
 
     scene = _make_scene(args)
-    scene._set_cur_seam(39)#
-    scene.plan_init_pose()
+    scene._set_cur_seam(89)#
+    scene.plan_init_pose_fast(verbose=True)
     scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
 
 
@@ -176,20 +176,20 @@ def obstacle_type1_demo_main(args):
                              hand='forehand', 
                              index=0, 
                              entry_index=0,
-                             otype='l_bracket')
+                             otype='pipe')
     scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
-    fflag = scene.compute_pose_and_plan_path(hand="forehand")
-    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+    # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    # fflag = scene.compute_pose_and_plan_path(hand="forehand")
+    # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    print(1)
+    # print(1)
 
 
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
     # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
-    # Open3DSceneVisualizer(scene).show_init_poses()
-    # Open3DSceneVisualizer(scene).show_joint_table_ee()
+    Open3DSceneVisualizer(scene).show_init_poses()
+    # Open3DSceneVisualizer(scene).show_joint_table_ee()ccc
 
     # # Open3DSceneVisualizer(scene).show_init_poses_debug(4, sort_by_seam_x=True)
     # # Open3DSceneVisualizer(scene).show_goal_pose_collision("backhand", 0)
@@ -199,7 +199,7 @@ def obstacle_type1_demo_main(args):
 
     # Open3DSceneVisualizer(scene).show_seam(106)
     # # Open3DSceneVisualizer(scene).show_seam_all_isaacsim()
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
+    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
 
 def main():
     ap = argparse.ArgumentParser(description="Scene API demo：初始位姿求解 / 障碍物类型2 / 障碍物类型3 + isaacsim 可视化")

@@ -173,6 +173,20 @@ plan_init_pose:                         # lookup 式初始位姿求解（scripts
   rot_y_deg: [-45, 45, 15]              # 绕末端局部 +y 轴（tilt）：[min,max,step]（度）
   rot_z_deg: [-45, 45, 15]                  # 绕末端局部 +z 轴（tilt）：[min,max,step]（度）
 
+plan_init_pose_fast:                    # 快速几何版初始位姿求解（scripts/plan_init_pose.py:_fast_* / Scene.plan_init_pose_fast）
+  # 不做 IK / 可达性 / 整臂碰撞，纯几何摆放：lay_flat 放平 → 保持放平的 8 种 90°朝向 → 焊缝中点在
+  # (ee_xy_range 径向环 × ee_z_range) 内按 xy_step/z_step 网格采样平移 → 4 条过滤（两端点在范围 /
+  # 底座-工件 XY 不相交 / 工件+障碍 vs init_free 无交集 / 轻去重）。返回格式与 plan_init_pose 一致。
+  ee_xy_range_m: [0.4, 1.7]             # 焊缝点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
+  ee_z_range_m: [-0.1, 0.1]             # 焊缝点在 base_link 系 z [下限,上限]（米）
+  xy_step_m: 0.20                       # 平移网格 xy 步长（米）：焊缝中点在 xy 平面按此步长采样
+  z_step_m: 0.08                        # 平移网格 z 步长（米）：焊缝中点在 z 方向按此步长采样
+  standoff_cm: 0.0                      # 焊枪头 goal 沿 bisector（远离工件方向）外移的 standoff 距离（cm）；0=落在焊缝中点
+  base_overlap_filter: true             # 「固定底座(xiaoyu_base_link)碰撞球 vs 工件 在 base-xy 投影相交」过滤开关；
+                                        #   true=相交则丢弃该候选；false=关闭。
+  workpiece_x_voxel_m: 0.1             # 工件/障碍稠密点集体素粒度（米）：用于「工件+障碍 vs init_free 无交集」过滤，
+                                        #   与三角形大小解耦。与碰撞 ESDF 无关。
+
 plan_init_pose_kejian:                         # lookup 式初始位姿求解（scripts/plan_init_pose.py --solve）的关节角过滤
   # precompute_joint_table 对 n^6 采样的关节角做 FK 后，只保留焊枪末端位姿（base_link 系）满足下列约束的：
   #   ① xy 平面到原点距离 ∈ ee_xy_range_m；② z ∈ ee_z_range_m；③ 落在 init_free.box_min_m/box_max_m 盒内。
@@ -264,7 +278,7 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
     # 无需在此写绝对路径。如需覆盖：加 stomp_planner_dir: <路径> 或设 env STOMP_PLANNER_DIR。
     num_iterations: 120     # 迭代轮数（搜索深度）：越大收敛越充分越能绕开，越慢
     num_batch: 8            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
-    num_timesteps: 151       # 轨迹时间步数
+    num_timesteps: 101       # 轨迹时间步数
     delta_t: 0.1            # 步长（秒）；也是产出 npz 的回放 dt
     collision_weight: 80.0  # 碰撞代价权重
     buffer_m: 0.001         # STOMP 自身的碰撞激活距离≈0：间隙完全来自障碍物理膨胀(obstacle_buffer_m)，工件不膨胀，
@@ -289,7 +303,7 @@ params:
     lambda_angle: 5                    # score_candidate fun 增益 vs 焊枪朝向变化代价(rad,测地角)权重（Step 9，0=关）
     version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
   loop:
-    max_rounds: 6                     # 主循环最大轮次（Step 10）
+    max_rounds: 10                     # 主循环最大轮次（Step 10）
     stuck_rounds: 3                     # 连续无进展判卡死（Step 10）
     observe_every_n: 2000000                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
@@ -338,7 +352,7 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
       plate:            {size_scale_range: [0.5, 0.7], span_clip_m: [0.15, 2.2], tilt_deg: 0.0}                 # 绕 Y 倾角(度)
       l_bracket:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2]}                               # 纯尺寸，无离散项
       u_channel:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2], height_mult: 0.7}             # 侧板高 = s×0.7
-      pipe:             {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 1.5}    # 管轴 x/y/z；管长 = s×1.5
+      pipe:             {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 3.5}    # 管轴 x/y/z；管长 = s×1.5
       parallel_pipes:   {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], n: 3, axis: y, stack: z, length_mult: 1.5, gap_mult: 0.5} # n 根；沿 stack 以 gap=s×0.5 排开
       crossed_pipes:    {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], cross_deg: 90.0, length_mult: 1.5}                        # 两管夹角(度)；管长 = s×1.5
       box_beam:         {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 1.5, side_mult: 1.4, side_min: 0.06}# 方截面边长 = max(side_min, rt×side_mult)
