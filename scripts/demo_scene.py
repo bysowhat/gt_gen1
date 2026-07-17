@@ -200,13 +200,13 @@ def obstacle_type2_demo_main(args):
         try:
             scene._set_cur_seam(seam_id)
             # 候选初始位姿：hand/障碍无关（放宽不避障），每缝算 1 次即可
-            scene.plan_init_pose_fast(include_obstacles=False, verbose=True)
+            scene.plan_init_pose_fast(include_obstacles=False, verbose=False)
             for hand in ("forehand", "backhand"):
                 scene.obstacles.get(seam_id, {}).pop(hand, None)   # 隔离本手别桶
                 # 1) 加 1 个类型2 遮挡板，挂到本手别桶
                 scene.add_obstacle_type2(hand=hand)
                 # 2) 规划带障碍轨迹（只避开本手别桶障碍）
-                if scene.compute_pose_and_plan_path(hand, max_stomp_try=5):
+                if scene.compute_pose_and_plan_path(hand, max_stomp_try=1):
                     print(f"[demo] seam {seam_id} {hand}：带障碍轨迹成功")
                 else:
                     print(f"[demo] seam {seam_id} {hand}：带障碍轨迹失败")
@@ -311,7 +311,7 @@ def viz(fp):
 
     scene = Scene.load(fp)
     scene.summarize_trajectories()
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=0,hand="forehand")
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=0,hand="backhand")
 
   
 
@@ -347,13 +347,16 @@ def main():
         else:
             demo(args)
         return
+    
+    if args.task in ("viz"):
+        viz('/media/a/新加卷/tempt/5/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight_type2_seam0.pkl')
 
     # --task viz（默认）：本地可视化调试入口
     # demo_obstacle_type2(args)
     # demo_obstacle_type3(args)
     # demo_init_pose(args)
     # demo_init_poses(args)   # 多候选初始位姿同屏铺网格（先另进程 plan_init_pose + save）
-    viz('/media/a/新加卷/tempt/5/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight_type1_all.pkl')
+    # viz('/media/a/新加卷/tempt/5/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight_type1_all.pkl')
 
 if __name__ == "__main__":
     main()
