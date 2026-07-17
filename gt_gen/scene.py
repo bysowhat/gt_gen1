@@ -1132,7 +1132,7 @@ class Scene:
         return result
     
     def compute_pose_and_plan_path(self, hand, include_obstacles: bool = True,
-                                   device: str = None):
+                                   device: str = None, max_stomp_try: int = 1):
         """对某手别的每个候选 init pose，求观测位姿序列后【按序边走边看规划】覆盖整条焊缝的 GT。
 
         流程（每个候选 init pose）：
@@ -1187,7 +1187,8 @@ class Scene:
                 for pose_idx in range(B):                # 按序覆盖 B 个观测位姿
                     entry = self.plan_explore_path(
                         goal_index=pose_idx, variant=variant,
-                        cur_joints=start, ctx=ctx, vm=vm)   # 共享 vm ＝ 继承前一个 pose 的观测
+                        cur_joints=start, ctx=ctx, vm=vm,
+                        max_stomp_try=max_stomp_try)   # 共享 vm ＝ 继承前一个 pose 的观测
                     seq_entries.append(entry)
                     if entry["status"] != "reached":
                         all_reached = False
@@ -1217,7 +1218,8 @@ class Scene:
                           include_obstacles: bool = True,
                           device: str = None,
                           ctx: Ctx = None,
-                          vm=None) -> dict:
+                          vm=None,
+                          max_stomp_try=1) -> dict:
         """从【当前机械臂关节角】边走边看规划一条到 goal 关节角目标的探索轨迹（GT）。
 
         忠实复用 scripts/place_obstacles_to_gt2.py 的主体（gt_gen.main_loop.generate_gt，一行不改），
@@ -1301,7 +1303,7 @@ class Scene:
         _t0 = time.perf_counter()
         GT, status, info = generate_gt(h_truth, h_expl, vm, truth_scene, None,
                                        camera_model=cam, world_plan=world,
-                                       goal_cfg=goal_joints, start_cfg=start)
+                                       goal_cfg=goal_joints, start_cfg=start,max_stomp_try=max_stomp_try)
         if _PROFILEMAIN:
             print(f"[PROFILEMAIN][generate_gt] pose#{gi} 主循环={time.perf_counter() - _t0:.3f}s "
                   f"status={status} rounds={info.get('rounds')}")

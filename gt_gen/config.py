@@ -317,6 +317,11 @@ class Config:
         """工件/障碍稠密点集体素粒度（米），供「工件+障碍 vs init_free 无交集」过滤用。见 plan_init_pose_fast.workpiece_x_voxel_m。"""
         return float(self._fast.get("workpiece_x_voxel_m", 0.03))
 
+    @property
+    def plan_init_fast_workpiece_x_min(self) -> float:
+        """工件距 base_link 原点欧氏最近点的 base-x 分量下限（米）：须 > 此值否则丢弃。见 plan_init_pose_fast.workpiece_x_min_m。"""
+        return float(self._fast.get("workpiece_x_min_m", 0.36))
+
     # ---- plan_init_pose_kejian（新逻辑：固定朝向 + 平移网格 + STOMP 可达，见 scripts/plan_init_pose_kejian.py） ----
     @property
     def _kejian(self) -> dict:

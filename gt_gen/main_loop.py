@@ -43,7 +43,7 @@ def _observe(voxmap, fk_handle, q, camera_model, truth_scene, max_depth, pixel_s
 
 
 def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max_depth,
-             every_n=None, pixel_stride: int = 16):
+             every_n=None, pixel_stride: int = 16, max_stomp_try=1):
     """在 h_expl(VOXEL) 上规划 cur_cfg→target_cfg，取插值轨迹；沿途每 every_n 个路点 _observe
     一次（边走边拍），终点构型再补拍一次。
 
@@ -66,6 +66,13 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
         world, ck = si.world_from_voxmap_auto(cfg, voxmap)
         traj = si.plan_joint_single(cfg, cur_cfg=cur_cfg, target_cfg=target_cfg, world=world,
                                     checker_type=ck)
+        if traj is None:
+            for _ in range(max_stomp_try):
+                traj = si.plan_joint_single(cfg, cur_cfg=cur_cfg, target_cfg=target_cfg, world=world,
+                                    checker_type=ck)
+                if traj is not None:
+                    break
+
         if traj is None:
             print("[_move_to] STOMP plan_joint 失败:", ci.explain_endpoints(h_expl, cur_cfg, target_cfg))
             return None, None
@@ -723,7 +730,7 @@ def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, r_list, camera_model, tru
 
 def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 camera_model=None, params=None, h_truth_plan=None, p_star_init=None,
-                world_plan=None, goal_cfg=None, start_cfg=None):
+                world_plan=None, goal_cfg=None, start_cfg=None, max_stomp_try=1):
     """完整 ①~⑦ 主循环（goal 已含 standoff 后退）。
 
     入参：
@@ -848,6 +855,13 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 # dump_inputs("plan_joint_case.pkl", cfg, _w1, cur_cfg, goal_cfg, _ck1)
             else:
                 seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
+
+            if seg is None:
+                for _ in range(max_stomp_try):
+                    seg = si.plan_joint_single(cfg, _w1, cur_cfg, goal_cfg, checker_type=_ck1)
+                    if seg is not None:
+                        break
+
             _tick("step1_direct", _t)
             reached_direct = seg is not None
         else:
@@ -887,11 +901,19 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             else:
                 # goal_cfg 给定→规划到目标关节角（plan_joint_single，无 IK），否则规划到 goal 位姿。
                 if goal_cfg is not None:
+                    # 步② P* 的 STOMP 迭代次数（覆盖 cfg.stomp_params['num_iterations']）；按需调此常量。
                     P = si.plan_joint_single(cfg, world_plan, cur_cfg, goal_cfg)
                 else:
                     P = si.plan_pose_single(cfg, world_plan, cur_cfg, goal_pose)
                     # [1.2627240419387817, -2.024371862411499, 6.27759313583374, -0.5791741609573364, -1.5592968463897705, 3.2276997566223145]
                     # [-0.13571767508983612, -0.9203471541404724, 1.2579456567764282, -1.0674389600753784, -0.9313104748725891, -2.814171075820923]
+                #_debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)
+                #为了解决较难case, 多规划几遍可能就有解了
+                if P is None:
+                    for _ in range(max_stomp_try):
+                        P = si.plan_joint_single(cfg, world_plan, cur_cfg, goal_cfg)
+                        if P is not None:
+                            break
                 if P is None:
                     print(f"[step② P*失败 R{rnd}] STOMP 在 world_plan 上未找到到 goal 的合格轨迹")
                     # STOMP 规划不出 P* → 本场景不可行，直接失败退出 generate_gt（不再进 NBV/后续轮）
@@ -942,8 +964,9 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             for cand_idx, cand in enumerate(r_list):                              # 按 score 降序逐个试，第一个能走通(seg 非 None)的就用
                 _t = time.perf_counter()
                 seg, seg_obs = _move_to(h_expl, voxmap, cur_cfg, cand.cfg, camera_model, truth_scene,
-                                        max_depth, every_n=every_n)
+                                        max_depth, every_n=every_n, max_stomp_try=max_stomp_try)
                 _tick("move", _t)
+                #_debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)
                 if seg is not None:
                     # _debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)  # 收尾段 seg 路径
                     # _dump_seg_isaacsim(cur_cfg, seg, rnd=rnd)    # 同段落盘（isaacsim 回放：工件+障碍+臂，无 voxmap）

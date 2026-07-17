@@ -253,26 +253,29 @@ def obstacle_type1_demo_main(args):
     scene._set_cur_seam(58)#
     scene.plan_init_pose_fast(verbose=True)
     scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-
+    # Open3DSceneVisualizer(scene).show_init_poses()
 
     # # scene.seam_ids_by_length()  89,39,58,92
-    # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    fflag = scene.compute_pose_and_plan_path(hand="forehand")
-    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
     scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    bflag = scene.add_obstacle_type1(link='Link3', 
-                             hand='forehand', 
-                             index=1, 
-                             entry_index=0,
-                             otype='plate')
-    print(1)
+    fflag = scene.compute_pose_and_plan_path(hand="forehand", max_stomp_try=1)
+    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    for link_n in ['Link3','Link4','Link5','xiaoyu_accessory_link']:
+        flag = scene.add_obstacle_type1(link=link_n,
+                                hand='forehand', 
+                                index=1, 
+                                entry_index=0,
+                                otype='plate')
+        if flag:
+            break
     scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    # # # # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
-    # fflag = scene.compute_pose_and_plan_path(hand="forehand")
-    # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    fflag = scene.compute_pose_and_plan_path(hand="forehand", max_stomp_try=5)
+    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    # print(1)
+    print(1)
 
 
     # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')

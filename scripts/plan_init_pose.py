@@ -2919,6 +2919,7 @@ def _fast_build_ctx(obj_fp: str) -> dict:
         "z_step": float(cfg.plan_init_fast_z_step),
         "standoff": float(cfg.plan_init_fast_standoff),
         "wpx_pts": wpx_pts,
+        "workpiece_x_min": float(cfg.plan_init_fast_workpiece_x_min),
         "init_free_region": region,                            # ③ 工件+障碍 vs init_free 无交集
         "fast_obstacle_pts": None,                             # 障碍点云(mesh 局部系)；Scene 在 solve 前按当前障碍填充
         "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
@@ -2930,8 +2931,8 @@ def _fast_build_ctx(obj_fp: str) -> dict:
 def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
     """对单条焊缝几何求解，复用 ctx 的工件级预备（不重建）。返回
     ({"forehand":[...],"backhand":[...]}, prof, debug_steps, prefilter_steps)：
-    结果 dict 字段与 _kejian2_solve_weld 逐位一致；debug_steps = [①端点后, ②底座后, ③init_free后, ④合格]
-    每步【通过】的候选（raw dict）；prefilter_steps 恒为 {}（快速版无预筛阶段）。"""
+    结果 dict 字段与 _kejian2_solve_weld 逐位一致；debug_steps = [①端点后, ②底座后, ③init_free后,
+    ④工件最近点 base-x>x_min 后, ⑤合格] 每步【通过】的候选（raw dict）；prefilter_steps 恒为 {}（快速版无预筛阶段）。"""
     import time as _time
 
     p0 = np.asarray(weld["p0_world"], dtype=np.float64)
@@ -2947,6 +2948,7 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
     bc_cc, bc_rr, bc_umin, bc_umax = ctx["bc_cc"], ctx["bc_rr"], ctx["bc_umin"], ctx["bc_umax"]
     mesh_v, mesh_f = ctx["mesh_v"], ctx["mesh_f"]
     retract_q = ctx["retract_q"]
+    wp_x_min = float(ctx["workpiece_x_min"])       # ④ 工件最近点 base-x 下限（严格 > 才保留）
 
     # ③ 过滤稠密测试点（mesh 局部系）= 工件体素点 ∪ 障碍点（与工件同 T 变换到 base 后逐点判在不在 init_free）
     wpx_pts = ctx["wpx_pts"]
@@ -2971,12 +2973,12 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
 
     _t = _time.time()
     results = []
-    dbg_ep, dbg_overlap, dbg_free = [], [], []
-    n_ep = n_overlap = n_free = n_dedup = 0
+    dbg_ep, dbg_overlap, dbg_free, dbg_xmin = [], [], [], []
+    n_ep = n_overlap = n_free = n_xmin = n_dedup = 0
     n_orient_kept = 0                                          # 正面过滤后保留的朝向数
     seen = set()
     _acc = {"orient_setup": 0.0, "step1_inrange": 0.0, "build_cand": 0.0,
-            "step2_overlap": 0.0, "step3_free": 0.0}          # PROFILEMAIN 子步累计
+            "step2_overlap": 0.0, "step3_free": 0.0, "step4_xmin": 0.0}   # PROFILEMAIN 子步累计
 
     for oid, R in enumerate(ctx["orientations"]):
         _ts = _time.perf_counter() if _PROFILEMAIN else 0.0
@@ -2994,6 +2996,7 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
         goal_quat = rotmat_to_quat_wxyz(_align_rotmat([1.0, 0.0, 0.0], bis_base))
         vR = (mesh_v @ R.T) if mesh_v is not None else None    # (V,3) 旋转部分，per-candidate 只 + t
         fR = (free_test @ R.T) if free_test is not None else None
+        wpxR = (np.asarray(wpx_pts, dtype=np.float64) @ R.T) if wpx_pts is not None else None  # 仅工件点(不含障碍)，供 ④ 最近点
         if _PROFILEMAIN:
             _acc["orient_setup"] += _time.perf_counter() - _ts
 
@@ -3059,7 +3062,24 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
                 _acc["step3_free"] += _time.perf_counter() - _ts
             dbg_free.append(cand)
 
-            # ④ 轻去重：同朝向 + 2cm 同位
+            # ④ 工件最近点 base-x > x_min：工件点集变换到 base，取到原点欧氏最近的点，其 base-x 须 > 阈值。
+            #   顺带把该最近点(base 系)写进 wpx_near_base（供可视化品红球；与判定同一点）。
+            _ts = _time.perf_counter() if _PROFILEMAIN else 0.0
+            if wpxR is not None:
+                pts_base = wpxR + t                                       # (V,3) 工件点 → base
+                i_near = int(np.argmin(np.einsum("vi,vi->v", pts_base, pts_base)))  # argmin |p|^2
+                p_near = pts_base[i_near]
+                cand["wpx_near_base"] = np.asarray(p_near, dtype=np.float64)
+                if float(p_near[0]) <= wp_x_min:                          # 严格 > 才保留
+                    n_xmin += 1
+                    if _PROFILEMAIN:
+                        _acc["step4_xmin"] += _time.perf_counter() - _ts
+                    continue
+            if _PROFILEMAIN:
+                _acc["step4_xmin"] += _time.perf_counter() - _ts
+            dbg_xmin.append(cand)
+
+            # ⑤ 轻去重：同朝向 + 2cm 同位
             key = (oid, round(float(t[0]), 2), round(float(t[1]), 2), round(float(t[2]), 2))
             if key in seen:
                 n_dedup += 1
@@ -3069,13 +3089,14 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
 
     fore = [r for r in results if r["hand"] == "forehand"]
     back = [r for r in results if r["hand"] == "backhand"]
-    prof = {"fast_solve(几何摆放+4过滤)": _time.time() - _t}
+    prof = {"fast_solve(几何摆放+5过滤)": _time.time() - _t}
     if _PROFILEMAIN:
         _items = " ".join(f"{k}={v:.3f}s" for k, v in _acc.items())
         print(f"[PROFILEMAIN][_fast_solve_weld] {_items} | 朝向={n_orient_kept} 端点候选={n_ep}")
 
     after_overlap = n_ep - n_overlap
     after_free = after_overlap - n_free
+    after_xmin = after_free - n_xmin
     n_final = len(results)
     _free_desc = ("圆柱" if region.get("method") == "cylinder"
                   else f"盒{np.round(region['lo'], 2).tolist()}~{np.round(region['hi'], 2).tolist()}")
@@ -3088,10 +3109,11 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
     print(f"  ④ 底座-工件 XY 投影不相交                  : {n_ep} → {after_overlap}（相交丢 {n_overlap}）")
     print(f"  ⑤ 工件+障碍 vs init_free 空间无交集        : {after_overlap} → {after_free}"
           f"（相交丢 {n_free}；init_free={_free_desc}，障碍点 {_n_obs}）")
-    print(f"  ⑥ 轻去重(同朝向 + 2cm 同位)                : {after_free} → {n_final}（重复丢 {n_dedup}）")
+    print(f"  ⑥ 工件最近点 base-x > {wp_x_min:.3f}m           : {after_free} → {after_xmin}（过近丢 {n_xmin}）")
+    print(f"  ⑦ 轻去重(同朝向 + 2cm 同位)                : {after_xmin} → {n_final}（重复丢 {n_dedup}）")
     print(f"  ⇒ 合格 {n_final}（正手 {len(fore)} / 反手 {len(back)}；朝向 {n_orient_kept} 种）")
 
-    debug_steps = [list(dbg_ep), list(dbg_overlap), list(dbg_free), list(results)]
+    debug_steps = [list(dbg_ep), list(dbg_overlap), list(dbg_free), list(dbg_xmin), list(results)]
     return {"forehand": fore, "backhand": back}, prof, debug_steps, {}
 
 

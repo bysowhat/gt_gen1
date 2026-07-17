@@ -37,14 +37,19 @@ def _ensure_api(cfg):
     return stomp_planning_api
 
 
-def _plan_kwargs(cfg, buffer, checker_type):
-    """组装透传给 stomp_planning_api.plan_to_pose_* 的公共参数。"""
+def _plan_kwargs(cfg, buffer, checker_type, num_iterations=None):
+    """组装透传给 stomp_planning_api.plan_to_pose_* 的公共参数。
+
+    num_iterations：None 时用 cfg.stomp_params['num_iterations']；给定则覆盖 STOMP 迭代次数。
+    """
     sp = cfg.stomp_params
     if buffer is None:
         buffer = float(sp["buffer_m"])
+    if num_iterations is None:
+        num_iterations = int(sp["num_iterations"])
     return dict(
         robot_yml=cfg.robot_cfg_path, checker_type=checker_type, buffer=float(buffer),
-        num_iterations=int(sp["num_iterations"]), num_batch=int(sp["num_batch"]),
+        num_iterations=int(num_iterations), num_batch=int(sp["num_batch"]),
         num_timesteps=int(sp["num_timesteps"]), delta_t=float(sp["delta_t"]),
         collision_weight=float(sp["collision_weight"]),
         early_stop=bool(sp["early_stop"]),
@@ -122,20 +127,22 @@ def plan_pose_multi(cfg, world, cur_cfg, goal_pose, *, buffer: Optional[float] =
 
 
 def plan_joint_single(cfg, world, cur_cfg, target_cfg, *, buffer: Optional[float] = None,
-                      checker_type: Any = None) -> Optional[np.ndarray]:
+                      checker_type: Any = None,
+                      num_iterations: Optional[int] = None) -> Optional[np.ndarray]:
     """用 STOMP 规划 cur_cfg -> target_cfg（关节空间目标），返回【单条最优】避障轨迹。
 
     调 stomp_planning_api.plan_to_joint_single：跑 num_batch 条并行 STOMP，在所有「无碰撞
     (n_collision_steps==0) 且在限位(in_limit)」的候选里取 state_cost 最小那条；无合格候选返回 None。
 
     入参同 plan_pose_single，但目标是关节角 target_cfg（长度=dof）而非位姿。
+    num_iterations：None 时用 cfg.stomp_params['num_iterations']；给定则覆盖本次 STOMP 迭代次数。
     返回：(T,dof) ndarray 或 None。
     """
     api = _ensure_api(cfg)
     _t0 = time.perf_counter()
     traj = api.plan_to_joint_single(
         list(map(float, cur_cfg)), list(map(float, target_cfg)), world,
-        **_plan_kwargs(cfg, buffer, checker_type))
+        **_plan_kwargs(cfg, buffer, checker_type, num_iterations))
     print(f"[计时] plan_joint_single（建planner+STOMP，无IK）{time.perf_counter() - _t0:.3f}s "
           f"-> {'None' if traj is None else 'ok'}")
     return None if traj is None else np.asarray(traj, float)

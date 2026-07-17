@@ -118,7 +118,7 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
 
   method_for_init: "box"           # 机械臂初始 FREE 空间方案：cylinder=圆柱(cyl_*) | box=立方体(box_*_for_init)
   box_min_m_for_init: [-1.4, -1.0, -0.5]         # 表示机械臂初始free空间，立方体法：AABB 盒下界角点（米，base_link 系，轴对齐）
-  box_max_m_for_init: [0.1, 1.0, 2.0]            # 表示机械臂初始free空间，立方体法：AABB 盒上界角点（米）。中心落在 base_link，整块置 FREE
+  box_max_m_for_init: [0.2, 1.0, 2.0]            # 表示机械臂初始free空间，立方体法：AABB 盒上界角点（米）。中心落在 base_link，整块置 FREE
 
 
   # 预存扫掠法（第四种）：retract + 若干关键关节角两两规划轨迹的整臂扫掠并集，离线算好存盘、免每次重算。
@@ -186,6 +186,9 @@ plan_init_pose_fast:                    # 快速几何版初始位姿求解（sc
                                         #   true=相交则丢弃该候选；false=关闭。
   workpiece_x_voxel_m: 0.1             # 工件/障碍稠密点集体素粒度（米）：用于「工件+障碍 vs init_free 无交集」过滤，
                                         #   与三角形大小解耦。与碰撞 ESDF 无关。
+  workpiece_x_min_m: 0.4               # 工件距 base_link 原点【欧氏最近】的那个点，其 base-x 分量下限（米）：
+                                        #   须 > 此值否则丢弃（工件离底座 x 向太近/在底座后方）。仅看正 x（严格大于）。
+                                        #   最近点点集复用上面的 workpiece_x_voxel_m 体素点。
 
 plan_init_pose_kejian:                         # lookup 式初始位姿求解（scripts/plan_init_pose.py --solve）的关节角过滤
   # precompute_joint_table 对 n^6 采样的关节角做 FK 后，只保留焊枪末端位姿（base_link 系）满足下列约束的：
@@ -278,7 +281,7 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
     # 无需在此写绝对路径。如需覆盖：加 stomp_planner_dir: <路径> 或设 env STOMP_PLANNER_DIR。
     num_iterations: 120     # 迭代轮数（搜索深度）：越大收敛越充分越能绕开，越慢
     num_batch: 1            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
-    num_timesteps: 101       # 轨迹时间步数
+    num_timesteps: 251       # 轨迹时间步数
     delta_t: 0.1            # 步长（秒）；也是产出 npz 的回放 dt
     collision_weight: 80.0  # 碰撞代价权重
     buffer_m: 0.001         # STOMP 自身的碰撞激活距离≈0：间隙完全来自障碍物理膨胀(obstacle_buffer_m)，工件不膨胀，
@@ -313,7 +316,7 @@ params:
     lambda_angle: 5                    # score_candidate fun 增益 vs 焊枪朝向变化代价(rad,测地角)权重（Step 9，0=关）
     version: "oracle_path"              # 或 "line_weighted"(v1 fallback)
   loop:
-    max_rounds: 10                     # 主循环最大轮次（Step 10）
+    max_rounds: 15                     # 主循环最大轮次（Step 10）
     stuck_rounds: 3                     # 连续无进展判卡死（Step 10）
     observe_every_n: 2000000                 # 步⑤ _move_to 移动时，每隔 N 个插值路点 _observe 一次（边走边拍，Step 10）
   swept:
@@ -359,7 +362,7 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
                                         # 尺寸主体仍随走廊自适应：s=span(clip后)、rt=tube_r(clip后)、th=thickness_range_m 取样；
                                         # 只覆盖这里列出的键，未列的回退 _shape_for 内置默认（整段留 {} 即全用默认）。
                                         # 注：plate/l_bracket/u_channel 不用 rt，故不写 tube_r_clip_m。
-      plate:            {size_scale_range: [0.5, 0.7], span_clip_m: [0.15, 2.2], tilt_deg: 0.0}                 # 绕 Y 倾角(度)
+      plate:            {size_scale_range: [0.4, 0.5], span_clip_m: [0.15, 2.2], tilt_deg: 0.0}                 # 绕 Y 倾角(度)
       l_bracket:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2]}                               # 纯尺寸，无离散项
       u_channel:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2], height_mult: 0.7}             # 侧板高 = s×0.7
       pipe:             {size_scale_range: [0.6, 0.7], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 4.5}    # 管轴 x/y/z；管长 = s×1.5
