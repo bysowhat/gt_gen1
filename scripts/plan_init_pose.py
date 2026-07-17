@@ -37,6 +37,9 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+# PROFILEMAIN=1 时把 _fast_build_ctx / _fast_solve_weld 内部各子步的耗时细分打出来（正常运行零开销）。
+_PROFILEMAIN = os.environ.get("PROFILEMAIN") == "1"
 DEFAULT_LAY_FLAT_OBJ = ("/media/a/新加卷/hanfeng/segment/A3Changfang/"
                         "BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj")
 
@@ -250,6 +253,7 @@ def mat44_to_pose7(M):
 
 # ---- 焊缝 I/O（父 solve_arm_pose_parallel.py L191–304 移植） ----
 SHORT_SEAM_LEN_M = 0.03   # 短焊缝阈值（米）：焊缝端点距 < 此值视为过短（=3cm），--filter-short 时丢弃不求解
+_VERTICAL_SEAM_DZ_M = 0.1 # 竖焊缝阈值（米）：两端点 base-z 高度差 ≥ 此值视为竖焊缝，采样锚点=较低端点（横缝=中点）
 
 
 def _seam_len_m(weld: Dict) -> float:
@@ -2812,8 +2816,9 @@ def _kejian2_solve_weld(ctx: dict, weld: Dict, verbose: bool = True,
 # 与 kejian2 完全不同：不做 IK / 可达性 / 整臂碰撞复检，纯几何摆放，故极快。
 #   · 放平：复用 lay_flat（长轴→+X、贴 z=0，90°整倍旋转）；
 #   · 朝向：保持放平的 8 种 = {绕竖直 Z: 0/90/180/270} × {沿长轴翻面: 0/180}（工件始终躺平，非侧立/竖立）；
-#   · 平移：焊缝中点在 (ee_xy_range 径向环 × ee_z_range) 内按 xy_step/z_step 网格采样，t 使中点恰落网格点；
-#   · 过滤（严格 4 条，全部复用 kejian2 的几何 helper）：① 两端点在范围 → ② 底座-工件 XY 不相交
+#   · 平移：采样锚点在 (ee_xy_range 径向环 × ee_z_range) 内按 xy_step/z_step 网格采样，t 使锚点恰落网格点；
+#     锚点 = 横焊缝(两端 base-z 差<0.1m)取焊缝中点、竖焊缝(≥0.1m)取较低端点；seam_center_base 始终为真实中点；
+#   · 过滤（严格 4 条，全部复用 kejian2 的几何 helper）：① 端点在范围(横缝两端/竖缝较低端) → ② 底座-工件 XY 不相交
 #     → ③ 工件+障碍 vs init_free 无交集 → ④ 轻去重(同朝向 + 2cm 同位)；
 #   · 不做 kejian2 的「正面(bisector base-z≥0)」「焊缝中心 base-x>0」过滤（按需求确认）。
 # 产出 dict 字段与 _kejian2_solve_weld 完全一致（供 InitPoseCandidate.from_kejian2 / 可视化复用）；
@@ -2841,7 +2846,7 @@ def _fast_orientations(R_flat: np.ndarray) -> List[np.ndarray]:
 
 
 def _fast_grid(xy_range, z_range, xy_step: float, z_step: float) -> np.ndarray:
-    """焊缝中点候选落点网格 (G,3)（base 系）：xy 在径向环 [xy_lo,xy_hi] 内按 xy_step 采样、
+    """采样锚点(横缝=焊缝中点/竖缝=较低端点)候选落点网格 (G,3)（base 系）：xy 在径向环 [xy_lo,xy_hi] 内按 xy_step 采样、
     z 在 [z_lo,z_hi] 内按 z_step 采样。xy 网格覆盖 [-xy_hi,xy_hi]²（含 0，360° 全环），
     保留径向距离 ∈[xy_lo,xy_hi] 的点；z<=0 步长时退化为只取 z_lo。"""
     xy_lo, xy_hi = float(xy_range[0]), float(xy_range[1])
@@ -2866,15 +2871,28 @@ def _fast_build_ctx(obj_fp: str) -> dict:
     cfg、放平 8 朝向、工件顶点/三角形 + 稠密点集、固定底座圆、init_free 区域、ee 范围/步长/standoff、
     retract 占位关节角。无 solver / 无 joint 表 / 无 ESDF，故构建也很轻。"""
     from gt_gen.config import load_config
+    _tt = time.perf_counter() if _PROFILEMAIN else 0.0
+    _prof_b = {}
+    def _lap(name):
+        nonlocal _tt
+        if _PROFILEMAIN:
+            now = time.perf_counter()
+            _prof_b[name] = now - _tt
+            _tt = now
+
     cfg = load_config()
+    _lap("load_config")
     T_lay = lay_flat(obj_fp, viz=False)
     R_flat = np.asarray(T_lay, dtype=np.float64)[:3, :3]
     orientations = _fast_orientations(R_flat)
+    _lap("lay_flat+orient")
 
     mesh_v, mesh_f = _load_mesh_vf(obj_fp)
     if mesh_v is None:
         print("[fast] 警告：读不到工件顶点，「底座-工件 XY 相交」「工件 vs init_free」过滤将退化/跳过")
+    _lap("load_mesh_vf")
     wpx_pts = _voxelize_mesh_points(mesh_v, mesh_f, cfg.plan_init_fast_workpiece_x_voxel)
+    _lap("voxelize_mesh_points")
 
     if cfg.plan_init_fast_base_overlap_filter:
         base_circles = _fixed_base_xy_circles(cfg)
@@ -2884,6 +2902,13 @@ def _fast_build_ctx(obj_fp: str) -> dict:
     else:
         bc_cc = bc_rr = bc_umin = bc_umax = None
         print("[fast] base_overlap_filter=false：已关闭「底座-工件 XY 相交」过滤")
+    _lap("base_circles")
+
+    region = _init_free_region_from_cfg(cfg)
+    _lap("init_free_region")
+    if _PROFILEMAIN:
+        _items = " ".join(f"{k}={v:.3f}s" for k, v in _prof_b.items())
+        print(f"[PROFILEMAIN][_fast_build_ctx] {_items}")
 
     return {
         "obj_fp": obj_fp, "cfg": cfg,
@@ -2894,7 +2919,7 @@ def _fast_build_ctx(obj_fp: str) -> dict:
         "z_step": float(cfg.plan_init_fast_z_step),
         "standoff": float(cfg.plan_init_fast_standoff),
         "wpx_pts": wpx_pts,
-        "init_free_region": _init_free_region_from_cfg(cfg),   # ③ 工件+障碍 vs init_free 无交集
+        "init_free_region": region,                            # ③ 工件+障碍 vs init_free 无交集
         "fast_obstacle_pts": None,                             # 障碍点云(mesh 局部系)；Scene 在 solve 前按当前障碍填充
         "bc_cc": bc_cc, "bc_rr": bc_rr, "bc_umin": bc_umin, "bc_umax": bc_umax,
         "mesh_v": mesh_v, "mesh_f": mesh_f,
@@ -2950,8 +2975,11 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
     n_ep = n_overlap = n_free = n_dedup = 0
     n_orient_kept = 0                                          # 正面过滤后保留的朝向数
     seen = set()
+    _acc = {"orient_setup": 0.0, "step1_inrange": 0.0, "build_cand": 0.0,
+            "step2_overlap": 0.0, "step3_free": 0.0}          # PROFILEMAIN 子步累计
 
     for oid, R in enumerate(ctx["orientations"]):
+        _ts = _time.perf_counter() if _PROFILEMAIN else 0.0
         d0 = R @ (p0 - mid)                                    # p0_base = g + d0（工件中点落 g）
         d1 = R @ (p1 - mid)
         Rmid = R @ mid
@@ -2966,16 +2994,30 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
         goal_quat = rotmat_to_quat_wxyz(_align_rotmat([1.0, 0.0, 0.0], bis_base))
         vR = (mesh_v @ R.T) if mesh_v is not None else None    # (V,3) 旋转部分，per-candidate 只 + t
         fR = (free_test @ R.T) if free_test is not None else None
+        if _PROFILEMAIN:
+            _acc["orient_setup"] += _time.perf_counter() - _ts
 
-        # ① 两端点都在范围（向量化 over 全网格）
-        m_ep = _inrange(g + d0) & _inrange(g + d1)
+        # ① 端点在范围 + 采样锚点：工件平移使「锚点」恰落网格点 gk（seam_center_base 始终取真实中点）。
+        #   · 横焊缝（两端 base-z 高度差 <0.1m）：锚点=焊缝中点，两端点都须在范围（原逻辑不变）；
+        #   · 竖焊缝（高度差 ≥0.1m）：锚点=较低端点，把它挪到 gk（gk 在网格内必在范围 ⇒ 判据恒过）。
+        #   高度差 = 端点 base-z 之差 = d0[2]-d1[2]，只随朝向变（g 给两端加同一 z），故按朝向判定。
+        if abs(float(d0[2] - d1[2])) >= _VERTICAL_SEAM_DZ_M:
+            anchor_d = d0 if float(d0[2]) <= float(d1[2]) else d1   # 竖缝：锚点=较低端（base-z 较小者）
+            m_ep = _inrange(g)                                      # 较低端恰落 gk，恒在范围
+        else:
+            anchor_d = np.zeros(3, dtype=np.float64)                # 横缝：锚点=焊缝中点
+            m_ep = _inrange(g + d0) & _inrange(g + d1)
         idx_ep = np.nonzero(m_ep)[0]
         n_ep += int(idx_ep.size)
+        if _PROFILEMAIN:
+            _acc["step1_inrange"] += _time.perf_counter() - _ts
 
         for k in idx_ep.tolist():
+            _ts = _time.perf_counter() if _PROFILEMAIN else 0.0
             gk = g[k]
-            t = gk - Rmid                                      # seam_center_base = gk（精确）
-            ee_pos = gk + standoff * bis_base                  # goal 位置（沿 bisector 外移 standoff）
+            seam_center = gk - anchor_d                         # 真实焊缝中点在 base（横缝=gk；竖缝在 gk 正上方）
+            t = seam_center - Rmid                              # 使锚点(中点/竖缝较低端)恰落网格点 gk
+            ee_pos = seam_center + standoff * bis_base          # goal 位置（沿 bisector 外移 standoff）
             T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
             cand = {
                 "workpiece_pose7": mat44_to_pose7(T),
@@ -2984,25 +3026,37 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
                 "joint_angles": np.asarray(retract_q, dtype=np.float64),   # 无 IK，retract 占位
                 "rot_x_deg": 0.0, "rot_y_deg": 0.0, "rot_z_deg": 0.0,
                 "bisector_base": np.asarray(bis_base, dtype=np.float64),
-                "seam_center_base": np.asarray(gk, dtype=np.float64),
+                "seam_center_base": np.asarray(seam_center, dtype=np.float64),
                 "wpx_near_base": None,
                 "orientation_id": int(oid),
                 "hand": hand,
             }
             dbg_ep.append(cand)
+            if _PROFILEMAIN:
+                _acc["build_cand"] += _time.perf_counter() - _ts
 
             # ② 固定底座 vs 工件 base-xy 投影相交 → 丢弃
+            _ts = _time.perf_counter() if _PROFILEMAIN else 0.0
             if bc_cc is not None and vR is not None and mesh_f is not None:
                 if _base_overlaps_workpiece_tris(bc_cc, bc_rr, bc_umin, bc_umax, (vR + t)[:, :2], mesh_f):
                     n_overlap += 1
+                    if _PROFILEMAIN:
+                        _acc["step2_overlap"] += _time.perf_counter() - _ts
                     continue
+            if _PROFILEMAIN:
+                _acc["step2_overlap"] += _time.perf_counter() - _ts
             dbg_overlap.append(cand)
 
             # ③ 工件+障碍 与 init_free 起步空间有交集 → 丢弃
+            _ts = _time.perf_counter() if _PROFILEMAIN else 0.0
             if fR is not None:
                 if _pts_in_init_free(fR + t, region).any():
                     n_free += 1
+                    if _PROFILEMAIN:
+                        _acc["step3_free"] += _time.perf_counter() - _ts
                     continue
+            if _PROFILEMAIN:
+                _acc["step3_free"] += _time.perf_counter() - _ts
             dbg_free.append(cand)
 
             # ④ 轻去重：同朝向 + 2cm 同位
@@ -3016,6 +3070,9 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
     fore = [r for r in results if r["hand"] == "forehand"]
     back = [r for r in results if r["hand"] == "backhand"]
     prof = {"fast_solve(几何摆放+4过滤)": _time.time() - _t}
+    if _PROFILEMAIN:
+        _items = " ".join(f"{k}={v:.3f}s" for k, v in _acc.items())
+        print(f"[PROFILEMAIN][_fast_solve_weld] {_items} | 朝向={n_orient_kept} 端点候选={n_ep}")
 
     after_overlap = n_ep - n_overlap
     after_free = after_overlap - n_free
@@ -3027,7 +3084,7 @@ def _fast_solve_weld(ctx: dict, weld: Dict, verbose: bool = False):
     print(f"  ① 网格候选（{n_orient} 朝向 × {n_grid} 网格点）        : {n_orient * n_grid}")
     print(f"  ② 正面过滤(bisector 垂直分量 base-z≥0)     : {n_orient} → {n_orient_kept} 朝向"
           f"（背面丢 {n_orient - n_orient_kept}）→ 候选 {n_orient_kept * n_grid}")
-    print(f"  ③ 两端点都在范围(径向∈xy_range, z∈z_range) : {n_orient_kept * n_grid} → {n_ep}")
+    print(f"  ③ 端点在范围(横缝两端/竖缝较低端 ∈xy·z_range) : {n_orient_kept * n_grid} → {n_ep}")
     print(f"  ④ 底座-工件 XY 投影不相交                  : {n_ep} → {after_overlap}（相交丢 {n_overlap}）")
     print(f"  ⑤ 工件+障碍 vs init_free 空间无交集        : {after_overlap} → {after_free}"
           f"（相交丢 {n_free}；init_free={_free_desc}，障碍点 {_n_obs}）")

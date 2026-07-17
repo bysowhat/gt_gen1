@@ -73,27 +73,37 @@ def voxelize_spheres(voxmap, spheres) -> np.ndarray:
     判据为精确的「球-AABB(体素立方体)相交」：球心到体素盒的最近距离 ≤ r 才算覆盖
     （逐轴 clamp：d_k = max(0, |c_k - ctr_k| - vs/2)，∑d_k² ≤ r²）。
     候选枚举仍用 r + 半体对角线 框 AABB（保证候选集是超集、不漏），再用精确判据剔除"只擦到角外"的体素。
+
+    向量化实现：用【全体球的每轴最大 AABB 跨度】搭一个统一相对偏移网格，广播到每个球（lo+off），
+    再用 off ≤ 该球自身 (hi-lo) 掩掉多出的偏移——等价于原逐球 meshgrid(lo..hi)，但去掉 Python 逐球循环。
     """
     spheres = np.asarray(spheres, float)
     spheres = spheres[spheres[:, 3] > 1e-4]
+    if spheres.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.int64)
     vs = voxmap.voxel_size
     half = 0.5 * vs                          # 体素半边长（精确判据用）
     pad = 0.5 * vs * np.sqrt(3.0)            # 半体对角线，仅用于框候选 AABB（超集、不漏）
-    occ = set()
-    for c0, c1, c2, r in spheres:
-        c = np.array([c0, c1, c2]); R = r + pad
-        lo = voxmap.world_to_voxel(c - R); hi = voxmap.world_to_voxel(c + R)
-        rs = [np.arange(lo[k], hi[k] + 1) for k in range(3)]
-        ii, jj, kk = np.meshgrid(*rs, indexing="ij")
-        idx = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], 1)
-        ctr = voxmap.voxel_to_world(idx)
-        d = np.maximum(0.0, np.abs(ctr - c) - half)              # 逐轴超出体素盒的距离 (M,3)
-        for t in map(tuple, idx[(d * d).sum(axis=1) <= r * r]):  # 精确球-AABB 相交
-            occ.add(t)
-    if not occ:
+    c = spheres[:, :3]                       # (M,3)
+    r = spheres[:, 3]                        # (M,)
+    R = (r + pad)[:, None]                   # (M,1)
+    lo = voxmap.world_to_voxel(c - R).astype(np.int64)          # (M,3)
+    hi = voxmap.world_to_voxel(c + R).astype(np.int64)          # (M,3)
+    span = hi - lo                                              # (M,3) 每轴 AABB 跨度（含端 = span+1 格）
+    ext = np.maximum(span.max(axis=0) + 1, 1)                   # (3,) 统一偏移网格尺寸
+    ox, oy, oz = np.meshgrid(np.arange(ext[0]), np.arange(ext[1]), np.arange(ext[2]),
+                             indexing="ij")
+    off = np.stack([ox.ravel(), oy.ravel(), oz.ravel()], axis=1).astype(np.int64)  # (E,3)
+    idx = lo[:, None, :] + off[None, :, :]                      # (M,E,3) 候选下标
+    within = np.all(off[None, :, :] <= span[:, None, :], axis=2)   # (M,E) 掩掉超出各球自身 AABB 的偏移
+    ctr = voxmap.voxel_to_world(idx.reshape(-1, 3)).reshape(spheres.shape[0], -1, 3)  # (M,E,3) 体素中心
+    d = np.maximum(0.0, np.abs(ctr - c[:, None, :]) - half)     # 逐轴超出体素盒的距离 (M,E,3)
+    hit = ((d * d).sum(axis=2) <= (r * r)[:, None]) & within    # (M,E) 精确球-AABB 相交
+    sel = idx[hit]                                              # (K,3) 命中体素（含重复）
+    if sel.shape[0] == 0:
         return np.empty((0, 3), dtype=np.int64)
-    idx = np.array(sorted(occ), dtype=np.int64)
-    return idx[voxmap.in_bounds(idx)]
+    idx_u = np.unique(sel, axis=0)
+    return idx_u[voxmap.in_bounds(idx_u)]
 
 
 def _interp_count(handle, q_from, q_to, resolution):

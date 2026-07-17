@@ -19,6 +19,7 @@
 import argparse
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +27,92 @@ DEFAULT_OBJ = ("/media/a/新加卷/hanfeng/segment/A3Changfang/"
                "BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight.obj")
 DEFAULT_WELD_JSON = ("/media/a/新加卷/hanfeng/segment/A3Changfang/"
                      "BEAM_1aEEYa00Ed5Z4sE34qDJKu_weld_angle3.json")
+
+# PROFILEMAIN=1 时，用 sys.settrace 逐行统计【本文件】每行代码耗时（含该行调用的其它模块耗时）。
+_PROFILE_MAIN = os.environ.get("PROFILEMAIN") == "1"
+
+
+class _LineProfiler:
+    """逐行行级计时器（仅统计 target_file 内的帧）。
+
+    原理：settrace 全局钩子对每个新帧的 'call' 事件被调用——只对 target_file 的帧返回本地
+    tracer，其它文件返回 None（不产生逐行事件）。故某行若调用了别的模块（如 scene.compute_*），
+    其耗时会在【控制权回到本文件下一行】时，被归到发起调用的那一行——正是「每行耗时」的语义。
+    每个帧独立维护 (上一行号, 上一时刻)，正确处理本文件内的函数嵌套（如 _make_scene）。
+    """
+
+    def __init__(self, target_file):
+        self.target_abs = os.path.abspath(target_file)
+        self.stats = {}          # lineno -> [hits, total_seconds]
+        self._state = {}         # frame -> [last_lineno, last_perf_counter]
+        self._file_cache = {}    # co_filename -> bool(是否本文件)
+
+    def _trace(self, frame, event, arg):
+        if event == "call":
+            fn = frame.f_code.co_filename
+            matched = self._file_cache.get(fn)
+            if matched is None:
+                matched = (os.path.abspath(fn) == self.target_abs)
+                self._file_cache[fn] = matched
+            if not matched:
+                return None                      # 非本文件：不逐行跟踪（其耗时归调用行）
+            self._state[frame] = [None, time.perf_counter()]
+            return self._trace
+        if event == "line":
+            now = time.perf_counter()
+            st = self._state.get(frame)
+            if st is not None:
+                if st[0] is not None:
+                    rec = self.stats.setdefault(st[0], [0, 0.0])
+                    rec[0] += 1
+                    rec[1] += now - st[1]
+                st[0] = frame.f_lineno
+                st[1] = now
+            return self._trace
+        if event == "return":
+            now = time.perf_counter()
+            st = self._state.pop(frame, None)
+            if st is not None and st[0] is not None:
+                rec = self.stats.setdefault(st[0], [0, 0.0])
+                rec[0] += 1
+                rec[1] += now - st[1]
+            return self._trace
+        return self._trace
+
+    def __enter__(self):
+        sys.settrace(self._trace)
+        return self
+
+    def __exit__(self, *exc):
+        sys.settrace(None)
+        self.report()
+        return False
+
+    def report(self):
+        try:
+            with open(self.target_abs, "r", encoding="utf-8") as f:
+                src = f.readlines()
+        except Exception:
+            src = []
+        total = sum(t for _, t in self.stats.values())
+        print("\n" + "=" * 78)
+        print(f"[PROFILEMAIN] 逐行耗时 {os.path.basename(self.target_abs)}"
+              f"（总计 {total:.3f}s，仅列命中行）")
+        print("=" * 78)
+        print(f"{'行号':>5} | {'命中':>5} | {'耗时(s)':>10} | {'占比':>6} | 源码")
+        print("-" * 78)
+        for ln in sorted(self.stats):
+            hits, t = self.stats[ln]
+            pct = (100.0 * t / total) if total > 0 else 0.0
+            code = src[ln - 1].rstrip("\n") if 0 < ln <= len(src) else ""
+            print(f"{ln:>5} | {hits:>5} | {t:>10.4f} | {pct:>5.1f}% | {code.strip()}")
+        print("-" * 78)
+        top = sorted(self.stats.items(), key=lambda kv: -kv[1][1])[:10]
+        print("[PROFILEMAIN] 耗时 Top 10 行：")
+        for ln, (hits, t) in top:
+            code = src[ln - 1].rstrip("\n") if 0 < ln <= len(src) else ""
+            print(f"  L{ln:<4} {t:>9.4f}s  {code.strip()}")
+        print("=" * 78 + "\n")
 
 
 def _make_scene(args):
@@ -107,7 +194,7 @@ def obstacle_type2_demo_main(args):
     # if random.random() < 0.7:  # 70% 概率添加遮挡板
     #     scene.add_obstacle_type2()
     scene.add_obstacle_type2()
-    scene.plan_init_pose(include_obstacles=False, diagnostic=True)
+    scene.plan_init_pose_fast(include_obstacles=False, diagnostic=True)
     scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
 
     # # scene.plan_init_pose()
@@ -163,33 +250,35 @@ def obstacle_type1_demo_main(args):
     # # seg = replay("plan_joint_case.pkl")
 
     scene = _make_scene(args)
-    scene._set_cur_seam(89)#
+    scene._set_cur_seam(58)#
     scene.plan_init_pose_fast(verbose=True)
     scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    Open3DSceneVisualizer(scene).show_init_poses()
 
 
-    # scene.seam_ids_by_length()  89,39,58,92
-    fflag = scene.compute_pose_and_plan_path(hand="forehand")
-    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    bflag = scene.add_obstacle_type1(link='Link3', 
-                             hand='forehand', 
-                             index=0, 
-                             entry_index=0,
-                             otype='pipe')
-    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+    # # # scene.seam_ids_by_length()  89,39,58,92
+    # # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    # fflag = scene.compute_pose_and_plan_path(hand="forehand")
+    # # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    # # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    # bflag = scene.add_obstacle_type1(link='Link3', 
+    #                          hand='forehand', 
+    #                          index=0, 
+    #                          entry_index=0,
+    #                          otype='plate')
+    # # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    # # # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
     # fflag = scene.compute_pose_and_plan_path(hand="forehand")
     # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    # print(1)
+    # # print(1)
 
 
     scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
     # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
     Open3DSceneVisualizer(scene).show_init_poses()
-    # Open3DSceneVisualizer(scene).show_joint_table_ee()ccc
+    # Open3DSceneVisualizer(scene).show_joint_table_ee()
 
     # # Open3DSceneVisualizer(scene).show_init_poses_debug(4, sort_by_seam_x=True)
     # # Open3DSceneVisualizer(scene).show_goal_pose_collision("backhand", 0)
@@ -222,8 +311,13 @@ def main():
     # demo_init_pose(args)
     # demo_init_poses(args)   # 多候选初始位姿同屏铺网格（先另进程 plan_init_pose + save）
 
-    obstacle_type1_demo_main(args)
-    # obstacle_type2_demo_main(args)
+    demo = obstacle_type1_demo_main
+    # demo = obstacle_type2_demo_main
+    if _PROFILE_MAIN:
+        with _LineProfiler(__file__):       # PROFILEMAIN=1：逐行计时（含各行调用的耗时）
+            demo(args)
+    else:
+        demo(args)
 
 if __name__ == "__main__":
     main()

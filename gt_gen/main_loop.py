@@ -16,7 +16,14 @@
 """
 from __future__ import annotations
 
+import os
+import time
+
 import numpy as np
+
+# PROFILEMAIN=1 时在 generate_gt 主循环内按步累计耗时（sync/直达/P*/NBV/move/observe/empty_cache），
+# 循环结束打印每步总耗时——用于定位主循环内的瓶颈步骤。
+_PROFILEMAIN = os.environ.get("PROFILEMAIN") == "1"
 
 
 # ---------------- 私有辅助 ----------------
@@ -787,8 +794,26 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
 
     # 准备阶段：冷启动补拍一次（首次更新占用）
     # _debug_viz_observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth, "before")  # 拍前
+    _prof = {} if _PROFILEMAIN else None      # step -> 累计秒；PROFILEMAIN=1 时启用
+
+    def _tick(key, t0):
+        if _prof is not None:
+            _prof[key] = _prof.get(key, 0.0) + (time.perf_counter() - t0)
+
+    def _emit_prof():
+        if _prof is None:
+            return
+        tot = sum(_prof.values())
+        rounds = info.get("rounds", 0) or 0
+        print(f"[PROFILEMAIN][generate_gt] 主循环分步耗时（{rounds} 轮，合计 {tot:.3f}s）：")
+        for k, v in sorted(_prof.items(), key=lambda kv: -kv[1]):
+            per = v / rounds if rounds else 0.0
+            print(f"    {k:<16} {v:>8.3f}s  {100.0 * v / tot if tot else 0:>5.1f}%  (每轮 {per * 1000:>6.1f}ms)")
+
+    _t = time.perf_counter()
     _observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth)
-    _debug_viz_observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth, "after")   # 拍后
+    _tick("observe", _t)
+    # _debug_viz_observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth, "after")   # 拍后
 
     info = {"rounds": 0, "n_B": [], "free": [], "status_seq": [], "P_len": None}
     free_prev = voxmap.counts()[FREE]
@@ -797,18 +822,25 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
     status = "max_rounds"
 
     for rnd in range(max_rounds):
+        _t = time.perf_counter()
         torch.cuda.empty_cache()
+        _tick("empty_cache", _t)
         # _debug_viz_voxmap(voxmap, h_truth, cur_cfg, truth_scene, every_n_layers=4)                     # voxmap 三态（sync 输入，不随 sync 变）
         # _debug_viz_curobo(h_expl, voxmap, h_truth, cur_cfg, truth_scene, "before", every_n_layers=10)   # sync 前：cuRobo 占据应空
+        _t = time.perf_counter()
         sync_collision_world(h_expl, voxmap)                 # 步0：最新「非 FREE」→ h_expl 障碍场
+        _tick("sync_world", _t)
         # _debug_viz_curobo(h_expl, voxmap, h_truth, cur_cfg, truth_scene, "after", every_n_layers=10)    # sync 后：仅圆柱留洞
 
         # 步①：试在已确认自由区直接规划到 goal（h_expl，UNKNOWN 已当障碍）
         if cfg.planner_backend == "stomp":
             # STOMP：把当前 voxmap 非 FREE 区转 mesh；goal_cfg 给定→直接规划到目标关节角，否则规划到 goal 位姿。
             from gt_gen import stomp_iface as si
+            _t = time.perf_counter()
             _w1, _ck1 = si.world_from_voxmap_auto(cfg, voxmap)
+            _tick("step1_world", _t)
             # _debug_viz_w1(_w1, h_expl, voxmap, cur_cfg, truth_scene, goal_pose, rnd=rnd)  # 看 _w1（mesh/cuboid）+ 当前整臂（每轮弹窗；只看首轮改 if rnd==0）
+            _t = time.perf_counter()
             if goal_cfg is not None:
                 # from gt_gen.repro_plan_joint import dump_inputs; dump_inputs("plan_joint_case.pkl", cfg, _w1, cur_cfg, goal_cfg, _ck1)  # 落盘复现用
                 seg = si.plan_joint_single(cfg, _w1, cur_cfg, goal_cfg, checker_type=_ck1)
@@ -816,10 +848,13 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 # dump_inputs("plan_joint_case.pkl", cfg, _w1, cur_cfg, goal_cfg, _ck1)
             else:
                 seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
+            _tick("step1_direct", _t)
             reached_direct = seg is not None
         else:
+            _t = time.perf_counter()
             res = ci.plan_to_pose(h_expl, cur_cfg, goal_pose,
                                   max_attempts=cfg.plan_max_attempts, pose_cost_metric=metric)
+            _tick("step1_direct", _t)
             reached_direct = res is not None and bool(res.success.item())
             seg = (res.get_interpolated_plan().position.detach().cpu().numpy()
                    if reached_direct else None)
@@ -836,6 +871,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             break
 
         # 步②：真值上的全知最优路 P*（挡住的只可能是 UNKNOWN）；h_plan 的障碍已含 buffer（若调用方传入）。
+        _t = time.perf_counter()
         if rnd == 0 and p_star_init is not None:
             # 第一轮：直接用 --scene 里 place_obstacles 已成功规划好的绕行轨迹当 P*，不重新规划。
             # （同一 3D 空间 + 同起点 retract，但这里 plan 会随机失败/位姿略差；全知阶段那条已验证可行。）
@@ -863,6 +899,8 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     status = "infeasible"
                     info["observe"] = np.asarray(OBS, dtype=np.int64)
                     info["goal"] = np.asarray(GOAL_FLAG, dtype=np.int64)
+                    _tick("step2_pstar", _t)
+                    _emit_prof()
                     return np.asarray(GT, dtype=np.float64), status, info
         else:
             # 改走 plan_to_pose_all（= place_obstacles.detour_exists 那条成功路径）：对多条 IK 分支逐个 plan，
@@ -881,12 +919,15 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     print(f"[step② P*失败 R{rnd}] IK 有 {len(_cands)} 解但 plan 全失败 → "
                           f"{ci.explain_endpoints(h_plan, cur_cfg, _cands[0][0])}")
         # _debug_viz_pstar(h_truth, voxmap, cur_cfg, P, truth_scene, goal_pose, rnd=rnd)  # 看真值最优路 P*（注释此行可关）
+        _tick("step2_pstar", _t)
         # 步③④：一轮特权 NBV（P* → reach_pt/B → 候选 → 假设性 raycast 打分 → argmax）
+        _t = time.perf_counter()
         r, r_list = best_next_view_using_oracle(h_truth, cur_cfg, voxmap, truth_scene, goal_pose,
                                         params=params, camera_model=camera_model,
                                         pose_cost_metric=metric, p_star=P)
+        _tick("nbv", _t)
         # _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, r_list, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
-        _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
+        # _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
         info["status_seq"].append(r.status)
         info["n_B"].append(int(r.n_B))#r.n_B:本轮阻塞段B的体素个数
         if P is not None and info["P_len"] is None:
@@ -899,8 +940,10 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             break
         elif r.status == "ok":                               # 正常探索一步
             for cand_idx, cand in enumerate(r_list):                              # 按 score 降序逐个试，第一个能走通(seg 非 None)的就用
+                _t = time.perf_counter()
                 seg, seg_obs = _move_to(h_expl, voxmap, cur_cfg, cand.cfg, camera_model, truth_scene,
                                         max_depth, every_n=every_n)
+                _tick("move", _t)
                 if seg is not None:
                     # _debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)  # 收尾段 seg 路径
                     # _dump_seg_isaacsim(cur_cfg, seg, rnd=rnd)    # 同段落盘（isaacsim 回放：工件+障碍+臂，无 voxmap）
@@ -918,10 +961,13 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             status = "infeasible"
             info["observe"] = np.asarray(OBS, dtype=np.int64)
             info["goal"] = np.asarray(GOAL_FLAG, dtype=np.int64)
+            _emit_prof()
             return np.asarray(GT, dtype=np.float64), status, info
         elif r.status == "no_reachable_candidate":            # B 遮死/够不着 → 就近揭示兜底
+            _t = time.perf_counter()
             prog, new_cfg, seg, seg_obs = handle_stuck(h_truth, h_expl, voxmap, cur_cfg,
                                               camera_model, truth_scene, max_depth, every_n=every_n)
+            _tick("stuck", _t)
             if prog and seg is not None:
                 GT.extend(seg)
                 OBS.extend(seg_obs.tolist())
@@ -929,7 +975,9 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 cur_cfg = new_cfg
 
         # 步⑥：终点补拍（_move_to 沿途已拍；对未移动/兜底失败的轮次再确保当前构型有观测）
+        _t = time.perf_counter()
         _observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth)
+        _tick("observe", _t)
         OBS[-1] = 1
 
         # 步⑦：进展判定（free 或 reach 增长 = 有进展；连续 stuck_rounds 轮无进展 → 卡死）
@@ -951,4 +999,5 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
 
     info["observe"] = np.asarray(OBS, dtype=np.int64)
     info["goal"] = np.asarray(GOAL_FLAG, dtype=np.int64)
+    _emit_prof()
     return np.asarray(GT, dtype=np.float64), status, info

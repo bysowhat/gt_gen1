@@ -21,10 +21,14 @@ T_cam_ee 与构型无关，用任一构型 FK 一次性求出（ee 位姿 + Link
 """
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
+
+_PROFILEMAIN = os.environ.get("PROFILEMAIN") == "1"
 
 
 @dataclass
@@ -298,33 +302,62 @@ def generate_candidates(handle, voxmap, B, camera_model, cur_cfg,
         print(f"[wrap/candidate][warn] 取关节限位失败，跳过目标 2π 归一：{e}")
         jl = None
     out: List[Candidate] = []
+    # ── 阶段1：枚举全部 (目标点 T × 相机位姿) → 末端 ee 目标（眼在手换算），记住每个 job 属于哪个 T。
+    #    保持 targets × standoff 的原有嵌套顺序，使候选输出顺序与逐位姿版一致。
+    _t = time.perf_counter() if _PROFILEMAIN else 0.0
+    jobs = []                                                 # [(T, (ee_pos, ee_quat)), ...]
     for T in targets:
         for cam_pose in standoff_poses_looking_at(T, voxmap, camera_model, anchor=anchor,
                                                   standoff_d=standoff_d, n_view_dirs=n_view_dirs):
             T_base_ee = cam_pose @ T_cam_ee                   # 眼在手：相机位姿 → ee_link 位姿
             ee_pos = T_base_ee[:3, 3]
             ee_quat = _R_to_quat_wxyz(T_base_ee[:3, :3])
-            ik = ci.solve_ik(handle, (ee_pos, ee_quat), return_seeds=handle.config.ik_num_seeds)
-            cfgs = ci.ik_configs(handle, ik)[:ik_per_pose]
-            for cfg, perr in cfgs:
-                # IK 解可能落在「巻绕远支」（某旋转关节差 2π），先归一到离 cur_cfg 最近的等价支：
-                # 物理位姿不变(±2π 同姿态)，但避免它被存为候选 / 当下一步起点时逼出整圈退绕
-                # （否则如 J3=6.2776 这类目标会让后续从该支出发的规划被迫扫 ~288° 而中途碰撞，见 joint_wrap）。
-                # 归一在②看向校验/③可达性/存储之前完成，使这三步与 plan_to_config 实际规划的分支一致。
-                if jl is not None:
-                    cfg = wrap_goal_near_start(cur_cfg, cfg, jl[0], jl[1], tag="wrap/candidate", verbose=False)
-                # ② 看向校验：实际相机光轴 vs (T - 相机位置) 的夹角
-                Tc = camera_pose_from_config(handle, cfg, camera_model)
-                axis = Tc[:3, 2]
-                look = _normalize(T - Tc[:3, 3])
-                look_deg = float(np.degrees(np.arccos(np.clip(np.dot(axis, look), -1, 1))))
-                if look_deg > max_look_deg:
-                    continue
-                # _debug_viz_candidate(handle, voxmap, cur_cfg, cfg, B)  # 看 cur_cfg/候选整臂 + voxmap(FREE/OCC) + B（去注释开窗）
-                # ③ 保守可达：当前构型 → 候选，整臂扫掠 ⊆ FREE
-                ok, _ = motion_stays_in_free(handle, voxmap, cur_cfg, cfg)
-                if not ok:
-                    continue
-                out.append(Candidate(config=list(cfg), cam_pose=Tc, target=np.asarray(T, float),
-                                     ik_pos_err=float(perr), look_err_deg=look_deg))
+            jobs.append((np.asarray(T, float), (ee_pos, ee_quat)))
+    _t_enum = (time.perf_counter() - _t) if _PROFILEMAIN else 0.0
+    if not jobs:
+        return out
+
+    # ── 阶段2：一把【分块批量】IK 替代逐位姿 solve_ik（本步主瓶颈：原来 N 次串行 GPU 调用）。
+    #    return_seeds 取小值——下游每位姿只用前 ik_per_pose 个解，返回 200 个纯浪费拷回；
+    #    num_seeds 仍用 IKSolver 建时的值(200)，每问题搜索质量不变。chunk×num_seeds 控峰值显存。
+    _t = time.perf_counter() if _PROFILEMAIN else 0.0
+    ik_return = max(int(nbv.get("ik_return_seeds", 8)), ik_per_pose)
+    ik_chunk = int(nbv.get("ik_batch", 16))
+    per_pose_cfgs = ci.solve_ik_batch_configs(
+        handle, [j[1] for j in jobs], return_seeds=ik_return, chunk=ik_chunk)
+    _t_ik = (time.perf_counter() - _t) if _PROFILEMAIN else 0.0
+
+    # ── 阶段3：逐位姿取前 ik_per_pose 个解 → 2π 归一 → 看向校验 → 保守可达性过滤（与原逐位姿逻辑逐字一致）
+    _t = time.perf_counter() if _PROFILEMAIN else 0.0
+    _n_look_fail = _n_reach_fail = _n_msif = 0
+    for (T, _ee), cfgs in zip(jobs, per_pose_cfgs):
+        for cfg, perr in cfgs[:ik_per_pose]:
+            # IK 解可能落在「巻绕远支」（某旋转关节差 2π），先归一到离 cur_cfg 最近的等价支：
+            # 物理位姿不变(±2π 同姿态)，但避免它被存为候选 / 当下一步起点时逼出整圈退绕
+            # （否则如 J3=6.2776 这类目标会让后续从该支出发的规划被迫扫 ~288° 而中途碰撞，见 joint_wrap）。
+            # 归一在②看向校验/③可达性/存储之前完成，使这三步与 plan_to_config 实际规划的分支一致。
+            if jl is not None:
+                cfg = wrap_goal_near_start(cur_cfg, cfg, jl[0], jl[1], tag="wrap/candidate", verbose=False)
+            # ② 看向校验：实际相机光轴 vs (T - 相机位置) 的夹角
+            Tc = camera_pose_from_config(handle, cfg, camera_model)
+            axis = Tc[:3, 2]
+            look = _normalize(T - Tc[:3, 3])
+            look_deg = float(np.degrees(np.arccos(np.clip(np.dot(axis, look), -1, 1))))
+            if look_deg > max_look_deg:
+                _n_look_fail += 1
+                continue
+            # _debug_viz_candidate(handle, voxmap, cur_cfg, cfg, B)  # 看 cur_cfg/候选整臂 + voxmap(FREE/OCC) + B（去注释开窗）
+            # ③ 保守可达：当前构型 → 候选，整臂扫掠 ⊆ FREE
+            _n_msif += 1
+            ok, _ = motion_stays_in_free(handle, voxmap, cur_cfg, cfg)
+            if not ok:
+                _n_reach_fail += 1
+                continue
+            out.append(Candidate(config=list(cfg), cam_pose=Tc, target=np.asarray(T, float),
+                                 ik_pos_err=float(perr), look_err_deg=look_deg))
+    if _PROFILEMAIN:
+        _t_filt = time.perf_counter() - _t
+        print(f"[PROFILEMAIN][candgen] enum={_t_enum:.3f}s ik={_t_ik:.3f}s filt={_t_filt:.3f}s "
+              f"| poses={len(jobs)} 出候选={len(out)} look丢={_n_look_fail} "
+              f"扫掠检查={_n_msif}(丢{_n_reach_fail}) filt每次扫掠={_t_filt / max(1, _n_msif) * 1000:.1f}ms")
     return out

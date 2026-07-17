@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -26,6 +27,10 @@ import numpy as np
 from gt_gen.config import Config, load_config, PROJECT_ROOT
 
 _SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "scripts")
+
+# PROFILEMAIN=1 时打印重型环节（plan_init_pose_fast / _build_explore_world / generate_gt）的分段耗时，
+# 用于把 demo_scene 逐行 profiler 里的大头（compute_pose_and_plan_path 等）进一步拆开定位瓶颈。
+_PROFILEMAIN = os.environ.get("PROFILEMAIN") == "1"
 
 
 class Ctx(dict):
@@ -575,10 +580,11 @@ class Scene:
         整臂碰撞**，纯几何摆放，故极快（复用 scripts/plan_init_pose.py 的 _fast_build_ctx / _fast_solve_weld）：
           ① 放平：lay_flat（与 plan_init_pose 同一份放平逻辑，长轴→+X、贴 z=0、90°整倍旋转）；
           ② 朝向：保持放平的 8 种 = {绕竖直 Z 0/90/180/270} × {沿长轴翻面 0/180}（工件始终躺平）；
-          ③ 平移：焊缝中点在 (plan_init_pose_fast.ee_xy_range_m 径向环 × ee_z_range_m) 内，按 xy_step_m /
-             z_step_m 网格采样，平移工件使中点恰落每个网格点；
-          ④ 过滤（严格 4 条）：两端点都在范围 → 底座-工件 XY 投影不相交 → 工件+障碍 vs init_free 无交集
-             → 轻去重(同朝向 + 2cm 同位)。**不做**「正面 / 焊缝中心 base-x>0」过滤。
+          ③ 平移：采样锚点在 (plan_init_pose_fast.ee_xy_range_m 径向环 × ee_z_range_m) 内，按 xy_step_m /
+             z_step_m 网格采样，平移工件使锚点恰落每个网格点（锚点=横缝取焊缝中点/竖缝取较低端点，
+             竖缝阈值：两端 base-z 高度差 ≥0.1m；seam_center_base 始终为真实焊缝中点）；
+          ④ 过滤（严格 4 条）：端点在范围(横缝两端/竖缝仅较低端) → 底座-工件 XY 投影不相交 →
+             工件+障碍 vs init_free 无交集 → 轻去重(同朝向 + 2cm 同位)。**不做**「正面 / 焊缝中心 base-x>0」过滤。
         配置全部读 default.yaml 的 plan_init_pose_fast 段。
 
         **避障**：include_obstacles=True（默认）且 self.obstacles 非空时，把已放障碍体素化成点云，
@@ -596,9 +602,11 @@ class Scene:
         pim = _load_plan_init_pose()
 
         # —— 工件级几何 ctx：按工件复用（放平朝向/底座圆/mesh/点集，无 solver/ESDF/joint 表，构建也很轻） ——
+        _t0 = time.perf_counter()
         if rebuild or self._fastctx is None or self._fastctx_key != self.workpiece_obj:
             self._fastctx = pim._fast_build_ctx(self.workpiece_obj)
             self._fastctx_key = self.workpiece_obj
+        _t_build = time.perf_counter()
 
         # —— 障碍点云（mesh 局部系，与工件同框、同 T）：仅供「工件+障碍 vs init_free 无交集」过滤 ——
         #   每次都重设（含 None），避免上一条焊缝的障碍点残留。
@@ -617,6 +625,9 @@ class Scene:
 
         res, _prof, debug_steps, prefilter_steps = pim._fast_solve_weld(
             self._fastctx, self.seam, verbose=verbose)
+        if _PROFILEMAIN:
+            print(f"[PROFILEMAIN][plan_init_pose_fast] _fast_build_ctx={_t_build - _t0:.3f}s "
+                  f"_fast_solve_weld={time.perf_counter() - _t_build:.3f}s")
         self.init_pose_debug_steps[self.seam_id] = debug_steps
         self.init_pose_prefilter_steps[self.seam_id] = prefilter_steps
 
@@ -1143,7 +1154,7 @@ class Scene:
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
 
-            # self.save('/media/a/新加卷/tempt/4/scene1.pkl')
+            # self.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
             jt = res["joints"]
             joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
@@ -1153,7 +1164,11 @@ class Scene:
             variant_list = [0]
 
             # 静态探索世界（工件+障碍摆放）只随 init pose 变，整批 variant 共用一套（省重型 handle）
+            _t0 = time.perf_counter()
             ctx = self._build_explore_world(include_obstacles=include_obstacles, device=device)
+            if _PROFILEMAIN:
+                print(f"[PROFILEMAIN][compute_pose_and_plan_path] _build_explore_world 总"
+                      f"={time.perf_counter() - _t0:.3f}s（init#{init_pose_idx}）")
 
             for variant in variant_list:
                 vm = self._fresh_explore_voxmap(ctx)     # 每个 variant 重置探索状态，互不串扰
@@ -1274,9 +1289,13 @@ class Scene:
 
         # world_plan=world：backend=stomp 时步② 规划 P* 需要 MESH 世界（真实尺寸，无 buffer）
         # goal_pose=None + goal_cfg=goal_joints：以关节角为目标（见 place_obstacles_to_gt2）
+        _t0 = time.perf_counter()
         GT, status, info = generate_gt(h_truth, h_expl, vm, truth_scene, None,
                                        camera_model=cam, world_plan=world,
                                        goal_cfg=goal_joints, start_cfg=start)
+        if _PROFILEMAIN:
+            print(f"[PROFILEMAIN][generate_gt] pose#{gi} 主循环={time.perf_counter() - _t0:.3f}s "
+                  f"status={status} rounds={info.get('rounds')}")
 
         positions = np.asarray([np.asarray(q, float) for q in GT])
         observe = np.asarray(info.get("observe", []), dtype=np.int64).reshape(-1, 1)
@@ -1341,11 +1360,16 @@ class Scene:
         world = WorldConfig(mesh=meshes)                 # MESH 真值世界（工件+障碍），兼作步② world_plan
 
         print(f"[scene] _build_explore_world：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
+        _t0 = time.perf_counter()
         h_truth = ci.init_curobo(self.cfg, world_model=world,
                                  collision_checker_type=CollisionCheckerType.MESH,
                                  position_threshold=0.05, rotation_threshold=0.5)
+        _t_truth = time.perf_counter()
         print("[scene] _build_explore_world：建 h_expl（VOXEL 三态）...")
         h_expl = ci.init_curobo(self.cfg)
+        if _PROFILEMAIN:
+            print(f"[PROFILEMAIN][_build_explore_world] h_truth(MESH)={_t_truth - _t0:.3f}s "
+                  f"h_expl(VOXEL)={time.perf_counter() - _t_truth:.3f}s")
 
         # truth_scene（base 系 trimesh）：工件 + 障碍（同一 T 变到 base 系）
         work_mesh = load_truth_scene(self.workpiece_obj, mesh_pose=wp_pose7)

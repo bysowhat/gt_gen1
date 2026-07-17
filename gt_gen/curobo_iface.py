@@ -258,6 +258,58 @@ def ik_configs(handle: CuroboHandle, ik_result):
     return out
 
 
+def solve_ik_batch_configs(handle: CuroboHandle, poses, return_seeds: Optional[int] = None,
+                           num_seeds: Optional[int] = None, chunk: int = 16,
+                           pose_cost_metric=None):
+    """批量求解【多个位姿】的 IK，返回每个位姿的 [(cfg_list, pos_err), ...]（按位置误差升序，仅含成功解）。
+
+    语义等价于「对每个位姿各调一次 solve_ik + ik_configs」，只是把 N 个问题分块塞进一次
+    `IKSolver.solve_batch`，省掉 N 次 kernel 启动 / Python 往返（这是 NBV generate_candidates 的
+    主瓶颈）。IK 本身有随机种子，逐位一致不做保证（与逐个 solve_ik 同）。
+
+    poses          : [(pos3, quat_wxyz4), ...]（base 系末端目标）。
+    return_seeds   : 每问题取回的解数（None→config.ik_return_seeds）。调用方通常只取前几，取小些省拷回。
+    num_seeds      : 每问题并行优化的随机起点数（None→用 IKSolver 建时的 num_seeds，搜索质量不变）。
+    chunk          : 每次 solve_batch 的问题数上限——峰值显存≈chunk×num_seeds，太大 OOM（默认 16）。
+    pose_cost_metric: 可选 PoseCostMetric（用完即复位，语义同 solve_ik）。
+    返回长度 = len(poses) 的列表；第 i 项为第 i 个位姿的 [(cfg_list, pos_err), ...]（可空）。
+    """
+    from curobo.types.math import Pose
+    n = len(poses)
+    if n == 0:
+        return []
+    if return_seeds is None:
+        return_seeds = handle.config.ik_return_seeds
+    dof = len(handle.joint_names)
+    pos_all = np.asarray([list(p[0]) for p in poses], dtype=np.float32).reshape(n, 3)
+    quat_all = np.asarray([list(p[1]) for p in poses], dtype=np.float32).reshape(n, 4)
+
+    if pose_cost_metric is not None:
+        handle.ik.update_pose_cost_metric(pose_cost_metric)
+    out: List[list] = []
+    try:
+        for c0 in range(0, n, chunk):
+            c1 = min(c0 + chunk, n)
+            pose = Pose(
+                position=handle.ta.to_device(pos_all[c0:c1]).view(-1, 3),
+                quaternion=handle.ta.to_device(quat_all[c0:c1]).view(-1, 4),
+            )
+            res = handle.ik.solve_batch(pose, return_seeds=return_seeds, num_seeds=num_seeds)
+            B = c1 - c0
+            sol = res.solution.reshape(B, -1, dof).detach().cpu().numpy()
+            errs = res.position_error.reshape(B, -1).detach().cpu().numpy()
+            succ = res.success.reshape(B, -1).detach().cpu().numpy().astype(bool)
+            R = sol.shape[1]
+            for b in range(B):
+                rows = [(sol[b, i].tolist(), float(errs[b, i])) for i in range(R) if succ[b, i]]
+                rows.sort(key=lambda x: x[1])
+                out.append(rows)
+    finally:
+        if pose_cost_metric is not None:
+            _reset_ik_metric(handle)
+    return out
+
+
 def ik_best_config(handle: CuroboHandle, ik_result):
     """从 IKResult 取位置误差最小的成功解；不成功返回 None。"""
     cs = ik_configs(handle, ik_result)

@@ -11,10 +11,14 @@ B 多少（gain），减去路径代价得 score，argmax 选出下一视点。
 """
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+
+_PROFILEMAIN = os.environ.get("PROFILEMAIN") == "1"
 
 
 @dataclass
@@ -59,12 +63,67 @@ def raycast_reveal(voxmap, camera_pose, camera_model, truth_scene,
 
 
 def _count_intersection(reveal, B) -> int:
-    """|reveal ∩ B|：两组体素下标 (·,3) 的交集大小（B 通常较小，做成 set 查）。"""
+    """|reveal ∩ B|：两组体素下标 (·,3) 的交集大小。
+
+    向量化：把 3 轴整数下标按各轴 max+1 混合基编码成一维 key，再用 np.isin 求交（等价于原
+    Python set 逐 tuple 遍历，但省掉上万次 tuple 创建/哈希——这是打分循环的热点之一）。
+    """
+    reveal = np.asarray(reveal)
     B = np.asarray(B)
     if reveal.shape[0] == 0 or B.shape[0] == 0:
         return 0
-    Bset = set(map(tuple, B))
-    return int(sum(1 for r in map(tuple, reveal) if r in Bset))
+    reveal = reveal.reshape(-1, 3).astype(np.int64)
+    B = B.reshape(-1, 3).astype(np.int64)
+    m = np.maximum(reveal.max(axis=0), B.max(axis=0)) + 1        # 各轴基数（下标均为界内非负整数）
+    mul = np.array([m[1] * m[2], m[2], 1], dtype=np.int64)
+    rk = reveal @ mul
+    bk = B @ mul
+    return int(np.isin(rk, bk).sum())
+
+
+def _gun_costs_batched(handle, cur_cfg, cand_cfgs):
+    """一次 FK 批量算【全体候选】的焊枪(xiaoyu_accessory_link)平移/朝向代价，返回 (trans[N], angle[N]) 原始值(未乘 λ)。
+
+    语义与逐候选 _gun_translation_cost / _gun_rotation_cost 完全一致（平移=按碰撞球半径加权的球心
+    位移均值 m；朝向=该 link 四元数测地角 rad），只是把 N 次 get_state（各带 GPU→CPU 同步）合成 1 次。
+    取不到球掩码时该项退回关节空间位移；取不到 link 位姿时朝向代价为 0（均与逐候选版一致）。
+    """
+    import torch
+    from gt_gen.swept import link_sphere_mask
+
+    N = len(cand_cfgs)
+    if N == 0:
+        return np.zeros(0), np.zeros(0)
+    qs = np.asarray([list(cur_cfg)] + [list(c) for c in cand_cfgs], dtype=np.float32)  # (N+1,dof)
+    qt = torch.as_tensor(qs, device=handle.ta.device)
+    st = handle.mg.kinematics.get_state(qt)
+
+    # --- 平移代价：xiaoyu_accessory_link 碰撞球心位移，按半径加权均值(m) ---
+    mask = link_sphere_mask(handle, "xiaoyu_accessory_link")
+    if mask is None or not bool(np.any(mask)):
+        trans = np.linalg.norm(qs[1:] - qs[0][None], axis=1)                 # 退回关节空间位移
+    else:
+        sph = st.link_spheres_tensor.detach().cpu().numpy()                  # (N+1,S,4) xyz+r
+        cur_c = sph[0, mask, :3]                                             # (Sm,3)
+        cand_c = sph[1:, mask, :3]                                           # (N,Sm,3)
+        radii = sph[0, mask, 3]                                              # (Sm,)
+        disp = np.linalg.norm(cand_c - cur_c[None], axis=2)                  # (N,Sm)
+        r_max = float(radii.max())
+        if r_max <= 0.0:
+            trans = disp.mean(axis=1)
+        else:
+            w = radii / r_max
+            trans = (w[None] * disp).sum(axis=1) / w.sum()
+
+    # --- 朝向代价：xiaoyu_accessory_link 四元数测地角(rad) ---
+    lp = st.link_pose.get("xiaoyu_accessory_link") if hasattr(st.link_pose, "get") else None
+    if lp is None:
+        angle = np.zeros(N)
+    else:
+        q = lp.quaternion.detach().cpu().numpy()                            # (N+1,4) wxyz
+        dot = np.clip(np.abs((q[1:] * q[0][None]).sum(axis=1)), 0.0, 1.0)
+        angle = 2.0 * np.arccos(dot)
+    return np.asarray(trans, float), np.asarray(angle, float)
 
 
 def _gun_translation_cost(handle, cur_cfg, cand_cfg) -> float:
@@ -270,9 +329,11 @@ def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
         return NBVResult("scene_infeasible"), []
 
     # 2) 沿 P* 求 reach_pt，取前方 k 段的 UNKNOWN = 阻塞段 B
+    _t = time.perf_counter() if _PROFILEMAIN else 0.0
     reach_idx = compute_reach_pt(handle, voxmap, P)
     # _debug_viz_voxmap(handle, voxmap, P, reach_idx, truth_scene)        # 看 voxmap 三态 + reach 整臂（注释此行可关）
     B = compute_blocking_B(handle, voxmap, P, reach_idx, k)
+    _t_reachB = (time.perf_counter() - _t) if _PROFILEMAIN else 0.0
     # _debug_viz_B(handle, voxmap, P, reach_idx, B, truth_scene)          # 看阻塞段 B（橙）（注释此行可关）
     if B.shape[0] == 0:
         '''
@@ -284,18 +345,39 @@ def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
         return NBVResult("corridor_confirmed", reach_idx=reach_idx, P_star=P), []
 
     # 3) 朝 B 生成"自由区内可达"的候选
+    _t = time.perf_counter() if _PROFILEMAIN else 0.0
     cands = generate_candidates(handle, voxmap, B, camera_model, cur_cfg)
+    _t_cand = (time.perf_counter() - _t) if _PROFILEMAIN else 0.0
     # _debug_viz_all_candidates(handle, voxmap, cands, B, truth_scene, camera_model, cur_cfg)  # 看全部候选视点（去注释开窗）
     if not cands:
+        if _PROFILEMAIN:
+            print(f"[PROFILEMAIN][nbv] reach+B={_t_reachB:.3f}s candgen={_t_cand:.3f}s "
+                  f"score=0.000s | n_B={int(B.shape[0])} n_cands=0")
         return NBVResult("no_reachable_candidate", reach_idx=reach_idx, n_B=int(B.shape[0]), P_star=P), []
 
     # 4) 假设性 raycast 打分，按 score 降序排列所有候选
-    scored = []                                                    # (score, gain, cand)
-    for c in cands:
-        gain, score, _, trans_cost, angle_cost = score_candidate(voxmap, c, B, truth_scene, camera_model, cur_cfg, handle,
-                                          lambda_cost=lam, lambda_angle=lam_ang)
+    _t = time.perf_counter() if _PROFILEMAIN else 0.0
+    # 焊枪平移/朝向代价：全体候选一次批量 FK（替代每候选 2 次带同步的 FK）
+    trans_all, angle_all = _gun_costs_batched(handle, cur_cfg, [c.config for c in cands])
+    _t_cost = (time.perf_counter() - _t) if _PROFILEMAIN else 0.0
+    _t2 = time.perf_counter() if _PROFILEMAIN else 0.0
+    scored = []                                                    # (score, gain, cand, trans, angle)
+    for i, c in enumerate(cands):
+        # 假设性 raycast 仍逐视点算（各候选相机位姿不同）；gain=|reveal∩B|（已向量化）
+        reveal = raycast_reveal(voxmap, c.cam_pose, camera_model, truth_scene, max_depth=None)
+        gain = _count_intersection(reveal, B)
+        trans_cost = float(lam) * float(trans_all[i])
+        angle_cost = float(lam_ang) * float(angle_all[i])
+        score = float(gain) - trans_cost - angle_cost
         scored.append((float(score), float(gain), c, trans_cost, angle_cost))
     scored.sort(key=lambda x: x[0], reverse=True)
+    if _PROFILEMAIN:
+        _t_score = time.perf_counter() - _t
+        _t_ray = time.perf_counter() - _t2
+        print(f"[PROFILEMAIN][nbv] reach+B={_t_reachB:.3f}s candgen={_t_cand:.3f}s "
+              f"score={_t_score:.3f}s(cost批量={_t_cost:.3f}s raycast+gain={_t_ray:.3f}s) "
+              f"| n_B={int(B.shape[0])} n_cands={len(cands)} "
+              f"(raycast/候选={_t_ray / max(1, len(cands)) * 1000:.1f}ms)")
 
     ranked = [NBVResult("ok", cfg=list(c.config), cam_pose=c.cam_pose, target=c.target,
                         gain=gain, trans_cost=trans_cost, angle_cost=angle_cost, score=score, reach_idx=reach_idx,

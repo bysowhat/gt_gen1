@@ -177,7 +177,7 @@ plan_init_pose_fast:                    # 快速几何版初始位姿求解（sc
   # 不做 IK / 可达性 / 整臂碰撞，纯几何摆放：lay_flat 放平 → 保持放平的 8 种 90°朝向 → 焊缝中点在
   # (ee_xy_range 径向环 × ee_z_range) 内按 xy_step/z_step 网格采样平移 → 4 条过滤（两端点在范围 /
   # 底座-工件 XY 不相交 / 工件+障碍 vs init_free 无交集 / 轻去重）。返回格式与 plan_init_pose 一致。
-  ee_xy_range_m: [0.4, 1.7]             # 焊缝点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
+  ee_xy_range_m: [0.4, 1.0]             # 焊缝点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
   ee_z_range_m: [-0.1, 0.1]             # 焊缝点在 base_link 系 z [下限,上限]（米）
   xy_step_m: 0.20                       # 平移网格 xy 步长（米）：焊缝中点在 xy 平面按此步长采样
   z_step_m: 0.08                        # 平移网格 z 步长（米）：焊缝中点在 z 方向按此步长采样
@@ -303,6 +303,8 @@ params:
     standoff_d_m: [0.55, 0.85, 1.05]    # 站位距离档（Step 8）
     n_view_dirs: 32                      # 每档观察方向数（Step 8）
     max_look_deg: 20                    # 候选看向校验：相机光轴对准 T 的最大夹角°（Step 8，兜 cuRobo 朝向阈值偏松）
+    ik_return_seeds: 8                   # 候选生成批量 IK 每个位姿取回的解数（Step 8）：下游只用前 ik_per_pose(=2)，取小省 GPU→CPU 拷回
+    ik_batch: 24                        # 候选生成批量 IK 的分块大小：一次 solve_batch 送几个位姿——峰值显存≈ik_batch×planner.ik_num_seeds(200)，太大 OOM
     cluster:                            # 阻塞段 B 聚类（Step 8，scipy 层次聚类 linkage+fcluster）
       max: 3                            # 最多簇数（超出则保留最大的簇心 + 全部点重指派到最近簇心覆盖）
       link_dist_m: 0.15                 # 距离阈值（fcluster criterion='distance' 的 t）：簇内最近邻间距 ≤ 此值归一簇
@@ -360,7 +362,7 @@ obstacle_placement:                     # 障碍物放置参数，按【障碍�
       plate:            {size_scale_range: [0.5, 0.7], span_clip_m: [0.15, 2.2], tilt_deg: 0.0}                 # 绕 Y 倾角(度)
       l_bracket:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2]}                               # 纯尺寸，无离散项
       u_channel:        {size_scale_range: [1.0, 2.1], span_clip_m: [0.15, 2.2], height_mult: 0.7}             # 侧板高 = s×0.7
-      pipe:             {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 3.5}    # 管轴 x/y/z；管长 = s×1.5
+      pipe:             {size_scale_range: [0.6, 0.7], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 4.5}    # 管轴 x/y/z；管长 = s×1.5
       parallel_pipes:   {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], n: 3, axis: y, stack: z, length_mult: 1.5, gap_mult: 0.5} # n 根；沿 stack 以 gap=s×0.5 排开
       crossed_pipes:    {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], cross_deg: 90.0, length_mult: 1.5}                        # 两管夹角(度)；管长 = s×1.5
       box_beam:         {size_scale_range: [0.6, 1.6], span_clip_m: [0.15, 2.2], tube_r_clip_m: [0.04, 0.20], axis: y, length_mult: 1.5, side_mult: 1.4, side_min: 0.06}# 方截面边长 = max(side_min, rt×side_mult)
