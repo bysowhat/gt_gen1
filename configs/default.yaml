@@ -1,13 +1,16 @@
 # GT 生成配置 —— Step 0 锁定的决策（见 docs/implementation-steps.md）
 
+output:                                 # 生产轨迹结果落盘（scripts/demo_scene.py 各 demo）
+  root: "/media/a/新加卷/tempt/5"        # 结果根目录；文件名含工件名以区分不同工件
+
 seam:                                   # 焊缝加载/过滤（Scene._load_seam）
   min_length_cm: 3.0                    # 焊缝长度(corrected_p0↔p1 直线距离)小于此值的焊缝丢弃
 
 robot:                                  # 决策 B
-  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
-  usd_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/robot_description_wo_cam_cover.usd"
-  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
-  # usd_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/robot_description_wo_cam_cover.usd"
+  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
+  # usd_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/robot_description_wo_cam_cover.usd"
+  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
+  usd_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/robot_description_wo_cam_cover.usd"
   # 新版机械臂(2026-06-26)：base=a1_ground_rail_platform, accessory=No012_TRM651, cable=No001_12ebarket。
   # 由 scripts/build_robot_from_xacro_pkg.py 从 urdf_12e_260626/xiaoyu_description 离线生成(碰撞球 CPU 拟合)。
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复
@@ -281,7 +284,7 @@ planner:                                # cuRobo IK / 规划参数（见 curobo_
     # 无需在此写绝对路径。如需覆盖：加 stomp_planner_dir: <路径> 或设 env STOMP_PLANNER_DIR。
     num_iterations: 120     # 迭代轮数（搜索深度）：越大收敛越充分越能绕开，越慢
     num_batch: 1            # 并行候选条数（搜索宽度）：越大越不易陷局部最优，取状态代价最小那条输出
-    num_timesteps: 251       # 轨迹时间步数
+    num_timesteps: 151       # 轨迹时间步数
     delta_t: 0.1            # 步长（秒）；也是产出 npz 的回放 dt
     collision_weight: 80.0  # 碰撞代价权重
     buffer_m: 0.001         # STOMP 自身的碰撞激活距离≈0：间隙完全来自障碍物理膨胀(obstacle_buffer_m)，工件不膨胀，

@@ -189,7 +189,7 @@ def _build_scenepose2_debug(scene, include_obstacles=True, device=None):
     scene2 = ScenePose2(cfg, num_envs=cfg.num_envs, device=dev,
                         obj_path=scene.workpiece_obj, robot_cfg_path=scene.cfg.robot_cfg_path)
     scene2.reset(robot_pose_t, horizontal, piece_pose_t)
-    want_obs = bool(include_obstacles and scene.obstacles.get(scene.seam_id))
+    want_obs = bool(include_obstacles and scene._seam_obstacles())
     if want_obs:
         scene._inject_obstacles_into_scenepose2(scene2)
 
@@ -276,7 +276,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         # extra_geoms 钩子：障碍（随工件按 (R,t) 摆放）+ 初始关节角机械臂碰撞球（base 系、与候选无关）
         factories = []
-        if scene.obstacles.get(scene.seam_id):
+        if scene._seam_obstacles():
             factories.append(self._obstacle_o3d_factory())
         if show_init_arm:
             factories.append(self._init_arm_o3d_factory(init_joints))
@@ -345,7 +345,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         # extra_geoms 钩子：与 show_init_poses 相同（障碍随工件摆放 + 初始关节角机械臂碰撞球）
         factories = []
-        if scene.obstacles.get(scene.seam_id):
+        if scene._seam_obstacles():
             factories.append(self._obstacle_o3d_factory())
         if show_init_arm:
             factories.append(self._init_arm_o3d_factory(init_joints))
@@ -418,7 +418,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         # extra_geoms 钩子：与 show_init_poses_debug 相同（障碍随工件摆放 + 初始臂碰撞球 + init_free 空间）
         factories = []
-        if scene.obstacles.get(scene.seam_id):
+        if scene._seam_obstacles():
             factories.append(self._obstacle_o3d_factory())
         if show_init_arm:
             factories.append(self._init_arm_o3d_factory(init_joints))
@@ -630,7 +630,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         from gt_gen.scene import (_polygon_mesh_to_trimesh, _box_prim_to_trimesh,
                                    _tube_prim_to_trimesh)
 
-        obstacles = list(self.scene.obstacles.get(self.scene.seam_id, []))
+        obstacles = list(self.scene._seam_obstacles())
 
         def _factory(R, t):
             T = np.eye(4)
@@ -926,7 +926,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         wp_mesh = trimesh.load(scene.workpiece_obj, force="mesh").copy()
         wp_mesh.apply_transform(T)
         obs_mesh = None
-        if include_obstacles and scene.obstacles.get(scene.seam_id):
+        if include_obstacles and scene._seam_obstacles():
             obs_tms = scene._obstacle_solid_trimeshes()   # open_cylinder 纯视觉，已自动跳过
             if obs_tms:
                 tms = [tm.copy() for tm in obs_tms]
@@ -1063,7 +1063,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         geoms.append(cyl)
 
         # 障碍（mesh 系，直接叠加；open_cylinder 也含在内）
-        obstacles = list(scene.obstacles.get(sid, []))
+        obstacles = [s for lst in scene.obstacles.get(sid, {}).values() for s in lst]
         for ob in obstacles:
             col = list(ob.color) if ob.color else [0.62, 0.64, 0.67]
             tms = []
@@ -1293,7 +1293,9 @@ class Open3DSceneVisualizer(SceneVisualizer):
         import numpy as np
 
         scene = self.scene
-        obstacles = list(scene.obstacles.get(scene.seam_id, []))
+        # 已选定 init pose(手别) 时只画该手别桶的障碍（与 compute_pose_and_plan_path 避障口径一致，
+        # 正/反手隔离）；未选手别(cur_init_hand=None)才退回正反手并集。
+        obstacles = list(scene._seam_obstacles(scene.cur_init_hand))
         cur = scene.cur_init_pose
         base_frame = cur is not None
 
@@ -1855,7 +1857,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 seam_mesh = np.asarray(scene._seam_frame()[6], float)     # (N,3)
             except Exception as _e:
                 print(f"[viz] 取焊缝失败（忽略）: {_e}")
-        obstacles = list(scene.obstacles.get(scene.seam_id, [])) if show_obstacles else []
+        obstacles = list(scene._seam_obstacles()) if show_obstacles else []
 
         # —— SimulationApp 必须最先启动（在 import omni 之前）——
         try:
@@ -2072,7 +2074,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
             world.step(render=True)
         simulation_app.close()
 
-    def show_trajectory_isaacsim(self, traj_index: int = -1, headless: bool = False,
+    def show_trajectory_isaacsim(self, seam_id: int = None, hand: str = None,
+                                 traj_index: int = -1, headless: bool = False,
                                  fps: int = 30, goal_variant: int = 0,
                                  flash_peak: float = 6e4, flash_decay: int = None,
                                  goal_hold: int = None, base_intensity: float = 250.0):
@@ -2080,16 +2083,18 @@ class Open3DSceneVisualizer(SceneVisualizer):
 
         base 系里机械臂沿 GT 关节序列逐帧运动，同屏显示工件 + 障碍物 + goal 观测视锥/真实相机
         （复用 show_scene_isaacsim(trajectory=...)，故场景摆放与那套完全一致）。参考 launch.json 的
-        viz_placed_obstacle_isaacsim：首尾补静止帧、播完循环重播。会自动 set_init_pose 到该轨迹实际
-        所属的 (手别,候选下标)，并还原该候选当时的 goal_poses 快照，故工件摆放/焊缝/视锥与所选轨迹一致
-        （不依赖调用前 scene.cur_init_hand/index 恰好是哪个候选）。
+        viz_placed_obstacle_isaacsim：首尾补静止帧、播完循环重播。会自动切到该轨迹实际所属的焊缝
+        (seam_id) 与 init pose (手别,候选下标)，并还原该候选当时的 goal_poses 快照，故工件摆放/焊缝/
+        视锥与所选轨迹一致（不依赖调用前 scene.seam_id/cur_init_hand/index 恰好是哪个）。
 
         前提：先 plan_explore_path（其内部要求已 set_init_pose，故必为 base 系、会画机械臂）。跨进程时
         先 Scene.save→另起干净进程 Scene.load 再调用（compute/plan 会污染 warp，见 save/load 说明）。
 
         参数：
-          traj_index  : 把 self.scene.trajectories[seam_id] 里各 init pose(手别,候选下标) 下的 list
-                        按 key 插入顺序拼成一个扁平列表后，取第几条（默认 -1=最新；支持负索引）。
+          seam_id     : 回放哪条焊缝的轨迹（默认 None=用 scene 当前 seam_id；支持负索引）。
+          hand        : 只回放该手别（"forehand"/"backhand"）的轨迹（默认 None=不限手别）。
+          traj_index  : 把 (seam_id, hand) 过滤后各 init pose(手别,候选下标) 下的 list 按 key 插入顺序
+                        拼成一个扁平列表后，取第几条（默认 -1=最新；支持负索引）。
           headless    : 无显示器自检（spawn+跑几帧即退，打印路点数 + VIZ_SCENE_DONE）。
           fps         : 回放帧率。
           goal_variant: 画 goal 视锥用 cam_pose 的第几个变体 K（默认 0）。
@@ -2100,10 +2105,16 @@ class Open3DSceneVisualizer(SceneVisualizer):
         import numpy as np
 
         scene = self.scene
-        traj_map = scene.trajectories.get(scene.seam_id, {})
-        trajs = [(key, e) for key, lst in traj_map.items() for e in lst]
+        n_seam = len(scene.seams)
+        sid = scene.seam_id if seam_id is None else int(seam_id) % n_seam
+        traj_map = scene.trajectories.get(sid, {})
+        trajs = [(key, e) for key, lst in traj_map.items() for e in lst
+                 if hand is None or key[0] == hand]
         if not trajs:
-            raise RuntimeError("无可回放轨迹：请先 Scene.plan_explore_path()")
+            raise RuntimeError(
+                f"无可回放轨迹：seam_id={sid}"
+                f"{'' if hand is None else f' hand={hand}'}"
+                f"（请先 Scene.plan_explore_path()）")
         n = len(trajs)
         if not (-n <= int(traj_index) < n):
             raise IndexError(f"traj_index 越界：{traj_index}，共 {n} 条轨迹")
@@ -2111,13 +2122,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
         positions = np.asarray(entry["positions"], float)
         observe = entry.get("observe")
         goal = entry.get("goal")
-        print(f"[viz] 回放轨迹 #{int(traj_index) % n}/{n}：init pose={key[0]}#{key[1]} "
+        print(f"[viz] 回放轨迹 seam#{sid} #{int(traj_index) % n}/{n}：init pose={key[0]}#{key[1]} "
               f"status={entry.get('status')} 路点={len(positions)} goal=观测位姿#{entry.get('goal_index')}"
               f"（变体#{entry.get('variant')}）")
 
-        # 切到该轨迹实际所属的 init pose，并还原它当时的 goal_poses（视锥）快照——
-        # 否则工件摆放/焊缝/视锥会停在 scene 当前的 cur_init_hand/index（多手别依次计算时，
-        # 那始终是最后一次 compute_pose_and_plan_path 的候选，与本条轨迹不一致）。
+        # 切到该轨迹实际所属的焊缝 + init pose，并还原它当时的 goal_poses（视锥）快照——
+        # 否则工件摆放/焊缝/视锥会停在 scene 当前的 seam_id/cur_init_hand/index（多手别/多缝依次
+        # 计算时，那始终是最后一次 compute_pose_and_plan_path 的候选，与本条轨迹不一致）。
+        scene._set_cur_seam(sid)
         scene.set_init_pose(*key)
         snap = scene.trajectory_goal_poses.get(scene.seam_id, {}).get(key)
         if snap is not None:

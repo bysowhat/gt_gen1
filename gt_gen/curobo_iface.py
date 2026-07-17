@@ -73,6 +73,7 @@ def init_curobo(
     rotation_threshold: Optional[float] = None,
     num_seeds: Optional[int] = None,
     num_trajopt_seeds: Optional[int] = None,
+    collision_cache: Optional[dict] = None,
 ) -> CuroboHandle:
     """初始化 MotionGen + warmup。
 
@@ -90,6 +91,11 @@ def init_curobo(
         加 max_attempts 更划算——GPU 一把并行铺多条取最优，压住「随机起点陷局部最优」的失败。
         注：plan_single* 路径下 graph planner 的并行种子数也取此值（cuRobo 把 graph seeds 硬绑到
         trajopt seeds，无独立 num_graph_seeds 旋钮）。
+    collision_cache：显式指定碰撞世界缓存大小 {"mesh": N, "obb": M}。默认 None＝cuRobo 按【首次
+        load 的 world mesh 数】惰性定大小；若之后 update_world 的障碍数超过它，cuRobo 会重建 mesh 缓存，
+        而 use_cuda_graph=True 时已录制的 graph 引用旧缓存指针会失效（见 update_world 文档）。故对
+        「先无障碍(1 mesh)后加障碍(2 mesh)、且句柄复用只 update_world」的场景，须在建时就把 mesh 缓存
+        定足（工件+合并障碍上限=2），避免运行中扩容坏图。
     """
     from curobo.types.base import TensorDeviceType
     from curobo.geom.sdf.world import CollisionCheckerType
@@ -169,6 +175,7 @@ def init_curobo(
         position_threshold=position_threshold,
         rotation_threshold=rotation_threshold,
         num_trajopt_seeds=num_trajopt_seeds,
+        collision_cache=collision_cache,
     )
     mg = MotionGen(mg_cfg)
     mg.warmup(warmup_js_trajopt=False)

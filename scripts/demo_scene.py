@@ -148,7 +148,7 @@ def demo_obstacle_type2(args):
     scene = _make_scene(args)
     scene._set_cur_seam(9)
 
-    spec2 = scene.add_obstacle_type2()
+    spec2 = scene.add_obstacle_type2(hand="forehand")   # 纯 viz 演示：随便挂一只手别桶（viz 画并集）
     print(f"[demo] 类型2 遮挡板 1 个：{spec2.meta['candidate']}({spec2.kind})，启动 isaacsim 可视化…")
     Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless)
 
@@ -160,7 +160,7 @@ def demo_obstacle_type3(args):
     scene = _make_scene(args)
     scene._set_cur_seam(9)
 
-    spec3 = scene.add_obstacle_type3()
+    spec3 = scene.add_obstacle_type3(hand="forehand")   # 纯 viz 演示：随便挂一只手别桶（viz 画并集）
     print(f"[demo] 类型3 开口障碍 1 个：{spec3.kind}，启动 isaacsim 可视化…")
     Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless)
 
@@ -181,122 +181,151 @@ def demo_init_poses(args):
 
 
 def obstacle_type2_demo_main(args):
-    import random
-    from gt_gen.scene_viz import Open3DSceneVisualizer
-
-
-    # from gt_gen.repro_plan_joint import replay
-    # seg = replay("plan_joint_case.pkl")
-
-
+    '''
+        对【所有焊缝】、每缝【正手 + 反手】各跑一个生产轨迹任务（类型2 遮挡板）：
+          加 1 个类型2 遮挡板（按焊缝几何放置，不依赖已有轨迹）→ 规划带障碍轨迹。
+        类型2 障碍无需先规划无障碍轨迹即可放置，故不做无障碍预规划。
+        单个 Scene 全程复用、循环内不 save/load；正/反手障碍分桶隔离；
+        每缝【完成后】存 1 个 per-seam pkl（文件名含焊缝号，便于断点续跑跳过）。
+    '''
     scene = _make_scene(args)
-    scene._set_cur_seam(106)#
-    # if random.random() < 0.7:  # 70% 概率添加遮挡板
-    #     scene.add_obstacle_type2()
-    scene.add_obstacle_type2()
-    scene.plan_init_pose_fast(include_obstacles=False, diagnostic=True)
-    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    out_root = getattr(args, "out_root", None)
+    force = getattr(args, "force", False)
 
-    # # scene.plan_init_pose()
-    # # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    # num_init_pose = scene.num_init_pose()
-    # if num_init_pose == 0:
-    #     # 放宽障碍物条件，不考虑障碍物碰撞
-    #     scene.plan_init_pose(include_obstacles=False)
-    # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    # # if num_init_pose == 0:
-    # #     # raise NotImplementedError()
-    # #     # 继续放宽障碍物条件，将障碍物挪到更远一点的位置
-    # #     # scene.grow_obstacle_n(n_cm, spec=None)
-    # #     print(1)
-    # # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    for seam_id in range(len(scene.seams)):
+        out_path = _out_path(scene, "type2", seam_id=seam_id, out_root=out_root)
+        if not force and os.path.exists(out_path):
+            print(f"[demo] seam {seam_id}：已存在 {out_path}，跳过")
+            continue
+        try:
+            scene._set_cur_seam(seam_id)
+            # 候选初始位姿：hand/障碍无关（放宽不避障），每缝算 1 次即可
+            scene.plan_init_pose_fast(include_obstacles=False, verbose=True)
+            for hand in ("forehand", "backhand"):
+                scene.obstacles.get(seam_id, {}).pop(hand, None)   # 隔离本手别桶
+                # 1) 加 1 个类型2 遮挡板，挂到本手别桶
+                scene.add_obstacle_type2(hand=hand)
+                # 2) 规划带障碍轨迹（只避开本手别桶障碍）
+                if scene.compute_pose_and_plan_path(hand, max_stomp_try=5):
+                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹成功")
+                else:
+                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹失败")
+            scene.save(out_path)          # 仅在本缝正常处理完后存盘（异常则不存 → 续跑重试）
+        except Exception as e:
+            import traceback
+            print(f"[demo] seam {seam_id} 异常跳过: {e}")
+            traceback.print_exc()
 
-    # # scene.seam_ids_by_length()  169,88,164,106
-    # fflag = scene.compute_pose_and_plan_path(hand="forehand")
-    # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    # bflag = scene.compute_pose_and_plan_path(hand="backhand")
-    # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
-    # print(1)
-
-
-    from gt_gen.scene import Scene
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
-    # Open3DSceneVisualizer(scene).show_init_poses()
-    # Open3DSceneVisualizer(scene).show_joint_table_ee()
-
-    # # Open3DSceneVisualizer(scene).show_init_poses_debug(4, sort_by_seam_x=True)
-    # # Open3DSceneVisualizer(scene).show_goal_pose_collision("backhand", 0)
-    # # Open3DSceneVisualizer(scene).show_goal_pose(hand="backhand", variant=0, goal_index=1)
-    Open3DSceneVisualizer(scene).show_init_pose_prefilter(stage=2)#stage=1/2/3
+    print(f"[demo] type2 全部焊缝完成 → {out_root or scene.cfg.output_root}")
 
 
-    # Open3DSceneVisualizer(scene).show_seam(106)
-    # # Open3DSceneVisualizer(scene).show_seam_all_isaacsim()
-    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
+def _out_path(scene, tag: str, seam_id: int = None, out_root: str = None) -> str:
+    """结果落盘路径：<root>/<工件名>_<tag>[_seam<id>]_all.pkl（工件名区分不同工件）。
+
+    out_root 给定则覆盖 cfg.output_root；seam_id 给定则文件名含焊缝号（per-seam pkl，
+    里面仍是整场景快照——含其它已处理焊缝也无妨，命名区分即可断点续跑跳过本缝）。
+    """
+    obj_stem = os.path.splitext(os.path.basename(scene.workpiece_obj))[0]
+    root = out_root or scene.cfg.output_root
+    os.makedirs(root, exist_ok=True)
+    if seam_id is not None:
+        return os.path.join(root, f"{obj_stem}_{tag}_seam{seam_id}.pkl")
+    return os.path.join(root, f"{obj_stem}_{tag}_all.pkl")
 
 
 def obstacle_type1_demo_main(args):
     '''
-        先规划出一条轨迹
-        在扫掠空间中添加障碍物type1
-        重新规划1条轨迹
+        对【所有焊缝】、每缝【正手 + 反手】各跑一个生产轨迹任务：
+          先规划一条不带障碍物的轨迹 → 在其扫掠空间随机加 1 个障碍物 type1 → 带障碍重新规划。
+        单个 Scene 对象全程复用（curobo 句柄跨缝复用：h_truth 只 update_world、h_expl/cam 全程复用），
+        循环内不 save/load。正/反手障碍按手别桶隔离，互不影响。每跑完 1 条焊缝存盘一次（覆盖）。
     '''
-    import random
+    '''
+       DEBUG tools
+           scene.seam_ids_by_length()
+            scene.num_init_pose()
+            from gt_gen.scene import Scene                                                                    
+            scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')                                          
+            Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])  
+            Open3DSceneVisualizer(scene).show_init_poses()                                                  
+            Open3DSceneVisualizer(scene).show_seam(106)                                                     
+            Open3DSceneVisualizer(scene).show_seam_all_isaacsim()                                         
+            Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)   
+    '''
+    scene = _make_scene(args)
+    out_root = getattr(args, "out_root", None)
+    force = getattr(args, "force", False)
+
+    for seam_id in range(len(scene.seams)):
+        out_path = _out_path(scene, "type1", seam_id=seam_id, out_root=out_root)
+        if not force and os.path.exists(out_path):
+            print(f"[demo] seam {seam_id}：已存在 {out_path}，跳过")
+            continue
+        try:
+            scene._set_cur_seam(seam_id)
+            scene.plan_init_pose_fast(verbose=True)     # 复用 _fastctx，产正/反手候选
+            for hand in ("forehand", "backhand"):
+                # 隔离：清掉本手别桶（防重跑残留；正反手本就分桶，互不干扰）
+                scene.obstacles.get(seam_id, {}).pop(hand, None)
+
+                # 1) 无障碍轨迹（此时本手别桶为空 → compute_pose_and_plan_path 不避障）
+                if not scene.compute_pose_and_plan_path(hand, max_stomp_try=1):
+                    print(f"[demo] seam {seam_id} {hand}：无障碍轨迹失败，跳过该手")
+                    continue
+                key1 = scene._trajectory_key()          # 步骤1 命中的 init pose，步骤3 须复用
+
+                # 2) 基于刚成功的轨迹（当前 init pose key）随机加 1 个 type1 障碍
+                placed = False
+                for link_n in ("Link3", "Link4", "Link5", "xiaoyu_accessory_link"):
+                    if scene.add_obstacle_type1(link=link_n, hand=None, index=None,
+                                                entry_index=-1):
+                        placed = True
+                        break
+
+                scene.trajectories.get(seam_id, {}).pop(key1, None)
+                scene.trajectory_goal_poses.get(seam_id, {}).pop(key1, None)
+
+                if not placed:
+                    print(f"[demo] seam {seam_id} {hand}：4 个 link 均放不下障碍，跳过带障碍重规划")
+                    # 无障碍轨迹仅用于放障碍，不能留作 GT
+                    continue
+
+                # 3) 带障碍重规划（只避开本手别桶的障碍；必须复用步骤1 的 init pose）
+                if scene.compute_pose_and_plan_path(hand, max_stomp_try=1, init_pose_idx=key1[1]):
+                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹成功")
+                else:
+                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹失败")
+            scene.save(out_path)          # 仅在本缝正常处理完后存盘（异常则不存 → 续跑重试）
+        except Exception as e:
+            import traceback
+            print(f"[demo] seam {seam_id} 异常跳过: {e}")
+            traceback.print_exc()
+
+    print(f"[demo] type1 全部焊缝完成 → {out_root or scene.cfg.output_root}")
+    
+
+def viz(fp):
     from gt_gen.scene import Scene
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
-    # # from gt_gen.repro_plan_joint import replay
-    # # seg = replay("plan_joint_case.pkl")
 
-    scene = _make_scene(args)
-    scene._set_cur_seam(58)#
-    scene.plan_init_pose_fast(verbose=True)
-    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    # Open3DSceneVisualizer(scene).show_init_poses()
+    scene = Scene.load(fp)
+    scene.summarize_trajectories()
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=0,hand="forehand")
 
-    # # scene.seam_ids_by_length()  89,39,58,92
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    fflag = scene.compute_pose_and_plan_path(hand="forehand", max_stomp_try=1)
-    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+  
 
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    for link_n in ['Link3','Link4','Link5','xiaoyu_accessory_link']:
-        flag = scene.add_obstacle_type1(link=link_n,
-                                hand='forehand', 
-                                index=1, 
-                                entry_index=0,
-                                otype='plate')
-        if flag:
-            break
-    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
-
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
-    fflag = scene.compute_pose_and_plan_path(hand="forehand", max_stomp_try=5)
-    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
-
-    print(1)
-
-
-    # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
-    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
-    # # Open3DSceneVisualizer(scene).show_init_poses()
-    # # Open3DSceneVisualizer(scene).show_joint_table_ee()
-
-    # # # Open3DSceneVisualizer(scene).show_init_poses_debug(4, sort_by_seam_x=True)
-    # # # Open3DSceneVisualizer(scene).show_goal_pose_collision("backhand", 0)
-    # # # Open3DSceneVisualizer(scene).show_goal_pose(hand="backhand", variant=0, goal_index=1)
-    # # Open3DSceneVisualizer(scene).show_init_pose_prefilter(stage=2)#stage=1/2/3
-
-
-    # # Open3DSceneVisualizer(scene).show_seam(106)
-    # # # Open3DSceneVisualizer(scene).show_seam_all_isaacsim()
-    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
 
 def main():
     ap = argparse.ArgumentParser(description="Scene API demo：初始位姿求解 / 障碍物类型2 / 障碍物类型3 + isaacsim 可视化")
     ap.add_argument("--obj", default=DEFAULT_OBJ, help="工件 mesh（_part.obj / _watertight.obj）")
     ap.add_argument("--weld-json", default=DEFAULT_WELD_JSON, help="焊缝 _weld_angle3.json")
+    ap.add_argument("--task", default="viz", choices=["type1", "type2", "viz"],
+                    help="批处理任务：type1=障碍类型1 / type2=障碍类型2 / viz=本地可视化调试（默认）")
+    ap.add_argument("--out-root", default=None,
+                    help="覆盖 cfg.output_root 的结果落盘根目录（per-seam pkl 存这里）")
+    ap.add_argument("--force", action="store_true",
+                    help="忽略已存在的 per-seam pkl，强制重跑该焊缝")
     ap.add_argument("--headless", action="store_true", help="无显示器自检：spawn 后跑几帧即退")
     ap.add_argument("--goal-index", type=int, default=None,
                     help="再画一条到达第几个 goal 观测位姿的机械臂，并打印其三分碰撞（自碰撞/工件/障碍）")
@@ -308,19 +337,23 @@ def main():
                     help="demo_init_poses：网格格心节距（米，默认 2.5；1m 会重叠）")
     args = ap.parse_args()
 
-    # 默认跑障碍物类型2；想看别的换成下面对应调用（勿与本调用同进程先后跑，见模块 docstring）
+    # 默认 --task viz：保持本地可视化调试行为不变（勿与 curobo demo 同进程先后跑，见模块 docstring）。
+    # 批处理由 shell（scripts/bash/v1/）传 --task type1/type2 + --out-root 调用。
+    if args.task in ("type1", "type2"):
+        demo = obstacle_type1_demo_main if args.task == "type1" else obstacle_type2_demo_main
+        if _PROFILE_MAIN:
+            with _LineProfiler(__file__):       # PROFILEMAIN=1：逐行计时（含各行调用的耗时）
+                demo(args)
+        else:
+            demo(args)
+        return
+
+    # --task viz（默认）：本地可视化调试入口
     # demo_obstacle_type2(args)
     # demo_obstacle_type3(args)
     # demo_init_pose(args)
     # demo_init_poses(args)   # 多候选初始位姿同屏铺网格（先另进程 plan_init_pose + save）
-
-    demo = obstacle_type1_demo_main
-    # demo = obstacle_type2_demo_main
-    if _PROFILE_MAIN:
-        with _LineProfiler(__file__):       # PROFILEMAIN=1：逐行计时（含各行调用的耗时）
-            demo(args)
-    else:
-        demo(args)
+    viz('/media/a/新加卷/tempt/5/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight_type1_all.pkl')
 
 if __name__ == "__main__":
     main()

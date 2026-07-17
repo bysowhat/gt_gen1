@@ -396,7 +396,10 @@ class Scene:
                                                                           # 每条成功轨迹对应候选当时的 compute_goal_pose 结果快照，
                                                                           # 供 show_trajectory_isaacsim 按 traj_index 还原正确的视锥（
                                                                           # self.goal_poses 是全局单值，会被后续候选覆盖，不够用）
-        self.obstacles: Dict[int, list] = {}   # {seam_id: list[ObstacleSpec]} 已放障碍（按焊缝分组）
+        self.obstacles: Dict[int, Dict[str, list]] = {}   # {seam_id: {"forehand":[ObstacleSpec...], "backhand":[...]}}
+                                                           # 已放障碍，按【焊缝 → 手别】分组：类型1 挂到所依附轨迹的手别，
+                                                           # 类型2/3 挂到当前 init pose 手别（cur_init_hand）。正/反手各自隔离，
+                                                           # 规划某手别时只避开该手别的障碍（见 _seam_obstacles / _obstacle_solid_trimeshes）
         self.truth_scene = None              # 工件+障碍（base 系）trimesh，raycast 几何源——后续
         self.voxmap = None                   # 三态记忆 ThreeStateVoxelMap——后续
 
@@ -535,7 +538,7 @@ class Scene:
 
         # —— 障碍物并入 / 还原 solver 碰撞世界（不改 _kejian2_solve_weld 的碰撞算法） ——
         solver = self._k2ctx["solver"]
-        want_obs = bool(include_obstacles and self.obstacles.get(self.seam_id))
+        want_obs = bool(include_obstacles and self._seam_obstacles())   # 初位姿阶段无手别→正反手并集
         if want_obs:
             self._inject_obstacles_into_solver(solver, verbose=verbose)   # 每次按当前障碍重算合并 ESDF（覆盖体素）
             self._k2ctx_injected = True
@@ -620,7 +623,7 @@ class Scene:
         # —— 障碍点云（mesh 局部系，与工件同框、同 T）：仅供「工件+障碍 vs init_free 无交集」过滤 ——
         #   每次都重设（含 None），避免上一条焊缝的障碍点残留。
         obs_pts = None
-        if include_obstacles and self.obstacles.get(self.seam_id):
+        if include_obstacles and self._seam_obstacles():   # 初位姿阶段无手别→正反手并集
             chunks = []
             for tm in self._obstacle_solid_trimeshes():
                 p = pim._voxelize_mesh_points(np.asarray(tm.vertices, dtype=np.float64),
@@ -675,8 +678,28 @@ class Scene:
         order = sorted(range(n), key=lambda i: -float(score[i]))                       # 分数降序、稳定
         return [cands[i] for i in order]
 
-    def _obstacle_solid_trimeshes(self):
+    def _seam_obstacles(self, hand: str = None) -> list:
+        """本焊缝已放障碍（ObstacleSpec 列表）。
+
+        hand=None → 正反手【并集】（初位姿阶段等尚未选定手别时用，保守把整缝障碍都算上）；
+        给定 "forehand"/"backhand" → 只返回该手别桶（规划某手别轨迹时只避开自己的障碍，实现隔离）。
+        """
+        d = self.obstacles.get(self.seam_id, {}) or {}
+        if hand is None:
+            return [s for lst in d.values() for s in lst]
+        return list(d.get(hand, []))
+
+    def _append_obstacle(self, spec, hand: str) -> None:
+        """把障碍挂到 self.obstacles[seam_id][hand] 桶（hand 须为 forehand/backhand）。"""
+        if hand not in ("forehand", "backhand"):
+            raise ValueError(f"添加障碍需要明确手别（forehand/backhand），得到 {hand!r}："
+                             f"请先 set_init_pose，或调用时显式传 hand=")
+        self.obstacles.setdefault(self.seam_id, {}).setdefault(hand, []).append(spec)
+
+    def _obstacle_solid_trimeshes(self, hand: str = None):
         """当前 self.obstacles → 可并入碰撞 ESDF 的【实体 trimesh】列表。
+
+        hand=None → 本焊缝正反手障碍并集；给定手别 → 只取该手别桶（见 _seam_obstacles）。
 
         · 类型1 走廊障碍：obstacles.build 的 Box/Tube 原语（工件 mesh 系）→ 各建实体 trimesh；
         · 类型2 遮挡板（plate/triangle/trapezoid）：闭合薄棱柱 mesh → 三角化实体；
@@ -685,7 +708,7 @@ class Scene:
         每块 fix_normals 保证外向法线（供 igl 缠绕数按组件求和纠符号）。返回可能为空列表。
         """
         out = []
-        for ob in self.obstacles.get(self.seam_id, []):
+        for ob in self._seam_obstacles(hand):
             if ob.otype == 1:
                 for prim in ob.prims:
                     cls = type(prim).__name__       # 避免与循环变量 ob 争用 obstacles 模块名
@@ -855,6 +878,42 @@ class Scene:
         key = self._trajectory_key()
         self.trajectories.setdefault(self.seam_id, {}).setdefault(key, []).append(entry)
 
+    def summarize_trajectories(self, success_status: str = "reached",
+                               verbose: bool = True) -> dict:
+        """统计成功轨迹情况：一共多少条成功轨迹，及各自对应的 (seam_id, hand)。
+
+        成功判据：entry["status"] == success_status（默认 "reached"；其余 infeasible/stuck/
+        max_rounds 视为失败）。self.trajectories 结构为 {seam_id: {(hand, index): list[entry]}}，
+        逐 entry 统计（同一 (seam_id, hand) 可有多条）。
+
+        返回 dict：
+          total_success : 成功轨迹总条数。
+          total         : 全部轨迹条数。
+          items         : list[(seam_id, hand, index)]——每条成功轨迹一项，按 seam_id/hand/index 排序。
+          by_seam_hand  : {(seam_id, hand): 成功条数}。
+        verbose=True 时同时打印一览。
+        """
+        items = []          # 每条成功轨迹一项：(seam_id, hand, index)
+        total = 0
+        for sid in sorted(self.trajectories):
+            for (hand, index), lst in self.trajectories[sid].items():
+                for e in lst:
+                    total += 1
+                    if e.get("status") == success_status:
+                        items.append((sid, hand, index))
+        items.sort(key=lambda t: (t[0], t[1], t[2]))
+
+        by_seam_hand: Dict[Tuple[int, str], int] = {}
+        for sid, hand, _ in items:
+            by_seam_hand[(sid, hand)] = by_seam_hand.get((sid, hand), 0) + 1
+
+        if verbose:
+            print(f"[scene] 成功轨迹 {len(items)}/{total} 条（status=={success_status}）")
+            for (sid, hand), cnt in sorted(by_seam_hand.items()):
+                print(f"  seam#{sid:<4} {hand:<9} × {cnt}")
+        return dict(total_success=len(items), total=total,
+                    items=items, by_seam_hand=by_seam_hand)
+
     @staticmethod
     def merge_trajectory_entries(entries: List[dict]) -> dict:
         """把同一 init pose 下按序规划的多段 entry 合并成 1 条完整轨迹 entry。
@@ -924,7 +983,7 @@ class Scene:
             cur_init_pose=self.cur_init_pose,
             cur_init_hand=self.cur_init_hand,
             cur_init_index=self.cur_init_index,
-            obstacles=self.obstacles,                  # {seam_id: list[ObstacleSpec]}（dataclass；prims=Box、meshes=dict）
+            obstacles=self.obstacles,                  # {seam_id: {hand: list[ObstacleSpec]}}（dataclass；prims=Box、meshes=dict）
             goal_poses={sid: ({k: _to_np(v) for k, v in res.items()} if res else None)
                         for sid, res in self.goal_poses.items()},   # {seam_id: dict|None}
             trajectories={sid: {k: list(v2) for k, v2 in d.items()}
@@ -944,7 +1003,7 @@ class Scene:
         cur = ("%s#%d" % (self.cur_init_hand, self.cur_init_index)
                if self.cur_init_index is not None else "未设")
         print(f"[scene] 已保存 → {path}（候选 正手{n_f}/反手{n_b}，"
-              f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
+              f"障碍 {sum(len(l) for hd in self.obstacles.values() for l in hd.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
               f"轨迹 {sum(len(v2) for d in self.trajectories.values() for v2 in d.values())}，"
               f"当前 init pose={cur}）")
         return path
@@ -985,7 +1044,7 @@ class Scene:
         cur = ("%s#%d" % (self.cur_init_hand, self.cur_init_index)
                if self.cur_init_index is not None else "未设")
         print(f"[scene] 已加载 ← {path}（候选 正手{n_f}/反手{n_b}，"
-              f"障碍 {sum(len(v) for v in self.obstacles.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
+              f"障碍 {sum(len(l) for hd in self.obstacles.values() for l in hd.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
               f"轨迹 {sum(len(v2) for d in self.trajectories.values() for v2 in d.values())}，"
               f"当前 init pose={cur}）")
         return self
@@ -1105,11 +1164,12 @@ class Scene:
         scene2 = ScenePose2(cfg, num_envs=cfg.num_envs, device=device,
                             obj_path=self.workpiece_obj, robot_cfg_path=self.cfg.robot_cfg_path)
 
-        want_obs = bool(include_obstacles and self.obstacles.get(self.seam_id))
+        want_obs = bool(include_obstacles and self._seam_obstacles(self.cur_init_hand))   # 只避开当前手别的障碍
         # reset：把工件按 piece->base_link 摆进碰撞世界并选关节限位
         robot_pose_rel = scene2.reset(robot_pose_t, int(horizontal), piece_pose_t)
         if want_obs:
-            self._inject_obstacles_into_scenepose2(scene2, buffer_m=obstacle_buffer_m)     # 障碍与工件同 pose 一起进碰撞世界（避障；buffer_m>0 膨胀）
+            self._inject_obstacles_into_scenepose2(scene2, buffer_m=obstacle_buffer_m,
+                                                   hand=self.cur_init_hand)     # 障碍与工件同 pose 一起进碰撞世界（避障；buffer_m>0 膨胀）
 
         optimizer = Optimizer(cfg=cfg, scene=scene2, device=device)
         optimizer.resetSeamData(seam_line, seam_tangent, seam_limits)
@@ -1132,7 +1192,8 @@ class Scene:
         return result
     
     def compute_pose_and_plan_path(self, hand, include_obstacles: bool = True,
-                                   device: str = None, max_stomp_try: int = 1):
+                                   device: str = None, max_stomp_try: int = 1,
+                                   init_pose_idx: int = None):
         """对某手别的每个候选 init pose，求观测位姿序列后【按序边走边看规划】覆盖整条焊缝的 GT。
 
         流程（每个候选 init pose）：
@@ -1149,16 +1210,23 @@ class Scene:
           hand             : "forehand"/"backhand"。
           include_obstacles: 真值世界是否并入已放障碍（默认 True）。
           device           : cuda/cpu（None→cfg.compute_goal_pose.device）。
+          init_pose_idx    : 指定只跑该候选下标（如 type1 步骤3 须复用步骤1 命中的 init pose）；
+                             None(默认)=按原逻辑遍历前 2 个候选。
           variants         : 要尝试的 K 变体——None(默认)=仅 variant 0；int=仅该变体；"all"=全部 K；
                              可迭代=指定若干。（K 是收敛后近等价快照，通常取 0 即可，全跑很重。）
         """
         cur_cands = self.init_pose_candidates.get(self.seam_id, {"forehand": [], "backhand": []})
-        for init_pose_idx in range(len(cur_cands[hand])):
-            # 最多尝试2个初始位姿
-            if init_pose_idx >= 2:
+        n_cands = len(cur_cands[hand])
+        if init_pose_idx is not None:
+            idx_iter = [int(init_pose_idx)] if n_cands else []
+        else:
+            idx_iter = range(n_cands)
+        for init_pose_idx_loop in idx_iter:
+            # 未指定时最多尝试 2 个初始位姿；指定 init_pose_idx 时只跑那一个
+            if init_pose_idx is None and init_pose_idx_loop >= 2:
                 continue
 
-            self.set_init_pose(hand, init_pose_idx)
+            self.set_init_pose(hand, init_pose_idx_loop)
             res = self.compute_goal_pose()
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
@@ -1177,7 +1245,7 @@ class Scene:
             ctx = self._build_explore_world(include_obstacles=include_obstacles, device=device)
             if _PROFILEMAIN:
                 print(f"[PROFILEMAIN][compute_pose_and_plan_path] _build_explore_world 总"
-                      f"={time.perf_counter() - _t0:.3f}s（init#{init_pose_idx}）")
+                      f"={time.perf_counter() - _t0:.3f}s（init#{init_pose_idx_loop}）")
 
             for variant in variant_list:
                 vm = self._fresh_explore_voxmap(ctx)     # 每个 variant 重置探索状态，互不串扰
@@ -1192,7 +1260,7 @@ class Scene:
                     seq_entries.append(entry)
                     if entry["status"] != "reached":
                         all_reached = False
-                        print(f"[scene] 序列中断：init#{init_pose_idx} variant#{variant} "
+                        print(f"[scene] 序列中断：init#{init_pose_idx_loop} variant#{variant} "
                               f"pose#{pose_idx}/{B} status={entry['status']}")
                         break
                     start = entry["positions"][-1]        # 下一个 pose 从实际到达的末关节角起步
@@ -1202,7 +1270,7 @@ class Scene:
                     self.trajectories.setdefault(self.seam_id, {})[key] = [merged]
                     self.trajectory_goal_poses.setdefault(self.seam_id, {})[key] = res   # 快照当前候选的观测位姿结果，
                                                                                           # 供 show_trajectory_isaacsim 还原对应视锥
-                    print(f"[scene] 序列成功：init#{init_pose_idx} variant#{variant} "
+                    print(f"[scene] 序列成功：init#{init_pose_idx_loop} variant#{variant} "
                           f"覆盖 B={B} 个观测位姿，已合并为 1 条轨迹（路点={len(merged['positions'])}）")
                     return True
             # 本候选所有 variant 都失败：清掉 plan_explore_path 遗留的分段 entry（未 reached、未合并），
@@ -1368,7 +1436,7 @@ class Scene:
         wp_pose7 = np.asarray(self.cur_init_pose.workpiece_pose7, float).tolist()
         T = np.asarray(self.cur_init_pose.T_workpiece_in_base, float)
 
-        obs_tms = self._obstacle_solid_trimeshes() if include_obstacles else []
+        obs_tms = self._obstacle_solid_trimeshes(self.cur_init_hand) if include_obstacles else []
         meshes = [CuMesh(name="workpiece", file_path=self.workpiece_obj, pose=wp_pose7)]
         if obs_tms:
             merged = _trimesh.util.concatenate(obs_tms)
@@ -1390,9 +1458,13 @@ class Scene:
             _t_truth = time.perf_counter()
         else:
             print(f"[scene] _build_explore_world：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
+            # mesh 缓存定成 2（工件 + 合并后的 1 个障碍 mesh 上限）：本 handle 全程复用、加障碍靠
+            # update_world，若首建按无障碍世界(1 mesh)惰性定成 1，之后加障碍(2)会触发缓存重建、
+            # 坏掉 use_cuda_graph 录制的 graph（见 curobo update_world 文档 / init_curobo collision_cache）。
             h_truth = ci.init_curobo(self.cfg, world_model=world,
                                      collision_checker_type=CollisionCheckerType.MESH,
-                                     position_threshold=0.05, rotation_threshold=0.5)
+                                     position_threshold=0.05, rotation_threshold=0.5,
+                                     collision_cache={"mesh": 2, "obb": 0})
             _t_truth = time.perf_counter()
             print("[scene] _build_explore_world：建 h_expl（VOXEL 三态）...")
             h_expl = ci.init_curobo(self.cfg)
@@ -1441,7 +1513,7 @@ class Scene:
             print(f"[scene] 初始 FREE 空间=圆柱 体素={n_free}")
         return vm
 
-    def _inject_obstacles_into_scenepose2(self, scene2, buffer_m: float = 0.0):
+    def _inject_obstacles_into_scenepose2(self, scene2, buffer_m: float = 0.0, hand: str = None):
         """把当前障碍实体（工件 mesh 系）按 piece->base_link 位姿并进 ScenePose2 的碰撞世界，
         并把障碍 mesh（piece 系）并进遮挡 raycast 的 warp mesh。
 
@@ -1457,7 +1529,7 @@ class Scene:
         """
         import trimesh as _trimesh
         from gt_gen import obstacle_placement as _opl
-        obs_tms = self._obstacle_solid_trimeshes()
+        obs_tms = self._obstacle_solid_trimeshes(hand)
         if not obs_tms:
             print("[scene] compute_goal_pose：无可注入碰撞的障碍（仅工件或仅 open_cylinder）")
             return
@@ -1504,7 +1576,7 @@ class Scene:
         seam_line = _interp_line(p0, p1, n=n_seg)
         return mid, t, d1, d2, bis, seam_len, seam_line
 
-    def add_obstacle_type2(self, **overrides) -> ObstacleSpec:
+    def add_obstacle_type2(self, hand: str = None, **overrides) -> ObstacleSpec:
         """障碍物类型2：焊缝旁遮挡板（固定候选 **C1**，示例 viz_seam_plate_candidates_isaacsim.py）。
 
         C1 = 水平板·焊缝正上方对称：∥地面 a 面（板法向=a 面法向 na）、沿壁方向 b_dir 抬高 n_cm、
@@ -1572,7 +1644,7 @@ class Scene:
             otype=2, kind=shape, meshes=[mesh], seam_line=seam_line, color=color,
             meta=dict(candidate="C1", anchor=anchor, R=R, b_dir=b_dir, n_cm=n_cm,
                       width=width, length=length, thickness=thickness))
-        self.obstacles.setdefault(self.seam_id, []).append(spec)
+        self._append_obstacle(spec, hand or self.cur_init_hand)
         return spec
 
     def grow_obstacle_n(self, n_cm: float, spec: Optional[ObstacleSpec] = None) -> ObstacleSpec:
@@ -1583,7 +1655,7 @@ class Scene:
         焊缝最后放入的障碍。仅适用类型2（meta 含 b_dir/anchor）。
         """
         if spec is None:
-            lst = self.obstacles.get(self.seam_id, [])
+            lst = self._seam_obstacles(self.cur_init_hand)   # 当前手别桶最后放入的障碍
             if not lst:
                 raise RuntimeError(f"焊缝 {self.seam_id} 尚无障碍，无法调整 n_cm")
             spec = lst[-1]
@@ -1643,7 +1715,7 @@ class Scene:
                     sx=float(sx), sy=float(sy), sz=float(sz),
                     cen_a=cen_a, cen_b=cen_b, cen_c=cen_c, C=C)
 
-    def add_obstacle_type3(self, **overrides) -> ObstacleSpec:
+    def add_obstacle_type3(self, hand: str = None, **overrides) -> ObstacleSpec:
         """障碍物类型3：把本焊缝包住的开口障碍（示例 viz_seam_open_box_isaacsim.py）。
 
         大小 + 焊缝在障碍内的位置由 6 个面到焊缝的最近距离 dis 唯一解出；开口面=后(back)，朝焊缝角平分线
@@ -1684,7 +1756,7 @@ class Scene:
         else:
             raise ValueError(f"未知类型3障碍 {obstacle!r}，可选 open_box/open_cylinder")
 
-        self.obstacles.setdefault(self.seam_id, []).append(spec)
+        self._append_obstacle(spec, hand or self.cur_init_hand)
         return spec
 
     def add_obstacle_type1(self, link: str, *,
@@ -1754,11 +1826,11 @@ class Scene:
             pose=list(np.asarray(self.cur_init_pose.workpiece_pose7, float)))
 
         # —— 手动调试：放置前先看一眼 工件 + 扫掠走廊 + goal（无障碍）——
-        opl._debug_show_sweep(
-            per_wp, link, prims=None,
-            cfg=self.cfg, goal_pos=goal_pos,
-            workpiece_mesh=wp_mesh_dbg, seam_line=seam_base,
-            title=f"{link} 放置前（工件+扫掠+goal）")
+        # opl._debug_show_sweep(
+        #     per_wp, link, prims=None,
+        #     cfg=self.cfg, goal_pos=goal_pos,
+        #     workpiece_mesh=wp_mesh_dbg, seam_line=seam_base,
+        #     title=f"{link} 放置前（工件+扫掠+goal）")
 
         # —— 采样参数（seed+seam_id 决定 rng，可复现；关键字显式传入优先）——
         op = self.cfg.obstacle_placement
@@ -1814,7 +1886,7 @@ class Scene:
                     anchor_base=list(map(float, anchor_base)))
         spec = ObstacleSpec(otype=1, kind=otype_used, prims=prims_wp,
                             seam_line=seam_line, color=list(_GRAY), meta=meta)
-        self.obstacles.setdefault(self.seam_id, []).append(spec)
+        self._append_obstacle(spec, key[0])          # 挂到所依附轨迹的手别桶
         print(f"[scene] add_obstacle_type1：焊缝 {self.seam_id} link {link} 扫掠空间放置 "
               f"{otype_used}（{len(prims_wp)} 原语），已挂 self.obstacles")
         return spec

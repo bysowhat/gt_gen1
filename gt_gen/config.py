@@ -46,6 +46,11 @@ class Config:
 
     # ---- 其它决策 ----
     @property
+    def output_root(self) -> str:
+        """生产轨迹结果落盘根目录（configs/default.yaml output.root）。"""
+        return self.raw["output"]["root"]
+
+    @property
     def constraint_scope(self) -> str:
         return self.raw["constraint"]["scope"]
 
