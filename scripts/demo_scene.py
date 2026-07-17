@@ -253,41 +253,41 @@ def obstacle_type1_demo_main(args):
     scene._set_cur_seam(58)#
     scene.plan_init_pose_fast(verbose=True)
     scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    Open3DSceneVisualizer(scene).show_init_poses()
 
 
-    # # # scene.seam_ids_by_length()  89,39,58,92
-    # # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # fflag = scene.compute_pose_and_plan_path(hand="forehand")
-    # # scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
-    # # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # bflag = scene.add_obstacle_type1(link='Link3', 
-    #                          hand='forehand', 
-    #                          index=0, 
-    #                          entry_index=0,
-    #                          otype='plate')
-    # # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
+    # # scene.seam_ids_by_length()  89,39,58,92
+    # scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    fflag = scene.compute_pose_and_plan_path(hand="forehand")
+    scene.save('/media/a/新加卷/tempt/4/scene1.pkl')
+    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
+    bflag = scene.add_obstacle_type1(link='Link3', 
+                             hand='forehand', 
+                             index=1, 
+                             entry_index=0,
+                             otype='plate')
+    print(1)
+    scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    # # # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    # # # # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
     # fflag = scene.compute_pose_and_plan_path(hand="forehand")
     # scene.save('/media/a/新加卷/tempt/4/scene2.pkl')
 
-    # # print(1)
+    # print(1)
 
 
-    scene = Scene.load('/media/a/新加卷/tempt/4/scene1.pkl')
-    # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
-    Open3DSceneVisualizer(scene).show_init_poses()
-    # Open3DSceneVisualizer(scene).show_joint_table_ee()
+    # scene = Scene.load('/media/a/新加卷/tempt/4/scene2.pkl')
+    # # Open3DSceneVisualizer(scene).show_scene_isaacsim(headless=args.headless, goal_arm_index=[0,1])
+    # # Open3DSceneVisualizer(scene).show_init_poses()
+    # # Open3DSceneVisualizer(scene).show_joint_table_ee()
 
-    # # Open3DSceneVisualizer(scene).show_init_poses_debug(4, sort_by_seam_x=True)
-    # # Open3DSceneVisualizer(scene).show_goal_pose_collision("backhand", 0)
-    # # Open3DSceneVisualizer(scene).show_goal_pose(hand="backhand", variant=0, goal_index=1)
-    # Open3DSceneVisualizer(scene).show_init_pose_prefilter(stage=2)#stage=1/2/3
+    # # # Open3DSceneVisualizer(scene).show_init_poses_debug(4, sort_by_seam_x=True)
+    # # # Open3DSceneVisualizer(scene).show_goal_pose_collision("backhand", 0)
+    # # # Open3DSceneVisualizer(scene).show_goal_pose(hand="backhand", variant=0, goal_index=1)
+    # # Open3DSceneVisualizer(scene).show_init_pose_prefilter(stage=2)#stage=1/2/3
 
 
-    # Open3DSceneVisualizer(scene).show_seam(106)
-    # # Open3DSceneVisualizer(scene).show_seam_all_isaacsim()
+    # # Open3DSceneVisualizer(scene).show_seam(106)
+    # # # Open3DSceneVisualizer(scene).show_seam_all_isaacsim()
     # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(traj_index=0, headless=args.headless)
 
 def main():

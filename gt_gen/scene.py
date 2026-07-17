@@ -417,6 +417,15 @@ class Scene:
         self._fastctx_key = None    # workpiece_obj：_fastctx 复用标识
         self._dirty: set = set()    # {"worlds","truth_scene","goal"} 缓存失效标记
 
+        # ===== _build_explore_world 的重型 handle 复用（仿 _fastctx/_k2ctx）=====
+        # h_expl(VOXEL) 与场景无关、每轮 sync 全量覆盖 ESDF → 全程复用；
+        # h_truth(MESH) 依赖工件摆放+障碍，建 1 次后 update_world；cam 与场景无关。
+        # 换工件(key 变)整体失效；句柄不进 save 白名单，load 后自动为 None。
+        self._explore_h_truth = None
+        self._explore_h_expl = None
+        self._explore_cam = None
+        self._explore_key = None    # workpiece_obj：三个 handle 的复用标识
+
     # ------------------------------------------------------------------
     # 焊缝
     # ------------------------------------------------------------------
@@ -1319,6 +1328,12 @@ class Scene:
         摆到 base 系。返回 ctx dict：
           h_truth(MESH 真值 handle) / h_expl(VOXEL 三态 handle) / truth_scene(base 系 trimesh，raycast 源) /
           cam(相机模型) / world(MESH WorldConfig，兼作步② world_plan) / device。
+
+        【句柄复用，仿 _fastctx/_k2ctx】同一工件（workpiece_obj）跨多次调用只建 1 次重型 handle：
+          · h_expl(VOXEL) 与场景内容无关（每轮 generate_gt 步0 sync_collision_world 全量覆盖 ESDF）→ 全程复用；
+          · h_truth(MESH) 依赖工件摆放+障碍，建 1 次后用 mg.update_world(world) 更新碰撞世界（省重建+warmup）；
+          · cam 与场景无关，建 1 次复用。
+        换工件（key 变）→ 三者整体重建。句柄不进 save 白名单，load 后自动为 None（跨进程不泄漏）。
         ⚠ 会 import/初始化 warp+curobo，污染本进程；须在【未启动 SimulationApp 的进程】里调用。
         """
         if self.cur_init_pose is None:
@@ -1328,13 +1343,16 @@ class Scene:
         import gt_gen.compat as _compat  # noqa: F401  warp shim（须在 import curobo 前）
         _compat.apply_trimesh_shim()
 
-        # compute_goal_pose 的 ES 优化器（num_envs≈800）此时已出作用域；显式回收显存，
-        # 否则接着建 h_truth+h_expl 两个 MotionGen 易 CUDA OOM（小显存卡尤甚）。
-        import gc
-        import torch
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 首次构建两个 MotionGen 前，回收 compute_goal_pose 的 ES 优化器（num_envs≈800）残留显存，
+        # 否则易 CUDA OOM（小显存卡尤甚）。复用路径（只 update_world）不再有此压力，跳过省 GPU 同步。
+        reuse = (self._explore_key == self.workpiece_obj
+                 and self._explore_h_truth is not None and self._explore_h_expl is not None)
+        if not reuse:
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         from gt_gen import curobo_iface as ci
         from gt_gen.sensor import load_camera_model, load_truth_scene
@@ -1359,17 +1377,30 @@ class Scene:
                 pose=wp_pose7))                          # 障碍与工件同 pose → 一并进 base 系
         world = WorldConfig(mesh=meshes)                 # MESH 真值世界（工件+障碍），兼作步② world_plan
 
-        print(f"[scene] _build_explore_world：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
         _t0 = time.perf_counter()
-        h_truth = ci.init_curobo(self.cfg, world_model=world,
-                                 collision_checker_type=CollisionCheckerType.MESH,
-                                 position_threshold=0.05, rotation_threshold=0.5)
-        _t_truth = time.perf_counter()
-        print("[scene] _build_explore_world：建 h_expl（VOXEL 三态）...")
-        h_expl = ci.init_curobo(self.cfg)
+        if reuse:
+            # h_truth：建 1 次后只更新碰撞世界（工件摆放随 init pose 变 / 障碍变都靠 update_world 生效），
+            # 省掉重建 MotionGen + warmup（~19s）。h_expl 与场景无关、每轮 sync 全量覆盖 ESDF，直接复用。
+            print(f"[scene] _build_explore_world：复用 handle，update_world（工件 + {len(obs_tms)} 障碍实体）...")
+            h_truth = self._explore_h_truth
+            h_truth.mg.update_world(world)
+            h_expl = self._explore_h_expl
+            _t_truth = time.perf_counter()
+        else:
+            print(f"[scene] _build_explore_world：建 h_truth（MESH，工件 + {len(obs_tms)} 障碍实体）...")
+            h_truth = ci.init_curobo(self.cfg, world_model=world,
+                                     collision_checker_type=CollisionCheckerType.MESH,
+                                     position_threshold=0.05, rotation_threshold=0.5)
+            _t_truth = time.perf_counter()
+            print("[scene] _build_explore_world：建 h_expl（VOXEL 三态）...")
+            h_expl = ci.init_curobo(self.cfg)
+            self._explore_h_truth = h_truth
+            self._explore_h_expl = h_expl
+            self._explore_key = self.workpiece_obj
         if _PROFILEMAIN:
+            _tag = "update_world" if reuse else "build"
             print(f"[PROFILEMAIN][_build_explore_world] h_truth(MESH)={_t_truth - _t0:.3f}s "
-                  f"h_expl(VOXEL)={time.perf_counter() - _t_truth:.3f}s")
+                  f"h_expl(VOXEL)={time.perf_counter() - _t_truth:.3f}s [{_tag}]")
 
         # truth_scene（base 系 trimesh）：工件 + 障碍（同一 T 变到 base 系）
         work_mesh = load_truth_scene(self.workpiece_obj, mesh_pose=wp_pose7)
@@ -1380,7 +1411,10 @@ class Scene:
             tms.append(tmc)
         truth_scene = _trimesh.util.concatenate(tms) if len(tms) > 1 else work_mesh
 
-        cam = load_camera_model(self.cfg)
+        # cam 与场景无关，建 1 次全程复用
+        if self._explore_cam is None or self._explore_key != self.workpiece_obj:
+            self._explore_cam = load_camera_model(self.cfg)
+        cam = self._explore_cam
         return Ctx(h_truth=h_truth, h_expl=h_expl, truth_scene=truth_scene,
                    cam=cam, world=world, device=device)
 
@@ -1716,6 +1750,13 @@ class Scene:
         wp_mesh_dbg = SimpleNamespace(
             file_path=self.workpiece_obj,
             pose=list(np.asarray(self.cur_init_pose.workpiece_pose7, float)))
+
+        # —— 手动调试：放置前先看一眼 工件 + 扫掠走廊 + goal（无障碍）——
+        opl._debug_show_sweep(
+            per_wp, link, prims=None,
+            cfg=self.cfg, goal_pos=goal_pos,
+            workpiece_mesh=wp_mesh_dbg, seam_line=seam_base,
+            title=f"{link} 放置前（工件+扫掠+goal）")
 
         # —— 采样参数（seed+seam_id 决定 rng，可复现；关键字显式传入优先）——
         op = self.cfg.obstacle_placement

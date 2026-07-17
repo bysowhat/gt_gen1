@@ -834,9 +834,9 @@ def place_in_corridor(per_wp, origin, link, otype, *, size_scale, rot_jitter_deg
                 thickness=float(thickness), shape=shape, yaw_deg=float(psi),
                 push_vec=[float(x) for x in v], push_norm=float(np.linalg.norm(v)))
     # —— 【手动可视化】放置后连障碍一起看（默认注释关）——
-    # _debug_show_sweep(per_wp, link, prims, cfg=cfg, anchor=anchor_eff, goal_pos=goal_pos,
-    #                   workpiece_mesh=workpiece_mesh, seam_line=seam_line,
-    #                   title=f"{link}/{otype} t={t_k}(放置后)")
+    _debug_show_sweep(per_wp, link, prims, cfg=cfg, anchor=anchor_eff, goal_pos=goal_pos,
+                      workpiece_mesh=workpiece_mesh, seam_line=seam_line,
+                      title=f"{link}/{otype} t={t_k}(放置后)")
     return prims, anchor_eff, meta
 
 
