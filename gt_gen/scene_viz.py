@@ -1290,6 +1290,7 @@ class Open3DSceneVisualizer(SceneVisualizer):
         """
         import os
         import sys
+        import time
         import numpy as np
 
         scene = self.scene
@@ -1739,6 +1740,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
                     if flash_timer[c] > 0:
                         flash_timer[c] -= 1
                 world.step(render=True)
+                if fps and fps > 0:
+                    time.sleep(1.0 / fps)          # 按 fps 节流：否则一帧一路点、随渲染帧率狂奔
                 if not world.is_playing():
                     continue
                 if i < pad.shape[0]:
@@ -1778,6 +1781,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
             i = hold = 0
             while simulation_app.is_running():
                 world.step(render=True)
+                if fps and fps > 0:
+                    time.sleep(1.0 / fps)          # 按 fps 节流：否则一帧一路点、随渲染帧率狂奔
                 if not world.is_playing():
                     continue
                 if i < pad.shape[0]:

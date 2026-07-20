@@ -313,7 +313,11 @@ def viz(args):
     scene.summarize_trajectories()
     time.sleep(3)
     # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=0,hand="forehand")
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.pkl_hand,ds=args.ds,fps=3)
+    if args.ds:
+        fps = 3
+    else:
+        fps = 30
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.pkl_hand,ds=args.ds,fps=fps)
 
   
 

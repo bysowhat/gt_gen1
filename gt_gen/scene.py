@@ -899,12 +899,24 @@ class Scene:
         """
         items = []          # 每条成功轨迹一项：(seam_id, hand, index)
         total = 0
+        # 每个 (sid, hand) 累积各成功轨迹的 (采样前步数, 采样后步数)；采样后取自
+        # self.sampled_trajectories（与 self.trajectories 平行、按下标 1:1 对齐），
+        # 未做下采样或该条无采样结果则记 None。
+        sampled = getattr(self, "sampled_trajectories", None) or {}
+        steps_by_seam_hand: Dict[Tuple[int, str], list] = {}
         for sid in sorted(self.trajectories):
             for (hand, index), lst in self.trajectories[sid].items():
-                for e in lst:
+                samp_list = sampled.get(sid, {}).get((hand, index))
+                for j, e in enumerate(lst):
                     total += 1
-                    if e.get("status") == success_status:
-                        items.append((sid, hand, index))
+                    if e.get("status") != success_status:
+                        continue
+                    items.append((sid, hand, index))
+                    pre = len(e.get("positions", []))
+                    post = None
+                    if samp_list is not None and j < len(samp_list) and samp_list[j] is not None:
+                        post = len(samp_list[j])
+                    steps_by_seam_hand.setdefault((sid, hand), []).append((pre, post))
         items.sort(key=lambda t: (t[0], t[1], t[2]))
 
         by_seam_hand: Dict[Tuple[int, str], int] = {}
@@ -914,7 +926,12 @@ class Scene:
         if verbose:
             print(f"[scene] 成功轨迹 {len(items)}/{total} 条（status=={success_status}）")
             for (sid, hand), cnt in sorted(by_seam_hand.items()):
-                print(f"  seam#{sid:<4} {hand:<9} × {cnt}")
+                steps = steps_by_seam_hand.get((sid, hand), [])
+                # 每条成功轨迹 "301步/25步"（无采样结果则只显示采样前）；多条用逗号分隔
+                parts = [f"{pre}步（采样前）/{post}步（采样后）" if post is not None
+                         else f"{pre}步（采样前）" for pre, post in steps]
+                tail = ("  " + ", ".join(parts)) if parts else ""
+                print(f"  seam#{sid:<4} {hand:<9} × {cnt}{tail}")
         return dict(total_success=len(items), total=total,
                     items=items, by_seam_hand=by_seam_hand)
 

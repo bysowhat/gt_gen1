@@ -16,7 +16,7 @@
 #   scripts/bash/v1/traj_downsample_batch.sh /media/a/新加卷/tempt/6/tempt /media/a/新加卷/tempt/6/ds
 # 服务器（环境参考 run_obstacle_type1.sh，覆盖 PY / NUM_GPUS）：
 #   PY=/workspace/isaaclab/_isaac_sim/python.sh NUM_GPUS=8 \
-#       scripts/bash/v1/traj_downsample_batch.sh <in> <out>
+#       scripts/bash/v1/traj_downsample_batch.sh /kpfs_dataset_ssd/dataset/render_baiyu/tempt /kpfs_dataset_ssd/dataset/render_baiyu/tempt2
 # 后台长跑（断开 ssh 不中断）：
 #   nohup scripts/bash/v1/traj_downsample_batch.sh <in> <out> > ds.out 2>&1 &
 #
