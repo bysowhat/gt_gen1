@@ -1,0 +1,53 @@
+# 分段关键帧采样配置（基于MapAnything参数）
+experiment_name: segmented_sampling_mapanything
+
+# 数据路径
+data_root: traj_demo/imgs
+output_dir: output
+
+# 设备配置
+use_gpu: true
+device: null  # null表示自动选择，或指定 "cuda", "cpu", "cuda:0" 等
+
+# 共视率计算参数（MapAnything官方参数）
+covisibility:
+  # 深度关联误差阈值（MapAnything GT参数）
+  depth_assoc_error_thres: 0.1      # C_abs: 绝对误差阈值（米）
+  depth_assoc_rel_error_thres: 0.005 # C_rel: 相对误差阈值（相对于期望深度）
+  depth_assoc_error_temp: 0.1        # C_temp: 误差温度参数
+  
+  # 动态阈值公式：threshold = C_abs + C_rel * D_expected - log(0.5) * C_temp
+  # 在5.0m处的总阈值 = 0.1 + 0.005 * 5.0 - log(0.5) * 0.1 = 0.1 + 0.025 + 0.069 = 0.194m
+  
+  # 其他参数
+  denominator_mode: "valid_target_depth"  # 分母模式："valid_target_depth" 或 "full"
+  min_depth: 0.04  # 最小有效深度（米）
+  
+  # 矩阵缓存
+  load_overlap_matrix: null  # 加载已计算的共视率矩阵（.npy文件路径），null表示重新计算
+  save_overlap_matrix: null  # 保存共视率矩阵（.npy文件路径），null表示不保存
+
+# SE(3)距离计算参数
+se3_action:
+  w_trans: 1.0  # 平移权重
+  w_rot: 1.0    # 旋转权重
+
+# 分段采样参数
+sampling:
+  # 硬性节点（null表示自动生成，或指定列表如 [0, 50, 100, 150]）
+  nodes: null
+  
+  # 双重约束阈值
+  overlap_threshold: 0.25  # 最小共视率阈值
+  D_target: 0.1            # 最小运动成本阈值（SE(3)距离）
+  
+  # 路径搜索参数
+  max_path_length: 16      # 最大路径长度（软限制）
+  max_jump_distance: 10   # 最大跳跃距离（帧数）
+
+# 可视化参数
+visualization:
+  output_matrix: "output/segmented_sampling.png"           # 矩阵分析图输出路径
+  output_statistics: "output/segmented_sampling_stats.png" # 统计图输出路径
+  output_indices: "output/sampled_indices.json"            # 采样索引文件（供MapAnything工程师使用）
+

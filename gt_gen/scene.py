@@ -396,6 +396,10 @@ class Scene:
                                                                           # 每条成功轨迹对应候选当时的 compute_goal_pose 结果快照，
                                                                           # 供 show_trajectory_isaacsim 按 traj_index 还原正确的视锥（
                                                                           # self.goal_poses 是全局单值，会被后续候选覆盖，不够用）
+        # 关键帧下采样结果（scripts/traj_downsample.py 产出），与 self.trajectories 平行、结构镜像：
+        # {seam_id: {(hand,index): [每条 entry 的 (L,8) numpy 或 None]}}，与 trajectories[sid][(hand,index)]
+        # 的 entry 列表 1:1 对齐——reached 的 entry 存 (L,8)=[q1..q6,observe,goal]，其余存 None。
+        self.sampled_trajectories: Dict[int, Dict[Tuple[str, int], list]] = {}
         self.obstacles: Dict[int, Dict[str, list]] = {}   # {seam_id: {"forehand":[ObstacleSpec...], "backhand":[...]}}
                                                            # 已放障碍，按【焊缝 → 手别】分组：类型1 挂到所依附轨迹的手别，
                                                            # 类型2/3 挂到当前 init pose 手别（cur_init_hand）。正/反手各自隔离，
@@ -988,6 +992,8 @@ class Scene:
                         for sid, res in self.goal_poses.items()},   # {seam_id: dict|None}
             trajectories={sid: {k: list(v2) for k, v2 in d.items()}
                           for sid, d in self.trajectories.items()},   # {seam_id: {(hand,index): list[dict]}}（positions 等均 numpy，可直接 pickle）
+            sampled_trajectories={sid: {k: list(v2) for k, v2 in d.items()}
+                                  for sid, d in self.sampled_trajectories.items()},   # {seam_id: {(hand,index): [(L,8) numpy 或 None]}}（关键帧下采样，与 trajectories 1:1 对齐）
             trajectory_goal_poses={sid: {k: ({kk: _to_np(vv) for kk, vv in res.items()} if res else None)
                                           for k, res in d.items()}
                                    for sid, d in self.trajectory_goal_poses.items()},   # {seam_id: {(hand,index): goal_pose结果}}
@@ -1037,6 +1043,7 @@ class Scene:
         self.obstacles = state.get("obstacles", {}) or {}
         self.goal_poses = state.get("goal_poses", {}) or {}
         self.trajectories = state.get("trajectories", {}) or {}   # {seam_id: {(hand,index): list[dict]}}
+        self.sampled_trajectories = state.get("sampled_trajectories", {}) or {}   # {seam_id: {(hand,index): [(L,8) numpy 或 None]}}
         self.trajectory_goal_poses = state.get("trajectory_goal_poses", {}) or {}   # {seam_id: {(hand,index): goal_pose结果}}
         cur_cands = self.init_pose_candidates.get(self.seam_id, {})
         n_f = len(cur_cands.get("forehand", []))

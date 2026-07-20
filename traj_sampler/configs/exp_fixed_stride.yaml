@@ -1,0 +1,10 @@
+experiment_name: fixed_stride_5
+sampler:
+  type: time
+  params:
+    stride: 5
+
+# DP网络训练参数
+obs_len: 5      # 观测窗口长度（观测帧数）
+pred_len: 5     # 预测窗口长度（预测帧数）
+

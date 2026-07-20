@@ -51,6 +51,18 @@ class Config:
         return self.raw["output"]["root"]
 
     @property
+    def traj_downsample(self) -> dict:
+        """关键帧稀疏采样参数（configs/default.yaml traj_downsample）。
+        缺省给一份与旧行为一致的默认值，兼容未含该段的旧配置快照。"""
+        d = self.raw.get("traj_downsample", {}) or {}
+        return dict(
+            w_trans=float(d.get("w_trans", 1.0)),
+            w_rot=float(d.get("w_rot", 0.1)),
+            D_target=float(d.get("D_target", 0.1)),
+            node_step=int(d.get("node_step", 50)),
+        )
+
+    @property
     def constraint_scope(self) -> str:
         return self.raw["constraint"]["scope"]
 

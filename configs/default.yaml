@@ -3,14 +3,20 @@
 output:                                 # 生产轨迹结果落盘（scripts/demo_scene.py 各 demo）
   root: "/media/a/新加卷/tempt/5"        # 结果根目录；文件名含工件名以区分不同工件
 
+traj_downsample:                        # 关键帧稀疏采样参数（scripts/traj_downsample.py：Scene 轨迹 → (L,8) 关键帧）
+  w_trans: 1.0                          # SE(3) 运动度量平移权重
+  w_rot: 0.1                            # SE(3) 运动度量旋转权重（rad→m 折算，1 rad ≈ w_rot 米）
+  D_target: 0.1                         # 图搜索相邻关键帧目标运动量阈值（SE(3) 距离）
+  node_step: 500                         # 固定锚点节点步长：每 node_step 帧保底一个关键帧（首尾必含）
+
 seam:                                   # 焊缝加载/过滤（Scene._load_seam）
   min_length_cm: 3.0                    # 焊缝长度(corrected_p0↔p1 直线距离)小于此值的焊缝丢弃
 
 robot:                                  # 决策 B
-  # cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
-  # usd_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/robot_description_wo_cam_cover.usd"
-  cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
-  usd_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/robot_description_wo_cam_cover.usd"
+  cfg_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/ur12e_full.yml"
+  usd_path: "/home/a/Datas/curobo/example_new_robot/urdf_12e_260626/robot_description_wo_cam_cover.usd"
+  # cfg_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/ur12e_full.yml"
+  # usd_path: "/kpfs_dataset/dataset/baiyu/code/render/urdf_12e_260626_remote/robot_description_wo_cam_cover.usd"
   # 新版机械臂(2026-06-26)：base=a1_ground_rail_platform, accessory=No012_TRM651, cable=No001_12ebarket。
   # 由 scripts/build_robot_from_xacro_pkg.py 从 urdf_12e_260626/xiaoyu_description 离线生成(碰撞球 CPU 拟合)。
   # ee_link / joint_names / retract_config 从上面的 cfg 读取，不在此重复

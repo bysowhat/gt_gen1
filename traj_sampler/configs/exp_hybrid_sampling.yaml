@@ -1,0 +1,13 @@
+experiment_name: hybrid_covisibility_action
+sampler:
+  type: hybrid
+  params:
+    min_overlap: 0.25  # 最小重叠率，低于此值必须采样
+    max_overlap: 0.75  # 最大重叠率，高于此值跳过采样
+    action_threshold: 0.125  # 动作幅度阈值（当共视率在合理范围内时使用）
+    rot_weight: 1.0   # 旋转权重λ
+
+# DP网络训练参数
+obs_len: 5      # 观测窗口长度（观测帧数）
+pred_len: 5     # 预测窗口长度（预测帧数）
+

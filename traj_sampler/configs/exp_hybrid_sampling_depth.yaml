@@ -1,0 +1,22 @@
+experiment_name: hybrid_covisibility_action_depth
+sampler:
+  type: hybrid
+  params:
+    min_overlap: 0.25  # 最小重叠率，低于此值必须采样
+    max_overlap: 0.75  # 最大重叠率，高于此值跳过采样
+    action_threshold: 0.125  # 动作幅度阈值（当共视率在合理范围内时使用）
+    rot_weight: 1.0   # 旋转权重λ
+    use_depth_reprojection: true  # 使用深度重投影验证方法（MapAnything方法）
+    # 深度重投影参数（参考MapAnything实现）
+    depth_threshold: 0.01  # 深度误差阈值（米），向后兼容参数（绝对误差阈值）
+    depth_assoc_error_thres: 0.01  # 深度关联绝对误差阈值（米）
+    depth_assoc_rel_error_thres: 0.0  # 深度关联相对误差阈值（相对于期望深度）
+                                    # 设置为0.0使用固定阈值，设置>0（如0.02）启用动态阈值
+    depth_assoc_error_temp: 0.0  # 深度关联误差温度参数
+    denominator_mode: "valid_target_depth"  # 分母模式："valid_target_depth" 或 "full"
+    min_depth: 0.04  # 最小有效深度（米）
+
+# DP网络训练参数
+obs_len: 5      # 观测窗口长度（观测帧数）
+pred_len: 5     # 预测窗口长度（预测帧数）
+

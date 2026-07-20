@@ -2078,7 +2078,8 @@ class Open3DSceneVisualizer(SceneVisualizer):
                                  traj_index: int = -1, headless: bool = False,
                                  fps: int = 30, goal_variant: int = 0,
                                  flash_peak: float = 6e4, flash_decay: int = None,
-                                 goal_hold: int = None, base_intensity: float = 250.0):
+                                 goal_hold: int = None, base_intensity: float = 250.0,
+                                 ds: bool = False):
         """用 **isaacsim** 回放【边走边看轨迹】（Scene.plan_explore_path 产出）。
 
         base 系里机械臂沿 GT 关节序列逐帧运动，同屏显示工件 + 障碍物 + goal 观测视锥/真实相机
@@ -2101,6 +2102,9 @@ class Open3DSceneVisualizer(SceneVisualizer):
           flash_peak / flash_decay / goal_hold / base_intensity:
               闪光回放参数——爆闪峰值强度 / 衰减帧数(缺省 fps//4) / goal 停顿帧数(缺省 fps//2) /
               压暗后基础 DomeLight 强度。entry 里有 observe/goal 时自动进入闪光模式（见 show_scene_isaacsim）。
+          ds          : False（默认）=回放原始稠密轨迹 entry["positions"]；True=回放
+                        scripts/traj_downsample.py 产出的【关键帧采样后】轨迹（scene.sampled_trajectories，
+                        与 trajectories 1:1 对齐的 (L,8) 数组：前 6 列关节角、第 7/8 列 observe/goal）。
         """
         import numpy as np
 
@@ -2108,8 +2112,16 @@ class Open3DSceneVisualizer(SceneVisualizer):
         n_seam = len(scene.seams)
         sid = scene.seam_id if seam_id is None else int(seam_id) % n_seam
         traj_map = scene.trajectories.get(sid, {})
-        trajs = [(key, e) for key, lst in traj_map.items() for e in lst
-                 if hand is None or key[0] == hand]
+        sampled_map = scene.sampled_trajectories.get(sid, {}) if ds else {}
+        # 与原稠密轨迹 1:1 对齐地铺平（ds 时同时带上对应的采样后数组，None=该条未被采样）
+        trajs = []
+        for key, lst in traj_map.items():
+            if hand is not None and key[0] != hand:
+                continue
+            slst = sampled_map.get(key, []) if ds else []
+            for i, e in enumerate(lst):
+                s = slst[i] if i < len(slst) else None
+                trajs.append((key, e, s))
         if not trajs:
             raise RuntimeError(
                 f"无可回放轨迹：seam_id={sid}"
@@ -2118,11 +2130,22 @@ class Open3DSceneVisualizer(SceneVisualizer):
         n = len(trajs)
         if not (-n <= int(traj_index) < n):
             raise IndexError(f"traj_index 越界：{traj_index}，共 {n} 条轨迹")
-        key, entry = trajs[int(traj_index)]
-        positions = np.asarray(entry["positions"], float)
-        observe = entry.get("observe")
-        goal = entry.get("goal")
-        print(f"[viz] 回放轨迹 seam#{sid} #{int(traj_index) % n}/{n}：init pose={key[0]}#{key[1]} "
+        key, entry, sampled = trajs[int(traj_index)]
+        if ds:
+            if sampled is None:
+                raise RuntimeError(
+                    f"该条轨迹无采样结果（seam#{sid} {key[0]}#{key[1]} 第 {int(traj_index) % n} 条，"
+                    f"status={entry.get('status')}）——请先跑 scripts/traj_downsample.py 生成 sampled_trajectories")
+            arr = np.asarray(sampled, float)                       # (L,8)=[q1..q6, observe, goal]
+            positions = arr[:, :6]
+            observe = arr[:, 6].astype(np.int64)
+            goal = arr[:, 7].astype(np.int64)
+        else:
+            positions = np.asarray(entry["positions"], float)
+            observe = entry.get("observe")
+            goal = entry.get("goal")
+        print(f"[viz] 回放{'【采样后】' if ds else ''}轨迹 seam#{sid} #{int(traj_index) % n}/{n}："
+              f"init pose={key[0]}#{key[1]} "
               f"status={entry.get('status')} 路点={len(positions)} goal=观测位姿#{entry.get('goal_index')}"
               f"（变体#{entry.get('variant')}）")
 

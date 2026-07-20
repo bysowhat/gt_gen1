@@ -1,0 +1,11 @@
+experiment_name: adaptive_overlap
+sampler:
+  type: adaptive
+  params:
+    min_overlap: 0.3 # 最小重叠率
+    max_overlap: 0.75  # 最大重叠率
+
+# DP网络训练参数
+obs_len: 5      # 观测窗口长度（观测帧数）
+pred_len: 5     # 预测窗口长度（预测帧数）
+

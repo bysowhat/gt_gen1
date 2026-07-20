@@ -1,0 +1,11 @@
+experiment_name: distance_0_1m
+sampler:
+  type: spatial
+  params:
+    distance_threshold: 0.01  # 米
+    # angle_threshold: null  # 可选，不设置则只使用距离阈值
+
+# DP网络训练参数
+obs_len: 5      # 观测窗口长度（观测帧数）
+pred_len: 5     # 预测窗口长度（预测帧数）
+

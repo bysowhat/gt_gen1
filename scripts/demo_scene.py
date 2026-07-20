@@ -313,7 +313,7 @@ def viz(args):
     scene.summarize_trajectories()
     time.sleep(3)
     # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=0,hand="forehand")
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.hand)
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.pkl_hand,ds=args.ds,fps=3)
 
   
 
@@ -325,6 +325,8 @@ def main():
     ap.add_argument("--pkl", help="保存轨迹的pkl文件")
     ap.add_argument("--pkl-seamid", type=int, help="保存轨迹的pkl文件")
     ap.add_argument("--pkl-hand", help="保存轨迹的pkl文件")
+    ap.add_argument("--ds", action="store_true",
+                    help="viz：回放【关键帧采样后】轨迹（scene.sampled_trajectories，需先跑 scripts/traj_downsample.py）")
     ap.add_argument("--task", default="viz", choices=["type1", "type2", "viz"],
                     help="批处理任务：type1=障碍类型1 / type2=障碍类型2 / viz=本地可视化调试（默认）")
     ap.add_argument("--out-root", default=None,

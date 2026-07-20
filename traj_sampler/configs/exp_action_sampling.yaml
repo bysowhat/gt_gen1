@@ -1,0 +1,12 @@
+experiment_name: se3_action_0_1
+sampler:
+  type: action_proxy
+  params:
+    action_threshold: 0.1  # 动作幅度阈值（米 + 弧度*权重）
+    rot_weight: 1.0        # 旋转权重λ，用于平衡平移和旋转
+    use_accumulated: true  # 是否使用累积动作幅度模式
+
+# DP网络训练参数
+obs_len: 5      # 观测窗口长度（观测帧数）
+pred_len: 5     # 预测窗口长度（预测帧数）
+

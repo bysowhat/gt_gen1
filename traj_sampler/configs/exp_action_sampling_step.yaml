@@ -1,0 +1,12 @@
+experiment_name: se3_action_step_0_05
+sampler:
+  type: action_proxy
+  params:
+    action_threshold: 0.05  # 单步动作幅度阈值
+    rot_weight: 1.0         # 旋转权重
+    use_accumulated: false  # 使用单步模式（计算相邻帧之间的动作）
+
+# DP网络训练参数
+obs_len: 5      # 观测窗口长度（观测帧数）
+pred_len: 5     # 预测窗口长度（预测帧数）
+

@@ -1,0 +1,23 @@
+# ============================================================================
+# [LEGACY / 已弃用] 仅供老 traj_sampler/down_sampling.py（消费旧 STOMP (B,D,M) 格式）。
+#
+# 新链路（scripts/traj_downsample.py 消费 Scene pkl）**不读本文件**，采样参数已迁到
+#   configs/default.yaml → traj_downsample 段（w_trans/w_rot/D_target/node_step）。
+# 本文件的 sampling.nodes / res_ratio 也不再使用（新链路 node_step 自动生成节点、
+# B=1 无跨批 res_ratio 筛选）。请勿在新代码中引用本文件。
+# ============================================================================
+
+# SE(3)距离计算参数
+se3_action:
+  w_trans: 1.0  # 平移权重
+  w_rot: 0.1    # 旋转权重  meaning: w_rot [m/rad], 1 rad equivalent to w_rot meter
+
+
+# 分段采样参数
+sampling:
+  # 硬性节点（null表示自动生成，或指定列表如 [0, 50, 100, 150]）
+  nodes: null
+
+  # 约束阈值
+  D_target: 0.1            # 最小运动成本阈值（SE(3)距离）
+  res_ratio: 0.3           # 保留率
