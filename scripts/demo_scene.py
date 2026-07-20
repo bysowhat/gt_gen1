@@ -304,14 +304,16 @@ def obstacle_type1_demo_main(args):
     print(f"[demo] type1 全部焊缝完成 → {out_root or scene.cfg.output_root}")
     
 
-def viz(fp):
+def viz(args):
     from gt_gen.scene import Scene
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
 
-    scene = Scene.load(fp)
+    scene = Scene.load(args.pkl)
     scene.summarize_trajectories()
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=0,hand="backhand")
+    time.sleep(3)
+    # Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=0,hand="forehand")
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.hand)
 
   
 
@@ -320,6 +322,9 @@ def main():
     ap = argparse.ArgumentParser(description="Scene API demo：初始位姿求解 / 障碍物类型2 / 障碍物类型3 + isaacsim 可视化")
     ap.add_argument("--obj", default=DEFAULT_OBJ, help="工件 mesh（_part.obj / _watertight.obj）")
     ap.add_argument("--weld-json", default=DEFAULT_WELD_JSON, help="焊缝 _weld_angle3.json")
+    ap.add_argument("--pkl", help="保存轨迹的pkl文件")
+    ap.add_argument("--pkl-seamid", type=int, help="保存轨迹的pkl文件")
+    ap.add_argument("--pkl-hand", help="保存轨迹的pkl文件")
     ap.add_argument("--task", default="viz", choices=["type1", "type2", "viz"],
                     help="批处理任务：type1=障碍类型1 / type2=障碍类型2 / viz=本地可视化调试（默认）")
     ap.add_argument("--out-root", default=None,
@@ -349,7 +354,7 @@ def main():
         return
     
     if args.task in ("viz"):
-        viz('/media/a/新加卷/tempt/5/BEAM_1aEEYa00Ed5Z4sE34qDJKu_part_watertight_type2_seam0.pkl')
+        viz(args)
 
     # --task viz（默认）：本地可视化调试入口
     # demo_obstacle_type2(args)
