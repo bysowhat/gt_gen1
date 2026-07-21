@@ -70,3 +70,28 @@ def store_rgb(fname, rgb):
     else:
         bgr = rgb_np
     return cv2.imwrite(str(fname), bgr)
+
+
+def store_seg(fname, data):
+    """把【实例分割 id 图】保存为 16-bit 单通道 PNG（每像素一个整数实例 id）。
+
+    id 本身无颜色语义，靠整数值区分实例（不同实例=不同整数），配套 render_info 里
+    逐帧的 seg_id_to_label 才知道每个整数是哪类物体。故这里落盘的是【原始整数 id】，
+    不上色——渲染侧须设 colorize_instance_segmentation=False。
+
+    Args:
+        fname: 输出路径（必须 .png）
+        data: id 图（numpy 或 torch.Tensor，整数），会 squeeze 成 2D
+    Returns:
+        bool: 是否保存成功
+    """
+    if Path(fname).suffix.lower() != ".png":
+        raise ValueError(f"分割 id 图只支持 .png 后缀，收到: {fname}")
+    # 先用宽整型防止 uint32→uint16 截断，校验后再降到 uint16
+    data_np = to_numpy(data, dtype=np.int64).squeeze()
+    if data_np.ndim != 2:
+        raise ValueError(f"分割 id 图需为 2D，收到维度: {data_np.shape}")
+    lo, hi = int(data_np.min()), int(data_np.max())
+    if lo < 0 or hi > 65535:
+        raise ValueError(f"实例 id 超出 [0,65535]（min={lo} max={hi}），16-bit PNG 无法表示，请改存 npy")
+    return cv2.imwrite(str(fname), data_np.astype(np.uint16))

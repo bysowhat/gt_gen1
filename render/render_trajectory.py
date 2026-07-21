@@ -49,6 +49,9 @@ CAM_LEFT_POS = CAM_LEFT_ROT = CAM_RIGHT_POS = CAM_RIGHT_ROT = None
 CAM_WIDTH = CAM_HEIGHT = CAM_FOCAL_LENGTH = CAM_FOCUS_DISTANCE = None
 CAM_H_APERTURE = CAM_V_APERTURE = CAM_CLIP = None
 DEPTH_KEY = "distance_to_image_plane"
+# 2D 实例分割：每个打了语义标签的 prim 子树一个整数 id（工件/机械臂/各障碍各一 id，
+# 机械臂整体一个 id 不被拆成各 link）。相机侧须 colorize=False 才拿到整数 id 图。
+SEG_KEY = "instance_segmentation_fast"
 
 # ===== 整组离地高度约束（同 render_seam）=====
 FLOOR_CLEARANCE = 0.0
@@ -246,6 +249,11 @@ from isaaclab.sensors.camera import TiledCamera, TiledCameraCfg  # noqa: E402
 import omni.usd  # noqa: E402
 from pxr import Usd, UsdGeom, Gf, UsdPhysics  # noqa: E402
 
+try:  # 给裸 UsdGeom.Mesh（障碍）打语义标签用；新旧 Isaac 命名空间兜底
+    from isaacsim.core.utils.semantics import add_update_semantics  # noqa: E402
+except ImportError:  # pragma: no cover
+    from omni.isaac.core.utils.semantics import add_update_semantics  # noqa: E402
+
 import depth_io  # noqa: E402
 import asset_convert  # noqa: E402
 
@@ -300,7 +308,8 @@ def compute_group_lift(workpiece_path, robot_path=None):
 def make_camera_cfg(prim_path, pos, rot_wxyz):
     return TiledCameraCfg(
         prim_path=prim_path, update_period=0, width=CAM_WIDTH, height=CAM_HEIGHT,
-        data_types=["rgb", DEPTH_KEY],
+        data_types=["rgb", DEPTH_KEY, SEG_KEY],
+        colorize_instance_segmentation=False,  # 拿 (H,W) 整数 id 图（否则输出上色 RGBA）
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=CAM_FOCAL_LENGTH, focus_distance=CAM_FOCUS_DISTANCE,
             horizontal_aperture=CAM_H_APERTURE, vertical_aperture=CAM_V_APERTURE,
@@ -359,6 +368,56 @@ def _cam_pose_arm(cam_pos_w, cam_quat_w, base_pos_w, base_quat_w):
     return _T_to_pose7(T_arm)[None, :]
 
 
+def _link6_index(scene):
+    """在机械臂 articulation 的 body 列表里定位 Link6 的下标（相机挂它上面）。"""
+    names = list(scene["robots"][0].data.body_names)
+    for i, n in enumerate(names):
+        if n == "Link6" or str(n).split("/")[-1] == "Link6":
+            return i
+    raise KeyError(f"body_names 里找不到 Link6：{names}")
+
+
+def _cam_pose_w_from_link6(l6_pos, l6_quat_wxyz, ext_pos, ext_quat_wxyz):
+    """由 Link6 的【活体】世界位姿 ∘ 相机相对 Link6 的固定外参(ROS) → 相机世界位姿(ROS 光学)。
+
+    背景：TiledCamera.pos_w/quat_w_ros 对「挂在关节体、由物理驱动」的相机读回的是陈旧
+    （冻结在初始）值——RTX 渲染读 Fabric 活变换故图像正确，但传感器位姿读 USD 未回写故不变。
+    这里改从物理 tensor 的 Link6 link 位姿(body_link_pos_w/quat_w，逐帧更新)重建：
+    相机世界位姿 = T_link6_w ∘ T_extrinsic(config, ROS)。extrinsic 与相机 spawn 用的
+    OffsetCfg(convention="ros") 同一份，故组合出的正是 ROS 光学相机帧（等价原 quat_w_ros）。
+    """
+    T_l6 = _pose7_to_T(np.concatenate([np.asarray(l6_pos, float), np.asarray(l6_quat_wxyz, float)]))
+    T_ext = _pose7_to_T(np.concatenate([np.asarray(ext_pos, float), np.asarray(ext_quat_wxyz, float)]))
+    T_cam = T_l6 @ T_ext
+    return T_cam[:3, 3], _R_to_quat_wxyz(T_cam[:3, :3])
+
+
+def sanity_check_cam_pose(sim, scene, settle=6, tol=2e-3):
+    """retract 初始态自检：此刻 TiledCamera.pos_w/quat_w_ros 尚未变陈旧(=正确初值)，
+    用它校验「Link6活位姿 ∘ config extrinsic」重建法是否与传感器一致（即 extrinsic 约定没搞反）。
+    偏差应≈0；偏大则说明外参/约定组合有误。只在开跑前跑一次，不影响渲染。"""
+    dt = sim.get_physics_dt()
+    for _ in range(settle):
+        sim.step()
+        scene["robots"][0].update(dt=dt)
+        scene["left_cam"].update(dt=dt)
+        scene["right_cam"].update(dt=dt)
+    l6_idx = _link6_index(scene)
+    rb = scene["robots"][0].data
+    l6_pos = rb.body_link_pos_w[0, l6_idx].detach().cpu().numpy()
+    l6_quat = rb.body_link_quat_w[0, l6_idx].detach().cpu().numpy()
+    for side, cam, epos, equat in (
+            ("left", scene["left_cam"], CAM_LEFT_POS, CAM_LEFT_ROT),
+            ("right", scene["right_cam"], CAM_RIGHT_POS, CAM_RIGHT_ROT)):
+        cpos, cquat = _cam_pose_w_from_link6(l6_pos, l6_quat, epos, equat)
+        spos = cam.data.pos_w[0].detach().cpu().numpy()
+        squat = cam.data.quat_w_ros[0].detach().cpu().numpy()
+        dp = float(np.linalg.norm(cpos - spos))
+        dq = float(min(np.linalg.norm(cquat - squat), np.linalg.norm(cquat + squat)))  # 四元数符号无关
+        flag = "OK" if (dp < tol and dq < tol) else "⚠ 偏大！检查 extrinsic 约定/组合顺序"
+        print(f"[sanity:{side}] retract 相机位姿 计算 vs 传感器: dpos={dp:.5f}m dquat={dq:.5f}  {flag}")
+
+
 # ======================= 场景构建 / 渲染 =======================
 def ordered_joint_row(sim_names, q_row):
     """把一行关节角 q_row（按 cfg JOINT_NAMES 顺序）重排成 robot 内部关节顺序。"""
@@ -385,7 +444,8 @@ def build_scene(robot_usd, workpiece_usd, link6_sub, num_envs, spacing, warehous
             prim_path=f"{env_root}/robot",
             spawn=sim_utils.UsdFileCfg(
                 usd_path=robot_usd,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True)),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
+                semantic_tags=[("class", "robot")]),  # 机械臂整体一个实例 id
             init_state=ArticulationCfg.InitialStateCfg(
                 joint_pos=joint_pos_dict,
                 pos=(float(off[0]), float(off[1]), 0.0), rot=(1.0, 0.0, 0.0, 0.0)),
@@ -394,7 +454,8 @@ def build_scene(robot_usd, workpiece_usd, link6_sub, num_envs, spacing, warehous
         robots.append(Articulation(cfg=rcfg))
 
         wp = f"{env_root}/workpiece"
-        wcfg = sim_utils.UsdFileCfg(usd_path=workpiece_usd)
+        wcfg = sim_utils.UsdFileCfg(usd_path=workpiece_usd,
+                                    semantic_tags=[("class", "workpiece")])
         wcfg.func(wp, wcfg)
         workpiece_paths.append(wp)
 
@@ -415,8 +476,9 @@ def _disable_physics(prim_path):
             UsdPhysics.RigidBodyAPI(pr).GetRigidBodyEnabledAttr().Set(False)
 
 
-def spawn_obstacle_mesh(path, verts, faces, color):
-    """把 base 系实体三角网 spawn 成一个静态 UsdGeom.Mesh。"""
+def spawn_obstacle_mesh(path, verts, faces, color, label=None):
+    """把 base 系实体三角网 spawn 成一个静态 UsdGeom.Mesh。
+    label 非空则给该 prim 打 class 语义标签（实例分割用，逐障碍不同 → obstacle_0/1/...）。"""
     stage = omni.usd.get_context().get_stage()
     m = UsdGeom.Mesh.Define(stage, path)
     m.CreatePointsAttr([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in verts])
@@ -424,6 +486,8 @@ def spawn_obstacle_mesh(path, verts, faces, color):
     m.CreateFaceVertexIndicesAttr(faces.flatten().tolist())
     m.CreateDisplayColorAttr([Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
     m.CreateDoubleSidedAttr(True)
+    if label is not None:
+        add_update_semantics(m.GetPrim(), str(label))
 
 
 def prepare_job(scene, job):
@@ -444,7 +508,8 @@ def prepare_job(scene, job):
             stage.RemovePrim(grp)
         UsdGeom.Xform.Define(stage, grp)
         for oi, (verts, faces, color) in enumerate(job["obstacles"]):
-            spawn_obstacle_mesh(f"{grp}/obs_{oi}", verts + off, faces, color)
+            spawn_obstacle_mesh(f"{grp}/obs_{oi}", verts + off, faces, color,
+                                label=f"obstacle_{oi}")
 
         # 离地抬升（工件 + 机械臂真实 bbox 实测 z 范围，保证二者都在地板上）
         rpath = f"/World/envs/env_{env_idx:02d}/robot"
@@ -453,6 +518,41 @@ def prepare_job(scene, job):
         set_prim_pose(scene["warehouse_paths"][env_idx],
                       (off[0], off[1], -lift), (1.0, 0.0, 0.0, 0.0))
     return lifts
+
+
+def _normalize_seg_labels(raw):
+    """把 Isaac 的 idToLabels 规整成 {int_id: label_str}。
+
+    instance_segmentation_fast 的值通常形如 {"2": {"class": "workpiece"}}；也兜底纯串/其它键。
+    背景/未标注（BACKGROUND/UNLABELLED）一并保留，便于下游按需过滤。
+    """
+    out = {}
+    for k, v in dict(raw).items():
+        try:
+            kid = int(k)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(v, dict):
+            label = v.get("class") or v.get("semantic") or v.get("instance") or str(v)
+        else:
+            label = str(v)
+        out[kid] = label
+    return out
+
+
+def _seg_labels_from_info(info, env_idx=None):
+    """从 camera.data.info 取实例分割 idToLabels 并规整成 {int_id: label}；缺失则空 dict。
+
+    坑：TiledCamera 的 camera.data.info 是 {data_type: info} 的【单 dict】（tiled_camera.py:236/395），
+    并非按 env 的 list——整块 tiled 渲染共用一份 idToLabels，覆盖所有 env 的 prim。故此处按 data_type
+    直接取，不能再用 info[env_idx] 索引（int 索引 dict 会 KeyError，早先被 except 吞掉导致映射恒为空）。
+    env_idx 仅为兼容旧签名保留，不再使用。
+    """
+    try:
+        raw = info[SEG_KEY]["idToLabels"]
+    except (TypeError, KeyError, IndexError):
+        return {}
+    return _normalize_seg_labels(raw)
 
 
 def render_batch(sim, scene, batch_rows, lifts, settle_steps):
@@ -479,22 +579,33 @@ def render_batch(sim, scene, batch_rows, lifts, settle_steps):
     left, right = scene["left_cam"].data, scene["right_cam"].data
     lrgb, ldep = left.output["rgb"], left.output[DEPTH_KEY]
     rrgb, rdep = right.output["rgb"], right.output[DEPTH_KEY]
+    lseg, rseg = left.output[SEG_KEY], right.output[SEG_KEY]   # (N,H,W,1) 整数 id 图
+    linfo, rinfo = left.info, right.info                       # 逐 env 的 idToLabels 等
     lK = left.intrinsic_matrices.detach().cpu().numpy()
     rK = right.intrinsic_matrices.detach().cpu().numpy()
-    lpos, lquat = left.pos_w.detach().cpu().numpy(), left.quat_w_ros.detach().cpu().numpy()
-    rpos, rquat = right.pos_w.detach().cpu().numpy(), right.quat_w_ros.detach().cpu().numpy()
+    # 注意：不再用 left.pos_w/quat_w_ros——它们对关节驱动的相机是陈旧(冻结)值。
+    # 改从 Link6 活位姿(body_link) ∘ config extrinsic 逐帧重建相机世界位姿(见 _cam_pose_w_from_link6)。
+    l6_idx = _link6_index(scene)
 
     out = {}
     for env_idx, _q in batch_rows:
         rb = scene["robots"][env_idx].data
+        l6_pos = rb.body_link_pos_w[0, l6_idx].detach().cpu().numpy()      # Link6 活位姿(世界系)
+        l6_quat = rb.body_link_quat_w[0, l6_idx].detach().cpu().numpy()    # wxyz
+        l_pos_w, l_quat_w = _cam_pose_w_from_link6(l6_pos, l6_quat, CAM_LEFT_POS, CAM_LEFT_ROT)
+        r_pos_w, r_quat_w = _cam_pose_w_from_link6(l6_pos, l6_quat, CAM_RIGHT_POS, CAM_RIGHT_ROT)
         out[env_idx] = dict(
             left_rgb=lrgb[env_idx].detach().cpu().numpy(),
             left_depth=ldep[env_idx, :, :, 0].detach().cpu().numpy(),
             right_rgb=rrgb[env_idx].detach().cpu().numpy(),
             right_depth=rdep[env_idx, :, :, 0].detach().cpu().numpy(),
+            left_seg=lseg[env_idx, :, :, 0].detach().cpu().numpy(),
+            right_seg=rseg[env_idx, :, :, 0].detach().cpu().numpy(),
+            left_seg_labels=_seg_labels_from_info(linfo),
+            right_seg_labels=_seg_labels_from_info(rinfo),
             left_K=lK[env_idx], right_K=rK[env_idx],
-            left_pos_w=lpos[env_idx], left_quat_w=lquat[env_idx],
-            right_pos_w=rpos[env_idx], right_quat_w=rquat[env_idx],
+            left_pos_w=l_pos_w, left_quat_w=l_quat_w,
+            right_pos_w=r_pos_w, right_quat_w=r_quat_w,
             base_pos_w=rb.root_link_pos_w[0].detach().cpu().numpy(),
             base_quat_w=rb.root_link_quat_w[0].detach().cpu().numpy(),
             z_lift=lifts.get(env_idx, 0.0))
@@ -516,6 +627,7 @@ def frame_record_for_side(side, r, job, row_idx, q_row):
         "jointstates": np.asarray(q_row, np.float32),         # 本关键帧关节角(6,)
         "observe": int(job["observe"][row_idx]),
         "goal": int(job["goal"][row_idx]),
+        "seg_id_to_label": dict(r.get(f"{side}_seg_labels", {})),  # 本帧 id→标签映射(逐帧存)
         "cam_pose_w_pos": np.asarray(r[f"{side}_pos_w"], np.float64),
         "cam_pose_w_quat_wxyz": np.asarray(r[f"{side}_quat_w"], np.float64),
         "base_pose_w_pos": np.asarray(r["base_pos_w"], np.float64),
@@ -549,6 +661,9 @@ def build_side_render_info(side, job, records):
         "base_pose_w_quat_wxyz": stk("base_pose_w_quat_wxyz"),
         "z_lift": np.asarray([rec["z_lift"] for rec in records], np.float64),
         "n_frames": int(len(records)),
+        # —— 2D 实例分割：id→标签映射【逐帧各一份】（list 长度 F，与各帧 {k}_seg.png 对应）——
+        "seg_type": SEG_KEY,
+        "seg_id_to_label_list": [rec["seg_id_to_label"] for rec in records],
         # —— 轨迹级常量 ——
         "sampled_len": int(len(job["positions"])),
         "traj_key": {"seam_id": int(sid), "hand": hand, "index": int(index), "traj_j": int(jj)},
@@ -600,8 +715,10 @@ def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps,
             r = rendered[env_idx]
             depth_io.store_rgb(left_dir / f"{k}_rgb.jpg", r["left_rgb"])
             depth_io.store_depth(left_dir / f"{k}_depth.exr", r["left_depth"])
+            depth_io.store_seg(left_dir / f"{k}_seg.png", r["left_seg"])
             depth_io.store_rgb(right_dir / f"{k}_rgb.jpg", r["right_rgb"])
             depth_io.store_depth(right_dir / f"{k}_depth.exr", r["right_depth"])
+            depth_io.store_seg(right_dir / f"{k}_seg.png", r["right_seg"])
             records["left"].append(frame_record_for_side("left", r, job, k, positions[k]))
             records["right"].append(frame_record_for_side("right", r, job, k, positions[k]))
             saved += 1
@@ -645,6 +762,9 @@ def main():
     scene = build_scene(ROBOT_USD, workpiece_usd, link6_sub, num_envs,
                         args_cli.spacing, args_cli.warehouse_usd)
     sim.reset(); sim.play()
+
+    # 开跑前一次性自检：验证「Link6活位姿 ∘ config extrinsic」重建相机位姿与传感器一致
+    sanity_check_cam_pose(sim, scene)
 
     obj_stem = asset_convert._ascii_safe(WORKPIECE_OBJ)
     part_stem = (obj_stem[:-len("_watertight")] if obj_stem.endswith("_watertight") else obj_stem)

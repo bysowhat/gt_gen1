@@ -11,8 +11,8 @@
 
 ```
 <out>/<part_stem>/seam{sid}_{hand}{index}_traj{j}/
-    left/   {k}_rgb.jpg   {k}_depth.exr  ...  render_info.npy   ← 本文档主题（左目）
-    right/  {k}_rgb.jpg   {k}_depth.exr  ...  render_info.npy   ← 右目（结构相同，side="right"）
+    left/   {k}_rgb.jpg   {k}_depth.exr   {k}_seg.png  ...  render_info.npy   ← 本文档主题（左目）
+    right/  {k}_rgb.jpg   {k}_depth.exr   {k}_seg.png  ...  render_info.npy   ← 右目（结构相同，side="right"）
     _traj_meta.npy        ← 轨迹级 meta（见 §5）
     _DONE_...             ← 完成哨兵（断点续跑用）
 ```
@@ -83,6 +83,19 @@ np.save(left_dir / "render_info.npy",
 > 说明：因每帧是不同 env 渲染，`base_pose_w_*`/`z_lift` 逐帧存的是该帧所在 env 的值；
 > 而相机 arm 系位姿 `cam_pos_list/cam_quat_list` 已消去 env 偏移与抬升，是训练直接可用的干净外参。
 
+### 3.1 逐帧的实例分割 id→标签映射（`seg_id_to_label_list`）
+
+| 字段 | 形状/类型 | 含义 |
+|---|---|---|
+| `seg_id_to_label_list` | `list[dict]`，长度 F | 第 `i` 个元素是第 `i` 帧（对应 `{k}_seg.png`）的 `{int_id: label}` 映射，如 `{0:"BACKGROUND", 2:"workpiece", 3:"obstacle_0", 5:"robot"}`。 |
+
+- **为何逐帧存**：一条轨迹的多帧分摊在**多个并行 env**里渲染，Isaac 的实例 id 是运行时分配的、
+  可能逐 env 不同，故每帧各存一份最稳（不依赖「整条轨迹 id 恒定」的假设）。
+- **如何用**：`{k}_seg.png` 是 16-bit 单通道整数图，**同一实例同一整数、不同实例不同整数**；
+  想知道某整数是哪类物体，查该帧的 `seg_id_to_label_list[i]`。两个同类物体（如两个 `workpiece`）
+  会是两个不同整数都映射到 `workpiece`——靠整数值区分实例，靠映射知道类别。
+- `seg_id_to_label_list[i]` 与 `frame_indices[i]`、各逐帧数组第 `i` 行、磁盘 `{frame_indices[i]}_seg.png` 一一对应。
+
 ---
 
 ## 4. 轨迹级常量字段（整条轨迹恒定，不随帧变化）
@@ -106,6 +119,7 @@ np.save(left_dir / "render_info.npy",
 | `extrinsic_convention` | str | `"ros"`，外参约定，见 §2。 |
 | `extrinsic_ref_link` | str | `"Link6"`，外参参考 link。 |
 | `depth_type` | str | `"distance_to_image_plane"`，深度语义，见 §2。 |
+| `seg_type` | str | `"instance_segmentation_fast"`，实例分割 annotator 类型（每个带语义的 prim 子树一个整数 id）。 |
 
 > `left_extrinsic_*` / `right_extrinsic_*` 是配置文件里的**标定外参（相对 Link6）**；
 > 而逐帧 `cam_pos_list/cam_quat_list` 是**渲染实际用到的、相对 base 的相机位姿**——
@@ -141,6 +155,7 @@ np.save(left_dir / "render_info.npy",
 |---|---|---|
 | `{k}_rgb.jpg` | 图片（OpenCV BGR 写盘） | 该帧 RGB，`k` = 关键帧行号。`store_rgb` 内部把 RGB→BGR 后落盘。 |
 | `{k}_depth.exr` | EXR（16-bit half float + ZIP） | 该帧深度图，语义为 `distance_to_image_plane`（到像平面的垂直距离，米）。`store_depth` squeeze 成 2D 后落盘。 |
+| `{k}_seg.png` | PNG（16-bit 单通道） | 该帧【实例分割 id 图】，每像素一个整数实例 id（0=背景类）；对应关系查同帧 `seg_id_to_label_list`（见 §3.1）。`store_seg` 落盘。 |
 
 `{k}` 与 `render_info` 里 `frame_indices` 的元素一一对应：
 `frame_indices[i]` 就是 `render_info` 内第 `i` 帧（各逐帧数组第 `i` 行）对应的磁盘文件 `{k}_rgb.jpg`。
@@ -160,6 +175,9 @@ for i in range(F):
     rgb   = cv2.imread(os.path.join(d, f"{k}_rgb.jpg"))            # (H,W,3) BGR
     depth = cv2.imread(os.path.join(d, f"{k}_depth.exr"),
                        cv2.IMREAD_UNCHANGED)                        # (H,W) float, 米
+    seg   = cv2.imread(os.path.join(d, f"{k}_seg.png"),
+                       cv2.IMREAD_UNCHANGED)                        # (H,W) uint16 实例 id 图
+    id2label = info["seg_id_to_label_list"][i]  # {int_id: label}，本帧映射（见 §3.1）
 
     K       = info["cam_intrinsic"][i]         # (3,3) 内参
     cam_pos = info["cam_pos_list"][i]          # (3,) base 系相机平移（USD 光学）
@@ -185,3 +203,5 @@ wp7  = info["workpiece_pose7"]                 # (7,) base 系工件位姿
 | 写 `render_info.npy` / `_traj_meta.npy` | `render_job()` 末尾 |
 | 相机内外参来源（单一真源） | `_load_cameras_from_config()` ← `configs/default.yaml` |
 | RGB/深度落盘 | `render/depth_io.py` 的 `store_rgb` / `store_depth` |
+| 实例分割 id 图落盘 | `render/depth_io.py` 的 `store_seg`（16-bit PNG） |
+| 分割 id→标签映射规整 | `_normalize_seg_labels()` / `_seg_labels_from_info()` |
