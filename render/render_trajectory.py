@@ -22,6 +22,10 @@
         _traj_meta.npy       # 轨迹级：(L,8) 原数组 + observe/goal + workpiece_pose7 + seam/hand/index …
         _DONE_...            # 完成哨兵（断点续跑）
     （k = 关键帧行号 0..L-1；--observe-only 时只有 observe 帧，帧号可能不连续，render_info.frame_indices 记录映射）
+
+分割类别：{k}_seg.png 含 robot / workpiece / obstacle_* / seam 四类。焊缝(seam)是沿焊缝线建的一根实体管，
+【只出现在分割里】——它平时 invisible，仅在渲染时的第二个 seg-only pass 临时置 visible，故 RGB / depth
+与「无焊缝」逐像素一致（详见 render_batch 双 pass 说明与 docs/渲染整条采样轨迹-方案.md）。
 """
 import argparse
 import os
@@ -49,9 +53,16 @@ CAM_LEFT_POS = CAM_LEFT_ROT = CAM_RIGHT_POS = CAM_RIGHT_ROT = None
 CAM_WIDTH = CAM_HEIGHT = CAM_FOCAL_LENGTH = CAM_FOCUS_DISTANCE = None
 CAM_H_APERTURE = CAM_V_APERTURE = CAM_CLIP = None
 DEPTH_KEY = "distance_to_image_plane"
-# 2D 实例分割：每个打了语义标签的 prim 子树一个整数 id（工件/机械臂/各障碍各一 id，
+# 2D 实例分割：每个打了语义标签的 prim 子树一个整数 id（工件/机械臂/各障碍/焊缝各一 id，
 # 机械臂整体一个 id 不被拆成各 link）。相机侧须 colorize=False 才拿到整数 id 图。
 SEG_KEY = "instance_segmentation_fast"
+
+# ===== 焊缝分割：沿焊缝线建一根实体管(tube)，打 "seam" 语义标签 =====
+# 关键约束：焊缝【只能出现在实例分割里】，RGB / depth 必须与「无焊缝」逐像素一致。
+# Isaac 的 rgb/depth/seg 是同一次光追出的三张 AOV，无「只进 seg、不进 rgb/depth」的单-prim 开关，
+# 故 tube 平时 invisible（rgb/depth 不含它），仅在 seg-only 的第二 pass 里临时置 visible（见 render_batch）。
+SEAM_TUBE_RADIUS = 0.004   # 焊缝管半径(米)，默认 4mm（可由 --seam-radius 覆盖）
+SEAM_TUBE_SIDES = 8        # 焊缝管截面多边形边数
 
 # ===== 整组离地高度约束（同 render_seam）=====
 FLOOR_CLEARANCE = 0.0
@@ -78,6 +89,10 @@ def parse_args():
     p.add_argument("--max-envs", type=int, default=8, help="并行环境数上限")
     p.add_argument("--spacing", type=float, default=40.0, help="相邻环境间距(米)")
     p.add_argument("--settle-steps", type=int, default=12, help="读图前 step 帧数")
+    p.add_argument("--seam-radius", type=float, default=SEAM_TUBE_RADIUS,
+                   help="焊缝分割管半径(米，默认 4mm)")
+    p.add_argument("--seam-settle-steps", type=int, default=4,
+                   help="seg-only 第二 pass 的 step 帧数（焊缝置 visible 后等 seg 更新）")
     p.add_argument("--force-convert", action="store_true", help="强制重转工件 USD")
     return p
 
@@ -477,17 +492,84 @@ def _disable_physics(prim_path):
 
 
 def spawn_obstacle_mesh(path, verts, faces, color, label=None):
-    """把 base 系实体三角网 spawn 成一个静态 UsdGeom.Mesh。
-    label 非空则给该 prim 打 class 语义标签（实例分割用，逐障碍不同 → obstacle_0/1/...）。"""
+    """把 base 系实体三角网 spawn 成一个静态 UsdGeom.Mesh，返回该 Mesh。
+    color 为 None 时不写 DisplayColor（焊缝管走此路：反正 RGB 不渲染它）。
+    label 非空则给该 prim 打 class 语义标签（实例分割用，逐障碍不同 → obstacle_0/1/...；焊缝 → seam）。"""
     stage = omni.usd.get_context().get_stage()
     m = UsdGeom.Mesh.Define(stage, path)
     m.CreatePointsAttr([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in verts])
     m.CreateFaceVertexCountsAttr([3] * len(faces))
     m.CreateFaceVertexIndicesAttr(faces.flatten().tolist())
-    m.CreateDisplayColorAttr([Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
-    m.CreateDoubleSidedAttr(True)
+    if color is not None:
+        m.CreateDisplayColorAttr([Gf.Vec3f(float(color[0]), float(color[1]), float(color[2]))])
+    m.CreateDoubleSidedAttr(True)   # 双面：无需管心面朝向/绕序
     if label is not None:
         add_update_semantics(m.GetPrim(), str(label))
+    return m
+
+
+def _seam_tube_mesh(seam_line, radius, n_sides=SEAM_TUBE_SIDES):
+    """沿 base 系焊缝折线 seam_line(N,3) 生成一根半径 radius 的实体管，返回 (verts(M,3), faces(K,3))。
+
+    每个折线点放一圈 n_sides 顶点(在与切线垂直的平面上)，相邻两圈用四边形(两三角)连成侧面，
+    并封两端。用平行传输(parallel transport)沿折线滚动截面基，避免折线拐弯处圈发生扭转。
+    点数 <2 → 返回 None（无法成管）。双面渲染，故不在意三角绕序/朝向。
+    """
+    P = np.asarray(seam_line, float).reshape(-1, 3)
+    if len(P) < 2:
+        return None
+    n = len(P)
+    tang = np.empty_like(P)                 # 逐点切线（中点用中心差分，端点用单边差分）
+    tang[1:-1] = P[2:] - P[:-2]
+    tang[0] = P[1] - P[0]
+    tang[-1] = P[-1] - P[-2]
+    tang /= np.clip(np.linalg.norm(tang, axis=1, keepdims=True), 1e-12, None)
+
+    def _perp(t):                           # 取一个与 t 垂直的单位向量
+        a = np.array([1.0, 0.0, 0.0]) if abs(t[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(t, a)
+        return u / (np.linalg.norm(u) + 1e-12)
+
+    ang = np.linspace(0.0, 2.0 * np.pi, n_sides, endpoint=False)
+    cos, sin = np.cos(ang)[:, None], np.sin(ang)[:, None]
+    u = _perp(tang[0]); v = np.cross(tang[0], u)
+    rings = []
+    for i in range(n):
+        if i > 0:                           # 平行传输：把上一 u 投影回当前法平面再正交化
+            u = u - float(np.dot(u, tang[i])) * tang[i]
+            if np.linalg.norm(u) < 1e-9:
+                u = _perp(tang[i])
+            u /= np.linalg.norm(u) + 1e-12
+            v = np.cross(tang[i], u)
+        rings.append(P[i] + radius * (cos * u[None, :] + sin * v[None, :]))
+    verts = np.vstack(rings)                # (n*n_sides, 3)
+
+    faces = []
+    for i in range(n - 1):
+        b0, b1 = i * n_sides, (i + 1) * n_sides
+        for k in range(n_sides):
+            kn = (k + 1) % n_sides
+            faces.append([b0 + k, b0 + kn, b1 + kn])
+            faces.append([b0 + k, b1 + kn, b1 + k])
+    c0 = len(verts)                         # 两端盖中心点
+    verts = np.vstack([verts, P[0][None, :], P[-1][None, :]])
+    last = (n - 1) * n_sides
+    for k in range(n_sides):
+        kn = (k + 1) % n_sides
+        faces.append([c0, k, kn])           # 首端盖
+        faces.append([c0 + 1, last + k, last + kn])   # 末端盖
+    return verts, np.asarray(faces, np.int64)
+
+
+def _set_seam_visible(scene, visible):
+    """把各 env 的焊缝管 prim 统一置 visible/invisible（双 pass 渲染切换用）。缺失则忽略。"""
+    stage = omni.usd.get_context().get_stage()
+    for env_idx in range(len(scene["offsets"])):
+        pr = stage.GetPrimAtPath(f"/World/envs/env_{env_idx:02d}/seam/tube")
+        if pr.IsValid():
+            img = UsdGeom.Imageable(pr)
+            img.MakeVisible() if visible else img.MakeInvisible()
+
 
 
 def prepare_job(scene, job):
@@ -510,6 +592,19 @@ def prepare_job(scene, job):
         for oi, (verts, faces, color) in enumerate(job["obstacles"]):
             spawn_obstacle_mesh(f"{grp}/obs_{oi}", verts + off, faces, color,
                                 label=f"obstacle_{oi}")
+
+        # 焊缝：沿 base 系焊缝线 + env 偏移建一根 tube，打 "seam" 标签，【初始 invisible】
+        # （只在 render_batch 的 seg-only 第二 pass 临时 visible；RGB/depth 恒不含它）。
+        sgrp = f"/World/envs/env_{env_idx:02d}/seam"
+        if stage.GetPrimAtPath(sgrp).IsValid():
+            stage.RemovePrim(sgrp)
+        if job["seam_line_base"] is not None:
+            tube = _seam_tube_mesh(np.asarray(job["seam_line_base"], float) + off,
+                                   float(args_cli.seam_radius))
+            if tube is not None:
+                UsdGeom.Xform.Define(stage, sgrp)
+                m = spawn_obstacle_mesh(f"{sgrp}/tube", tube[0], tube[1], None, label="seam")
+                UsdGeom.Imageable(m.GetPrim()).MakeInvisible()
 
         # 离地抬升（工件 + 机械臂真实 bbox 实测 z 范围，保证二者都在地板上）
         rpath = f"/World/envs/env_{env_idx:02d}/robot"
@@ -555,8 +650,11 @@ def _seg_labels_from_info(info, env_idx=None):
     return _normalize_seg_labels(raw)
 
 
-def render_batch(sim, scene, batch_rows, lifts, settle_steps):
-    """batch_rows: list[(env_idx, q_row(6,))]。设各 env 机械臂关节角 → step → 读左右目数据。"""
+def render_batch(sim, scene, batch_rows, lifts, settle_steps, seam_settle_steps):
+    """batch_rows: list[(env_idx, q_row(6,))]。设各 env 机械臂关节角后【双 pass 渲染】：
+      pass1：焊缝管 invisible → 读 RGB/depth（此帧=无焊缝场景，逐像素与不加焊缝一致）；
+      pass2：焊缝管 visible → 只读 seg（RGB/depth 丢弃）→ 复位 invisible。
+    相机内参与世界位姿是几何量、两 pass 相同，在 pass1 后算一次即可。"""
     sim_dt = sim.get_physics_dt()
     device = scene["robots"][0].data.default_root_state.device
     dtype = scene["robots"][0].data.default_root_state.dtype
@@ -569,45 +667,64 @@ def render_batch(sim, scene, batch_rows, lifts, settle_steps):
         robot.set_joint_position_target(q)
         robot.write_data_to_sim()
 
-    for _ in range(settle_steps):
-        sim.step()
-        for env_idx, _q in batch_rows:
-            scene["robots"][env_idx].update(dt=sim_dt)
-        scene["left_cam"].update(dt=sim_dt)
-        scene["right_cam"].update(dt=sim_dt)
+    def _step(n):
+        for _ in range(n):
+            sim.step()
+            for env_idx, _q in batch_rows:
+                scene["robots"][env_idx].update(dt=sim_dt)
+            scene["left_cam"].update(dt=sim_dt)
+            scene["right_cam"].update(dt=sim_dt)
 
+    # ---- pass1：焊缝隐藏 → RGB/depth ----
+    _set_seam_visible(scene, False)
+    _step(settle_steps)
     left, right = scene["left_cam"].data, scene["right_cam"].data
     lrgb, ldep = left.output["rgb"], left.output[DEPTH_KEY]
     rrgb, rdep = right.output["rgb"], right.output[DEPTH_KEY]
-    lseg, rseg = left.output[SEG_KEY], right.output[SEG_KEY]   # (N,H,W,1) 整数 id 图
-    linfo, rinfo = left.info, right.info                       # 逐 env 的 idToLabels 等
     lK = left.intrinsic_matrices.detach().cpu().numpy()
     rK = right.intrinsic_matrices.detach().cpu().numpy()
     # 注意：不再用 left.pos_w/quat_w_ros——它们对关节驱动的相机是陈旧(冻结)值。
     # 改从 Link6 活位姿(body_link) ∘ config extrinsic 逐帧重建相机世界位姿(见 _cam_pose_w_from_link6)。
     l6_idx = _link6_index(scene)
-
-    out = {}
+    # 立即把 RGB/depth 拷到 CPU（pass2 会覆写 camera.output），同时算好相机世界位姿(几何量)。
+    rgbd, campose = {}, {}
     for env_idx, _q in batch_rows:
+        rgbd[env_idx] = dict(
+            left_rgb=lrgb[env_idx].detach().cpu().numpy(),
+            left_depth=ldep[env_idx, :, :, 0].detach().cpu().numpy(),
+            right_rgb=rrgb[env_idx].detach().cpu().numpy(),
+            right_depth=rdep[env_idx, :, :, 0].detach().cpu().numpy())
         rb = scene["robots"][env_idx].data
         l6_pos = rb.body_link_pos_w[0, l6_idx].detach().cpu().numpy()      # Link6 活位姿(世界系)
         l6_quat = rb.body_link_quat_w[0, l6_idx].detach().cpu().numpy()    # wxyz
         l_pos_w, l_quat_w = _cam_pose_w_from_link6(l6_pos, l6_quat, CAM_LEFT_POS, CAM_LEFT_ROT)
         r_pos_w, r_quat_w = _cam_pose_w_from_link6(l6_pos, l6_quat, CAM_RIGHT_POS, CAM_RIGHT_ROT)
-        out[env_idx] = dict(
-            left_rgb=lrgb[env_idx].detach().cpu().numpy(),
-            left_depth=ldep[env_idx, :, :, 0].detach().cpu().numpy(),
-            right_rgb=rrgb[env_idx].detach().cpu().numpy(),
-            right_depth=rdep[env_idx, :, :, 0].detach().cpu().numpy(),
-            left_seg=lseg[env_idx, :, :, 0].detach().cpu().numpy(),
-            right_seg=rseg[env_idx, :, :, 0].detach().cpu().numpy(),
-            left_seg_labels=_seg_labels_from_info(linfo),
-            right_seg_labels=_seg_labels_from_info(rinfo),
-            left_K=lK[env_idx], right_K=rK[env_idx],
+        campose[env_idx] = dict(
             left_pos_w=l_pos_w, left_quat_w=l_quat_w,
             right_pos_w=r_pos_w, right_quat_w=r_quat_w,
             base_pos_w=rb.root_link_pos_w[0].detach().cpu().numpy(),
-            base_quat_w=rb.root_link_quat_w[0].detach().cpu().numpy(),
+            base_quat_w=rb.root_link_quat_w[0].detach().cpu().numpy())
+
+    # ---- pass2：焊缝显示 → 只取 seg（RGB/depth 丢弃）----
+    _set_seam_visible(scene, True)
+    _step(seam_settle_steps)
+    lseg = scene["left_cam"].data.output[SEG_KEY]     # (N,H,W,1) 整数 id 图
+    rseg = scene["right_cam"].data.output[SEG_KEY]
+    linfo, rinfo = scene["left_cam"].data.info, scene["right_cam"].data.info   # {data_type:info} 单 dict（含 seam）
+    lseg_lab = _seg_labels_from_info(linfo)
+    rseg_lab = _seg_labels_from_info(rinfo)
+    seg = {env_idx: dict(
+        left_seg=lseg[env_idx, :, :, 0].detach().cpu().numpy(),
+        right_seg=rseg[env_idx, :, :, 0].detach().cpu().numpy())
+        for env_idx, _q in batch_rows}
+    _set_seam_visible(scene, False)   # 复位，供下一个 batch 的 pass1
+
+    out = {}
+    for env_idx, _q in batch_rows:
+        out[env_idx] = dict(
+            **rgbd[env_idx], **seg[env_idx], **campose[env_idx],
+            left_seg_labels=lseg_lab, right_seg_labels=rseg_lab,
+            left_K=lK[env_idx], right_K=rK[env_idx],
             z_lift=lifts.get(env_idx, 0.0))
     torch.cuda.empty_cache()
     return out
@@ -684,7 +801,7 @@ def build_side_render_info(side, job, records):
 
 
 
-def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps, num_envs):
+def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps, seam_settle_steps, num_envs):
     """渲染一条轨迹的全部（或 observe==1）关键帧。左右目各存平铺 {k}_rgb.jpg/{k}_depth.exr +
     一个含全帧信息的 render_info.npy。返回已保存帧数。"""
     sid, hand, index, jj = job["key"]
@@ -710,7 +827,7 @@ def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps,
     for start in range(0, len(rows), num_envs):
         chunk = rows[start:start + num_envs]
         batch_rows = [(env_idx, positions[k]) for env_idx, k in enumerate(chunk)]
-        rendered = render_batch(sim, scene, batch_rows, lifts, settle_steps)
+        rendered = render_batch(sim, scene, batch_rows, lifts, settle_steps, seam_settle_steps)
         for env_idx, k in enumerate(chunk):
             r = rendered[env_idx]
             depth_io.store_rgb(left_dir / f"{k}_rgb.jpg", r["left_rgb"])
@@ -772,7 +889,8 @@ def main():
     total = 0
     for job in JOBS:
         r = render_job(sim, scene, job, part_stem, args_cli.out,
-                       args_cli.observe_only, args_cli.settle_steps, num_envs)
+                       args_cli.observe_only, args_cli.settle_steps,
+                       args_cli.seam_settle_steps, num_envs)
         if r != "skipped":
             total += int(r)
     print(f"[main] 全部完成：{len(JOBS)} 条轨迹，共渲染 {total} 帧，用时 {time.time() - t0:.1f}s")
