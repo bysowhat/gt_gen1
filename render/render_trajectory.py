@@ -21,7 +21,7 @@
         right/ {k}_rgb.jpg  {k}_depth.exr ...  render_info.npy
         _traj_meta.npy       # 轨迹级：(L,8) 原数组 + observe/goal + workpiece_pose7 + seam/hand/index …
         _DONE_...            # 完成哨兵（断点续跑）
-    （k = 关键帧行号 0..L-1；--observe-only 时只有 observe 帧，帧号可能不连续，render_info.frame_indices 记录映射）
+    （k = 关键帧行号 0..L-1；render_info.frame_indices 记录帧号映射）
 
 分割类别：{k}_seg.png 含 robot / workpiece / obstacle_* / seam 四类。焊缝(seam)是沿焊缝线建的一根实体管，
 【只出现在分割里】——它平时 invisible，仅在渲染时的第二个 seg-only pass 临时置 visible，故 RGB / depth
@@ -29,6 +29,7 @@
 """
 import argparse
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -82,8 +83,6 @@ def parse_args():
     p.add_argument("--traj-index", type=int, default=-1, help="过滤后第几条（默认 -1=最新）")
     p.add_argument("--all", action="store_true",
                    help="渲染 pkl 内【全部】有采样结果的成功轨迹（忽略上面单选）")
-    p.add_argument("--observe-only", action="store_true",
-                   help="只渲染 observe==1 的关键帧（默认关：渲染全部 L 个关键帧=整条轨迹）")
     # 通用（同 render_seam）
     p.add_argument("--warehouse-usd", default=DEFAULT_WAREHOUSE_USD, help="环境 USD")
     p.add_argument("--max-envs", type=int, default=8, help="并行环境数上限")
@@ -197,12 +196,13 @@ def collect_render_jobs(pkl_path, seam_id, hand, traj_index, render_all):
         observe = arr[:, 6].astype(np.int64)
         goal = arr[:, 7].astype(np.int64)
 
-        # 障碍：实体 trimesh（mesh 系）→ base 系顶点，存 (verts,faces,color)。统一灰蓝色（纯视觉）。
+        # 障碍：实体 trimesh（mesh 系）→ base 系顶点，存 (verts,faces,color)。color=None → 不写
+        # DisplayColor，与工件(同样无 DisplayColor)走同一默认材质，故障碍与工件颜色一致。
         obstacles = []
         for tm in scene._obstacle_solid_trimeshes(h):
             verts = np.asarray(tm.vertices, float) @ R_T.T + t_T
             faces = np.asarray(tm.faces, np.int64).reshape(-1, 3)
-            obstacles.append((verts, faces, (0.62, 0.64, 0.67)))
+            obstacles.append((verts, faces, None))
 
         # 当前焊缝折线（mesh 系 → base 系），供 render_info（失败则 None）
         seam_line_base = None
@@ -271,6 +271,7 @@ except ImportError:  # pragma: no cover
 
 import depth_io  # noqa: E402
 import asset_convert  # noqa: E402
+import materials  # noqa: E402
 
 
 # ======================= 几何/位姿辅助（同 render_seam）=======================
@@ -572,19 +573,36 @@ def _set_seam_visible(scene, visible):
 
 
 
-def prepare_job(scene, job):
-    """把本条轨迹的固定工件位姿 + 障碍摆到各 env（每 env 叠加各自偏移）。返回各 env 的 lift。
-    工件几何 build_scene 已 spawn（单 pkl 恒定），此处只改位姿；障碍先清旧再 spawn。"""
+def prepare_job(scene, job, mat_pick, job_ord):
+    """把本条轨迹的固定工件位姿 + 障碍摆到各 env（每 env 叠加各自偏移）。
+    并为本条轨迹选一个库材质，绑到【全部 env 的工件 + 障碍】（同一材质，保持工件/障碍外观一致；
+    无材质库→mat_name=None，退回默认灰）。工件静止 → 整条轨迹共用一份材质。
+    工件几何 build_scene 已 spawn（单 pkl 恒定），此处只改位姿；障碍先清旧再 spawn。
+    返回 (各 env 的 lift dict, 本条轨迹工件材质名 or None)。"""
     stage = omni.usd.get_context().get_stage()
     wp7 = job["workpiece_pose7"]
+
+    # 本条轨迹随机选一个库材质（每次运行随机取，不可复现）。工件与障碍共用同一
+    # 材质 prim（无 UV，靠 OmniPBR 世界/物体空间投影出纹理，见 materials.py）。
+    mat_name, mat_prim = None, None
+    m = mat_pick(job_ord) if mat_pick is not None else None
+    if m is not None:
+        mdl_path, mat_name = m
+        mat_prim = "/World/Looks/wpMat_traj"
+        # 先在 env0 工件上建材质 prim 并绑定（内部先删同名残留 → 跨 job 幂等）
+        materials.bind_material_to_prim(scene["workpiece_paths"][0], mdl_path, mat_prim)
+        print(f"[traj] 工件/障碍材质 = {mat_name}")
+
     lifts = {}
     for env_idx, off in enumerate(scene["offsets"]):
         # 工件：base 系 pose7 + env 偏移 → 世界系
         wpath = scene["workpiece_paths"][env_idx]
         set_prim_pose(wpath, np.asarray(wp7[:3], float) + off, np.asarray(wp7[3:7], float))
         _disable_physics(wpath)
+        if mat_prim is not None and env_idx > 0:       # env0 已在上面绑过
+            sim_utils.bind_visual_material(wpath, mat_prim)
 
-        # 障碍：清旧组、按 base 系顶点 + env 偏移 spawn 新的
+        # 障碍：清旧组、按 base 系顶点 + env 偏移 spawn 新的（color=None → 材质靠库材质投影）
         grp = f"/World/envs/env_{env_idx:02d}/obstacles"
         if stage.GetPrimAtPath(grp).IsValid():
             stage.RemovePrim(grp)
@@ -592,6 +610,8 @@ def prepare_job(scene, job):
         for oi, (verts, faces, color) in enumerate(job["obstacles"]):
             spawn_obstacle_mesh(f"{grp}/obs_{oi}", verts + off, faces, color,
                                 label=f"obstacle_{oi}")
+        if mat_prim is not None:                        # 障碍与工件同材质（绑到组，子网继承）
+            sim_utils.bind_visual_material(grp, mat_prim)
 
         # 焊缝：沿 base 系焊缝线 + env 偏移建一根 tube，打 "seam" 标签，【初始 invisible】
         # （只在 render_batch 的 seg-only 第二 pass 临时 visible；RGB/depth 恒不含它）。
@@ -612,7 +632,7 @@ def prepare_job(scene, job):
         lifts[env_idx] = lift
         set_prim_pose(scene["warehouse_paths"][env_idx],
                       (off[0], off[1], -lift), (1.0, 0.0, 0.0, 0.0))
-    return lifts
+    return lifts, mat_name
 
 
 def _normalize_seg_labels(raw):
@@ -753,7 +773,7 @@ def frame_record_for_side(side, r, job, row_idx, q_row):
     }
 
 
-def build_side_render_info(side, job, records):
+def build_side_render_info(side, job, records, material=None):
     """把某侧全部帧的 frame_record 按帧堆叠，加上轨迹级常量，组成一个 render_info（存该侧 render_info.npy）。
 
     逐帧字段（沿 axis0=帧堆叠，F=帧数）：frame_indices(F,)、cam_pos_list(F,3)、cam_quat_list(F,4)、
@@ -784,6 +804,7 @@ def build_side_render_info(side, job, records):
         # —— 轨迹级常量 ——
         "sampled_len": int(len(job["positions"])),
         "traj_key": {"seam_id": int(sid), "hand": hand, "index": int(index), "traj_j": int(jj)},
+        "workpiece_material": material,   # 本条轨迹绑定的工件/障碍库材质名（无库时 None）
         "seam_line_base": (None if job["seam_line_base"] is None
                            else np.asarray(job["seam_line_base"], np.float64)),
         "side": side,
@@ -801,8 +822,9 @@ def build_side_render_info(side, job, records):
 
 
 
-def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps, seam_settle_steps, num_envs):
-    """渲染一条轨迹的全部（或 observe==1）关键帧。左右目各存平铺 {k}_rgb.jpg/{k}_depth.exr +
+def render_job(sim, scene, job, part_stem, out_base, settle_steps, seam_settle_steps,
+               num_envs, mat_pick, job_ord):
+    """渲染一条轨迹的【全部】关键帧。左右目各存平铺 {k}_rgb.jpg/{k}_depth.exr +
     一个含全帧信息的 render_info.npy。返回已保存帧数。"""
     sid, hand, index, jj = job["key"]
     traj_dir = Path(out_base) / part_stem / f"seam{sid}_{hand}{index}_traj{jj}"
@@ -812,16 +834,15 @@ def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps,
         return "skipped"
 
     positions = job["positions"]
-    rows = (np.nonzero(job["observe"] == 1)[0].tolist() if observe_only
-            else list(range(len(positions))))
+    rows = list(range(len(positions)))
     print(f"[traj {traj_dir.name}] status={job['status']} 关键帧 {len(positions)}，"
-          f"渲染 {len(rows)} 帧{'（仅 observe）' if observe_only else ''}")
+          f"渲染 {len(rows)} 帧")
 
     left_dir, right_dir = traj_dir / "left", traj_dir / "right"
     left_dir.mkdir(parents=True, exist_ok=True)
     right_dir.mkdir(parents=True, exist_ok=True)
 
-    lifts = prepare_job(scene, job)
+    lifts, mat_name = prepare_job(scene, job, mat_pick, job_ord)
     records = {"left": [], "right": []}   # 逐帧记录（按渲染顺序，即帧号升序）
     saved = 0
     for start in range(0, len(rows), num_envs):
@@ -843,9 +864,9 @@ def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps,
 
     # 每侧一个含全帧信息的 render_info.npy
     np.save(left_dir / "render_info.npy",
-            build_side_render_info("left", job, records["left"]), allow_pickle=True)
+            build_side_render_info("left", job, records["left"], mat_name), allow_pickle=True)
     np.save(right_dir / "render_info.npy",
-            build_side_render_info("right", job, records["right"]), allow_pickle=True)
+            build_side_render_info("right", job, records["right"], mat_name), allow_pickle=True)
 
     # 轨迹级 meta
     np.save(traj_dir / "_traj_meta.npy", {
@@ -854,7 +875,7 @@ def render_job(sim, scene, job, part_stem, out_base, observe_only, settle_steps,
         "seam_id": int(sid), "hand": hand, "index": int(index), "traj_j": int(jj),
         "joint_names": JOINT_NAMES, "n_obstacles": len(job["obstacles"]),
         "status": job["status"], "goal_index": job["goal_index"], "variant": job["variant"],
-        "observe_only": bool(observe_only), "n_rendered": saved,
+        "n_rendered": saved, "workpiece_material": mat_name,
         "frame_indices": np.asarray(rows, np.int64),
     }, allow_pickle=True)
     done.write_text(f"saved={saved}\ntraj={traj_dir}\n")
@@ -869,8 +890,7 @@ def main():
     print(f"[main] Link6 子路径: {link6_sub}  工件 USD: {workpiece_usd}")
 
     # 并行环境数不超过最长轨迹要渲的帧数（够用即可，省显存）
-    max_rows = max((int((j["observe"] == 1).sum()) if args_cli.observe_only else len(j["positions"]))
-                   for j in JOBS)
+    max_rows = max(len(j["positions"]) for j in JOBS)
     num_envs = max(1, min(args_cli.max_envs, max_rows))
     print(f"[main] num_envs={num_envs}（max_envs={args_cli.max_envs}，最长轨迹 {max_rows} 帧）")
 
@@ -886,11 +906,17 @@ def main():
     obj_stem = asset_convert._ascii_safe(WORKPIECE_OBJ)
     part_stem = (obj_stem[:-len("_watertight")] if obj_stem.endswith("_watertight") else obj_stem)
 
+    # 工件/障碍库材质：扫材质库 → 随机 picker（每次运行随机取，不可复现；无库时 pick 恒 None → 退回默认灰）。
+    # 每条轨迹随机取一个材质（工件静止，整条轨迹同一材质；工件与障碍共用，见 prepare_job）。
+    mat_list = materials.scan_materials()
+    _mat_rng = random.Random()   # 无种子 → 依赖系统熵/时间，每次运行不同（不可复现）
+    mat_pick = (lambda _idx: _mat_rng.choice(mat_list)) if mat_list else (lambda _idx: None)
+
     total = 0
-    for job in JOBS:
+    for job_ord, job in enumerate(JOBS):
         r = render_job(sim, scene, job, part_stem, args_cli.out,
-                       args_cli.observe_only, args_cli.settle_steps,
-                       args_cli.seam_settle_steps, num_envs)
+                       args_cli.settle_steps,
+                       args_cli.seam_settle_steps, num_envs, mat_pick, job_ord)
         if r != "skipped":
             total += int(r)
     print(f"[main] 全部完成：{len(JOBS)} 条轨迹，共渲染 {total} 帧，用时 {time.time() - t0:.1f}s")

@@ -23,7 +23,7 @@ BASE_TYPES = [
     "Templates", "Textiles", "Wall_Board", "Wood",
 ]
 VMATER2_TYPES = [
-    "Carpet", "Ceramic", "Composite", "Concrete", "Fabric", "Gems", "Glass",
+    "Carpet", "Ceramic", "Composite", "Concrete", "Fabric", "Gems", 
     "Leather", "Liquids", "Masonry", "Metal", "Other", "Paint", "Paper",
     "Plaster", "Plastic", "Stone", "Wood",
 ]
