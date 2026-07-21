@@ -281,10 +281,12 @@ def prim_world_z_range(prim_path):
     return float(rng.GetMin()[2]), float(rng.GetMax()[2])
 
 
-def compute_group_lift(workpiece_path):
+def compute_group_lift(workpiece_path, robot_path=None):
     wp = prim_world_z_range(workpiece_path)
     wp_min, wp_max = wp if wp is not None else (0.0, 0.0)
-    rb_min, rb_max = ROBOT_Z_RANGE_EST
+    # 机械臂 z 范围优先实测（含底座/法兰低于 base 原点的几何），实测不到才退回估计值
+    rb = prim_world_z_range(robot_path) if robot_path else None
+    rb_min, rb_max = rb if rb is not None else ROBOT_Z_RANGE_EST
     group_min, group_max = min(wp_min, rb_min), max(wp_max, rb_max)
     lift = max(0.0, FLOOR_CLEARANCE - group_min)
     span = group_max - group_min
@@ -444,8 +446,9 @@ def prepare_job(scene, job):
         for oi, (verts, faces, color) in enumerate(job["obstacles"]):
             spawn_obstacle_mesh(f"{grp}/obs_{oi}", verts + off, faces, color)
 
-        # 离地抬升（按固定工件 bbox 估；机械臂运动范围由 ROBOT_Z_RANGE_EST 兜底）
-        lift = compute_group_lift(wpath)
+        # 离地抬升（工件 + 机械臂真实 bbox 实测 z 范围，保证二者都在地板上）
+        rpath = f"/World/envs/env_{env_idx:02d}/robot"
+        lift = compute_group_lift(wpath, rpath)
         lifts[env_idx] = lift
         set_prim_pose(scene["warehouse_paths"][env_idx],
                       (off[0], off[1], -lift), (1.0, 0.0, 0.0, 0.0))
@@ -525,7 +528,7 @@ def build_side_render_info(side, job, records):
     """把某侧全部帧的 frame_record 按帧堆叠，加上轨迹级常量，组成一个 render_info（存该侧 render_info.npy）。
 
     逐帧字段（沿 axis0=帧堆叠，F=帧数）：frame_indices(F,)、cam_pos_list(F,3)、cam_quat_list(F,4)、
-        cam_intrinsic(F,3,3)、jointstates(F,6)、observe(F,)、goal(F,)、
+        cam_intrinsic(F,3,3)、jointstates(F,6)、cam_2d(F,)、camera_3d(F,)、
         cam_pose_w_pos(F,3)/cam_pose_w_quat_wxyz(F,4)、base_pose_w_pos(F,3)/base_pose_w_quat_wxyz(F,4)、z_lift(F,)
     轨迹级常量：内外参、joint_names、workpiece_pose7、seam_line_base、约定串等（与 render_seam 同义）。
     """
@@ -538,8 +541,8 @@ def build_side_render_info(side, job, records):
         "cam_quat_list": stk("cam_quat"),
         "cam_intrinsic": stk("cam_intrinsic"),
         "jointstates": stk("jointstates"),
-        "observe": np.asarray([rec["observe"] for rec in records], np.int64),
-        "goal": np.asarray([rec["goal"] for rec in records], np.int64),
+        "cam_2d": np.asarray([rec["observe"] for rec in records], np.int64),
+        "camera_3d": np.asarray([rec["goal"] for rec in records], np.int64),
         "cam_pose_w_pos": stk("cam_pose_w_pos"),
         "cam_pose_w_quat_wxyz": stk("cam_pose_w_quat_wxyz"),
         "base_pose_w_pos": stk("base_pose_w_pos"),
