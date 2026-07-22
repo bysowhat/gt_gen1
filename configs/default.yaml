@@ -211,11 +211,16 @@ observeanything:                        # 观测场景：把机械臂悬空放�
     # 可达/过滤（口径同 plan_init_pose_fast）
     ee_xy_range_m: [0.4, 1.0]           # 端点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
     ee_z_range_m: [-0.1, 0.1]           # 端点在 base_link 系 z [下限,上限]（米）
+    vertical_seam_dz_m: 0.15            # 竖/横焊缝判据：焊缝起终点世界系高度差 |p0.z-p1.z| > 此值 ⇒ 竖焊缝（端点只判 xy 径向、不判 z）；否则横焊缝（xyz 全判）
     seam_center_x_min_m: 0.4            # 焊缝中点 base-x 下限（米，取代「工件最近点 base-x」判据）
     standoff_cm: 0.0                    # goal 沿 bisector（远离工件方向）外移的 standoff 距离（cm）
     workpiece_x_voxel_m: 0.1            # 场景体素点粒度（米），供「场景 vs init_free 无交集」过滤用
-    front_face_filter: false            # 正面过滤 bis_base.z≥0：只在焊缝正脸可见的朝向放相机（兼作正/反手分类）。false=去掉该过滤（正/反手分类仍照常）
+    front_face_filter: false            # 正面过滤 bis_base.z≥0：只在焊缝正脸可见的朝向放相机。false=去掉该过滤。（正/反手分类已改用「初始相机可见性」，见 plan_observe_scene.md §7，不再由此过滤兼任）
     debug_max_per_step: 200             # debug=True 时逐步过滤快照每步随机抽样上限（防 pkl 膨胀；合格步全存不受限）
+    # 正/反手分类（plan_observe_scene.md §7）：backhand ⇔ 初始关节角(retract_config)下末端相机对该焊缝完全看不到
+    visible_num_samples: 20             # 沿焊缝均匀取几个点判可见性（可见=在相机内参FOV内 且 未被裁剪块 mesh 遮挡）
+    block_radius_m: 0.04                # 遮挡容差圆盘半径（米）：把视线加粗成 4cm 圆柱去探遮挡（沿用 config_pose.block_radius）
+    num_block_pts: 6                    # 遮挡判定沿圆盘周向的偏移射线条数（沿用 config_pose.num_block_pts）
   crop:                                 # USD→obj 邻域裁剪（gt_gen/observe_scene.py:_crop_neighborhood_obj）
     crop_radius_m: 3.5                  # 焊缝中心球半径（米）：球内整块 prim 保留；≳ sample_cube_half_m + ee_xy_range 上限
     watertight: false                   # false=拼接(concatenate，快、每壳闭合，碰撞够用)；true=make_watertight 布尔并集成单一流形(慢)

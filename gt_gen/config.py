@@ -381,6 +381,11 @@ class Config:
         return list(self._obs_fast.get("ee_z_range_m", [-0.1, 0.1]))
 
     @property
+    def obs_fast_vertical_seam_dz(self) -> float:
+        """竖/横焊缝判据阈值（米）：焊缝起终点世界系高度差 |p0.z-p1.z| > 此值 ⇒ 竖焊缝（端点只判 xy 径向、不判 z）；否则横焊缝（xyz 全判）。见 observeanything.plan_init_pose_fast.vertical_seam_dz_m。"""
+        return float(self._obs_fast.get("vertical_seam_dz_m", 0.15))
+
+    @property
     def obs_fast_seam_center_x_min(self) -> float:
         """焊缝中点 base-x 下限（米）：seam_mid_base.x 须 > 此值否则丢弃（取代工件最近点判据）。见 observeanything.plan_init_pose_fast.seam_center_x_min_m。"""
         return float(self._obs_fast.get("seam_center_x_min_m", 0.4))
@@ -404,6 +409,22 @@ class Config:
     def obs_fast_debug_max_per_step(self) -> int:
         """plan_init_pose_fast(debug=True) 逐步过滤快照每步随机抽样上限（防 pkl 膨胀；合格步全存不受限）。见 observeanything.plan_init_pose_fast.debug_max_per_step。"""
         return int(self._obs_fast.get("debug_max_per_step", 200))
+
+    @property
+    def obs_fast_visible_num_samples(self) -> int:
+        """正/反手分类：沿焊缝均匀取几个点判「初始相机可见性」（见 plan_observe_scene.md §7）。见 observeanything.plan_init_pose_fast.visible_num_samples。"""
+        return int(self._obs_fast.get("visible_num_samples", 20))
+
+    @property
+    def obs_fast_block_radius(self) -> float:
+        """遮挡判定容差圆盘半径（米）：视线加粗成圆柱去探遮挡。沿用 config_pose.block_radius=0.04。见 observeanything.plan_init_pose_fast.block_radius_m。"""
+        return float(self._obs_fast.get("block_radius_m", 0.04))
+
+    @property
+    def obs_fast_num_block_pts(self) -> int:
+        """遮挡判定沿容差圆盘周向的偏移射线条数。沿用 config_pose.num_block_pts=6。见 observeanything.plan_init_pose_fast.num_block_pts。"""
+        return int(self._obs_fast.get("num_block_pts", 6))
+
 
     @property
     def obs_crop_radius(self) -> float:

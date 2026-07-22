@@ -84,7 +84,7 @@ T_workpiece_in_base  ==  T_scene_in_base  ==  inv(T_base_world)
 | **工件+障碍 vs init_free 无交集** | free 空间别撞场景 | **保留（核心需求）**：`_pts_in_init_free(scene_pts_base, region)` 有交集则丢 |
 | ~~底座-工件 XY 投影不相交（`base_overlap_filter`）~~ | 臂别压工件下 | **去掉**（整仓库 footprint 必然盖住 base） |
 | 工件最近点 base-x > `workpiece_x_min_m` → **改为：焊缝中点距离 base-x > 0.4** | 目标在臂前方 | **改判据**：用 `seam_mid_base.x > x_min` 取代「工件最近点」 |
-| 正面 bisector base-z≥0 | 焊缝朝上（正脸可见） | **保留**：只在能看到焊缝正面的朝向放相机，兼作正/反手分类依据 |
+| 正面 bisector base-z≥0 | 焊缝朝上（正脸可见） | **保留**：只在能看到焊缝正面的朝向放相机。~~兼作正/反手分类依据~~ → **正/反手分类已改用「初始相机可见性」，见 §7**（此过滤闸门保留，但不再兼任分类） |
 | 轻去重 | 通用 | **保留** |
 
 > 「焊缝中点距离 base-x > 0.4」：把焊缝中点变换到 base 系 `seam_mid_base = R·mid_world + t`，
@@ -280,6 +280,98 @@ class ObserveAnythingScene(Scene):
 - [x] `configs/default.yaml`：新增 `observeanything.plan_init_pose_fast` + `observeanything.crop` 段（§2.4）；`gt_gen/config.py` 加 `obs_fast_*`/`obs_crop_*` 访问器。
 - [x] demo 脚本：`scripts/demo_observe_scene.py`（`--stage fast|plan|viz`）——`plan_init_pose_fast` → `set_init_pose` → `compute_pose_and_plan_path`（继承）。
 - [x] 跨进程可视化沿用 `Scene.save/load` + `Open3DSceneVisualizer`（见 `[[scene_save_load_cross_process_viz]]`）。
+
+---
+
+## 7. 正/反手分类改判：以「初始相机可见性」为准（取代 `bisector.x`）
+
+> 本章**取代** §2.2 表格里「正面 bisector base-z≥0 …兼作正/反手分类」中关于**分类**的那半句。
+> 注意区分两件事：`bis_base.z ≥ 0` 这个**正面过滤闸门仍然保留**（决定某 yaw 整批要不要丢），
+> 只是**它不再兼任正/反手分类**。分类改由下面的「初始相机能不能看到焊缝」决定。
+
+### 7.1 目标语义
+
+- **旧判据**（`gt_gen/observe_scene.py:303`）：`hand = "forehand" if bis_base[0] < 0 else "backhand"`，
+  纯几何、**逐 yaw**（只看两面角平分向量的 base-x 正负），与机械臂实际能否观测无关。
+- **新判据**：**backhand ⇔ 在机械臂初始关节角（`retract_config`）下，末端相机对这条焊缝完全看不到；否则 forehand。**
+  沿焊缝取 `N=20` 个采样点，逐点判「可见」，`可见 = 在相机 FOV 内 且 未被工件遮挡`；
+  **20 点全不可见 → backhand，否则 forehand。**
+- **层级变化**：可见性既依赖朝向 `R`（yaw）、也依赖采样的 base 位置 `t`（同一 yaw，base 摆远/近/偏，可见性不同），
+  故 hand 由「逐 yaw」下沉为**逐候选**。同一个 yaw 现在可同时产出 forehand 和 backhand 候选（预期行为）。
+- **物理含义升级**：forehand = 初始位姿即可见（几乎不用动臂就能看到）；backhand = 初始看不到、需重定位。
+  比旧的 `bisector.x` 几何判据更贴近「正/反手」的实义。
+
+### 7.2 关键调研结论：`compute_goal_pose` 里的「看到」代码只有一半能直接复用
+
+`compute_goal_pose` 底层 `stomp_planner/scene_pose2.py:ScenePose2.computeVisionCost_1` 调三个判据：
+
+| 方法 | 作用 | 用于本分类 |
+|---|---|---|
+| `visionBlock()`（`scene_pose2.py:486`） | **遮挡**：相机光心→焊缝点发主射线+偏移射线（warp `mesh_query_ray`），到点前先撞 mesh 即被挡 | ✅ **口径直接复用** |
+| `visionInsides()`（`scene_pose2.py:461`） | 焊缝点是否在相机 **FOV 六面体**内 | ⚠️ **不直接用**（见下） |
+| `visionOrientation()` | 观测角 vs 两面角 | 与可见性无关，忽略 |
+
+`visionInsides` 用的六面体是硬编码 `p1..p8`（`scene_pose2.py:154-161`，`scl=7/11, scl_z=9.5/11`）：
+近面在相机前 **z≈0.4m**、远面 **z≈0.75m**，近面仅 **~17cm×21cm**。它表达的是「相机是否摆到了**合适观测工作距离**」的窄壳，
+**不是**「焊缝在不在视野里」。**初始 retract 位姿**下相机离焊缝通常 ≫ 0.75m → `visionInsides` 会几乎全判"不在" →
+所有候选都成 backhand，达不到目的。
+
+**结论**：**遮挡复用 `visionBlock` 口径；「超出视野」改用真实相机内参投影**
+（`configs/default.yaml: sensor.camera` 单一真源，fov≈92°×60°，截断到 `max_depth_m=3.0`，见 `[[camera_single_source_config]]`）。
+
+### 7.3 遮挡执行载体：自建轻量 warp raycast（选 B，不建 `ScenePose2`）
+
+不实例化 `ScenePose2`（其 `__init__` 会无条件 `_init_curobo` 建整套 cuRobo RobotWorld 碰撞世界，
+遮挡判定根本用不到，白吃显存/时间，见 `[[plan_explore_path_gpu_oom]]`）。而是**复用模块级的 warp 内核**、自建轻量遮挡：
+
+- **可直接 import 复用**（都是**模块级函数，不属于 `ScenePose2`、不牵扯 cuRobo**）：
+  `scene_pose2._ensure_warp()`（`:62`）、`scene_pose2._raycast_kernel()`（`:70`，即 `mesh_query_ray` 内核）。
+- **照抄逻辑**（各 ~十余行）：`generate_start_points`（`:646`，垂直视线的小圆盘上撒偏移射线）+
+  `visionBlock` 判据（`:506-518`，命中距离 < 到焊缝距离(容差 1e-2) 即被挡）。
+- **遮挡参数直接沿用** `config_pose.py:128-129` 的 `block_radius=0.04`（4cm 容差圆盘半径，把视线加粗成 4cm 圆柱）
+  与 `num_block_pts=6`（周向 6 条偏移射线）——与 `compute_goal_pose` 下游同口径，避免两处标准漂移。
+- warp mesh 用**本缝裁剪块 obj**（`_crop_neighborhood_obj`，世界系）建一次 `wp.Mesh`，按缝缓存。
+  → 遮挡物 = crop 半径内的场景（半径外不算，相机与焊缝都是局部，够用）。
+
+### 7.4 帧关系与判定流程
+
+观测场景里 **piece/mesh 系 = 世界系**（裁剪块 obj 就是世界坐标导出的），故一切在世界系里算：
+
+- 初始相机在 base 系位姿 `T_base_cam`（**常量**，`retract_config` 与相机外参都固定）=
+  `sensor.camera_pose_from_config(kin, retract_config, cm)`（同 `viz_observe.py:134`）；
+  取光心 `o`、旋转 `R_cam`、内参 `cm = sensor.load_camera_model(cfg)`。
+- 候选把 base 摆到世界 `T_base_world = inv(T_workpiece_in_base)`，故**相机世界位姿** = `T_base_world @ T_base_cam`。
+  记其光心 `o_w`、旋转 `R_cam_w`。
+
+**准备（yaw 循环外，一次性）**：算 `T_base_cam` / `o` / `R_cam` / `cm`；建裁剪块 `wp.Mesh`（按缝缓存）。
+
+**逐候选（对最终存活候选，在 `observe_scene.py:362` 结果构造处 append 前，批量一次 GPU 调用）**：
+1. 20 采样点 `seam_world = linspace(p0_world, p1_world, 20)`；相机世界位姿由 `T_base_world @ T_base_cam` 得 `o_w, R_cam_w`。
+2. **FOV（内参投影）**：`p_cam = R_cam_w.T @ (seam_world - o_w)`；可见需 `0 < z ≤ max_depth(3m)` 且
+   `u = fx·x/z + cx ∈ [0,W)`、`v = fy·y/z + cy ∈ [0,H)`。得 `in_fov`。
+3. **遮挡（自建 warp raycast，仅对 FOV 内点省算）**：相机→点主射线 + 6 条偏移射线（`block_radius=0.04`），
+   命中距离 < 到点距离(容差 1e-2) 即被挡 → `unblock`。
+4. `visible = in_fov & unblock`；`hand = "backhand" if not visible.any() else "forehand"`，写进 result dict。
+
+### 7.5 代码落点
+
+- **删** `gt_gen/observe_scene.py:303` 的旧 per-yaw `hand`。
+  **保留**同区的 `goal_quat`（目标朝向，与 hand 无关，仍逐 yaw 算）与 `② 正面过滤 bis_base.z<0`（闸门，与 hand 无关）。
+- hand **下沉**到 `:362` 结果构造处逐候选算（批量）。`fore/back` 拆分（`:377-378`）、打印统计、history 写入均不变。
+- 新增配置项（`observeanything.plan_init_pose_fast` 段）：`visible_num_samples: 20`；
+  遮挡直接用 `0.04/6`（如需单独可调可另开 `obs_fast_block_radius`/`obs_fast_num_block_pts`，初值仍 0.04/6）。
+
+### 7.6 环境约束
+
+自建 warp raycast 需在**能 import warp** 的环境跑（与 `compute_goal_pose` 同环境即可）；
+纯 pxr 环境（`find_surface_welds` 的 `_bootstrap_pxr`）不行。若与 USD 加载冲突，走跨进程
+（见 `[[scene_save_load_cross_process_viz]]`）。`T_base_cam` 是常量，也可离线算一次缓存以规避 FK 环境依赖。
+
+### 7.7 待拍板/默认已定
+
+- 已定：遮挡沿用 `block_radius=0.04 / num_block_pts=6`；FOV 采样点 `N=20`；遮挡载体走 **B（自建轻量 warp）**；
+  FOV 用**真实相机内参投影**（非 `visionInsides` 窄壳）。
+- debug 快照（`snap_*`）里 hand 字段：合格步（⑥）用逐候选新 hand；前几步为过滤演示、hand 可留占位（非合格候选，意义不大）。
 
 ---
 

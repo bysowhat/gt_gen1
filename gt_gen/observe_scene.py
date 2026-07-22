@@ -90,6 +90,11 @@ class ObserveAnythingScene(Scene):
         # 邻域裁剪块缓存：{seam_id: obj_fp}；体素点缓存：{seam_id: (K,3) 世界系}
         self._crop_cache: Dict[int, str] = {}
         self._scene_pts_cache: Dict[int, np.ndarray] = {}
+        # 正/反手分类（初始相机可见性，见 plan_observe_scene.md §7）：初始相机 base 位姿(常量)+内参 缓存；
+        # 每缝裁剪块的 warp 遮挡 mesh 缓存 {seam_id: wp.Mesh}
+        self._T_base_cam: Optional[np.ndarray] = None
+        self._cam_model: Optional[dict] = None
+        self._occluder_wp_cache: Dict[int, object] = {}
         self._cache_dir = cache_dir or os.path.join(
             PROJECT_ROOT, "render", "_assets_cache", "observe")
         os.makedirs(self._cache_dir, exist_ok=True)
@@ -169,6 +174,138 @@ class ObserveAnythingScene(Scene):
         return pts
 
     # ------------------------------------------------------------------
+    # 正/反手分类：以「初始关节角(retract)下末端相机可见性」为准（见 plan_observe_scene.md §7）
+    # ------------------------------------------------------------------
+    def _init_cam_pose_and_model(self):
+        """初始相机在 base 系的 4x4 位姿 T_base_cam（常量：retract_config + 相机外参都固定）+ 相机内参 dict。
+        懒算一次并缓存。需 curobo FK（build_kinematics）+ warp 环境（见 §7.6）。"""
+        if self._T_base_cam is None:
+            from gt_gen import sensor
+            cm = sensor.load_camera_model(self.cfg)
+            kin = sensor.build_kinematics(self.cfg)                       # 轻量 CudaRobotModel（仅 FK）
+            T = sensor.camera_pose_from_config(kin, self.cfg.retract_config, cm)
+            self._cam_model = cm
+            self._T_base_cam = np.asarray(T, dtype=np.float64)
+        return self._T_base_cam, self._cam_model
+
+    def _occluder_wp_mesh(self, seam_id: int):
+        """本缝裁剪块（世界系）的 warp 遮挡 mesh（供视线遮挡 raycast）。按缝缓存。
+        复用 stomp_planner/scene_pose2 的模块级 warp 初始化（不建 ScenePose2/cuRobo，见 §7.3）。"""
+        if seam_id in self._occluder_wp_cache:
+            return self._occluder_wp_cache[seam_id]
+        import sys
+        stomp_dir = os.path.join(PROJECT_ROOT, "stomp_planner")
+        if stomp_dir not in sys.path:
+            sys.path.insert(0, stomp_dir)
+        import scene_pose2 as _sp2                       # 顶层仅 torch/numpy，curobo 惰性，import 安全
+        import warp as wp
+        import trimesh as _trimesh
+        import gt_gen.compat
+        gt_gen.compat.apply_trimesh_shim()
+
+        _sp2._ensure_warp()
+        obj_fp = self._crop_neighborhood_obj(seam_id)
+        tm = _trimesh.load(obj_fp, process=False, force="mesh")
+        verts = np.asarray(tm.vertices, dtype=np.float32).reshape(-1, 3)
+        faces = np.asarray(tm.faces, dtype=np.int32).reshape(-1)
+        mesh = wp.Mesh(points=wp.array(verts, dtype=wp.vec3, device="cuda"),
+                       indices=wp.array(faces, dtype=wp.int32, device="cuda"))
+        self._occluder_wp_cache[seam_id] = mesh
+        return mesh
+
+    @staticmethod
+    def _raycast_hits(wp_mesh, starts: np.ndarray, dirs: np.ndarray) -> np.ndarray:
+        """批量首次命中：starts/dirs 为 (P,3)，返回命中点 (P,3)，无命中处填 inf
+        （语义同 scene_pose2._raycast；复用其模块级 warp 内核）。"""
+        import sys
+        stomp_dir = os.path.join(PROJECT_ROOT, "stomp_planner")
+        if stomp_dir not in sys.path:
+            sys.path.insert(0, stomp_dir)
+        import scene_pose2 as _sp2
+        import warp as wp
+        o = np.ascontiguousarray(starts, dtype=np.float32).reshape(-1, 3)
+        d = np.ascontiguousarray(dirs, dtype=np.float32).reshape(-1, 3)
+        n = o.shape[0]
+        t_out = wp.zeros(n, dtype=wp.float32, device="cuda")
+        wp.launch(_sp2._raycast_kernel(), dim=n,
+                  inputs=[wp_mesh.id,
+                          wp.array(o, dtype=wp.vec3, device="cuda"),
+                          wp.array(d, dtype=wp.vec3, device="cuda"),
+                          float(100.0), t_out],
+                  device="cuda")
+        t = t_out.numpy().reshape(-1, 1)                # (P,1)，miss=-1
+        hit = o + t * d
+        hit[t[:, 0] < 0] = np.inf
+        return hit
+
+    def _classify_hands(self, seam_id: int, results: List[dict]) -> None:
+        """就地给每个候选写 result["hand"]：初始相机对该焊缝可见→forehand，全不可见→backhand（§7.4）。
+        批量：所有候选 × N 焊缝采样点一次算 FOV（内参投影）+ 遮挡（warp raycast），单次 GPU 调用。"""
+        if not results:
+            return
+        T_base_cam, cm = self._init_cam_pose_and_model()
+        seam = self.seams[seam_id]
+        p0 = np.asarray(seam["p0_world"], dtype=np.float64)
+        p1 = np.asarray(seam["p1_world"], dtype=np.float64)
+        Ns = max(2, int(self.cfg.obs_fast_visible_num_samples))
+        ts = np.linspace(0.0, 1.0, Ns)[:, None]
+        seam_world = (1.0 - ts) * p0[None, :] + ts * p1[None, :]          # (Ns,3) 固定（焊缝在世界系）
+
+        # 每候选的相机世界位姿：T_world_cam = T_base_world @ T_base_cam，T_base_world = inv(T_workpiece_in_base)
+        M = len(results)
+        o_w = np.empty((M, 3), dtype=np.float64)
+        RcT = np.empty((M, 3, 3), dtype=np.float64)                       # 光学→世界 旋转的转置（世界→光学）
+        for i, r in enumerate(results):
+            T_wc = np.linalg.inv(np.asarray(r["T_workpiece_in_base"], dtype=np.float64)) @ T_base_cam
+            o_w[i] = T_wc[:3, 3]
+            RcT[i] = T_wc[:3, :3].T
+
+        # ① FOV（内参投影）：p_cam = R_cam^T (seam_world - o_w) → (M,Ns,3)
+        diff = seam_world[None, :, :] - o_w[:, None, :]                   # (M,Ns,3)
+        p_cam = np.einsum("mij,msj->msi", RcT, diff)                      # (M,Ns,3)
+        z = p_cam[:, :, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = cm["fx"] * p_cam[:, :, 0] / z + cm["cx"]
+            v = cm["fy"] * p_cam[:, :, 1] / z + cm["cy"]
+        in_fov = ((z > 0.0) & (z <= cm["max_depth"]) &
+                  (u >= 0.0) & (u < cm["width"]) & (v >= 0.0) & (v < cm["height"]))   # (M,Ns)
+
+        visible = np.zeros((M, Ns), dtype=bool)
+        mi, si = np.nonzero(in_fov)                                       # 只对 FOV 内的点做遮挡（省算）
+        if mi.size:
+            r_disk = float(self.cfg.obs_fast_block_radius)
+            Nb = max(0, int(self.cfg.obs_fast_num_block_pts))
+            starts0 = o_w[mi]                                             # (P,3) 相机光心
+            targets = seam_world[si]                                     # (P,3) 焊缝点
+            main_dir = targets - starts0
+            dist = np.linalg.norm(main_dir, axis=1, keepdims=True)
+            dirn = main_dir / np.clip(dist, 1e-8, None)                   # (P,3)
+            # 偏移起点：垂直视线的小圆盘上周向撒 Nb 点（照搬 generate_start_points 逻辑）
+            ref = np.where((np.abs(dirn[:, [0]]) < 0.9), np.array([1., 0., 0.]), np.array([0., 1., 0.]))
+            uu = np.cross(dirn, ref); uu /= np.clip(np.linalg.norm(uu, axis=1, keepdims=True), 1e-8, None)
+            vv = np.cross(dirn, uu); vv /= np.clip(np.linalg.norm(vv, axis=1, keepdims=True), 1e-8, None)
+            P = starts0.shape[0]
+            starts_all = [starts0]                                        # 主射线起点 = 光心
+            if Nb > 0:
+                theta = np.linspace(0.0, 2.0 * np.pi, Nb)
+                for th in theta:
+                    starts_all.append(starts0 + r_disk * (np.cos(th) * uu + np.sin(th) * vv))
+            starts_all = np.concatenate(starts_all, axis=0)              # ((Nb+1)*P, 3)
+            tgt_rep = np.tile(targets, (Nb + 1, 1))                       # 同一焊缝点为目标
+            rd = tgt_rep - starts_all
+            rd /= np.clip(np.linalg.norm(rd, axis=1, keepdims=True), 1e-8, None)
+            wp_mesh = self._occluder_wp_mesh(seam_id)
+            hits = self._raycast_hits(wp_mesh, starts_all, rd)           # ((Nb+1)*P,3)，miss=inf
+            dist_c = np.linalg.norm(hits - tgt_rep, axis=1).reshape(Nb + 1, P)   # 命中点到焊缝点距离
+            blocked_each = ~(dist_c < 1e-2)                              # 未命中在焊缝点(含 miss=inf)=被挡（口径同 visionBlock）
+            unblock = ~blocked_each.any(axis=0)                          # (P,) 全部射线都命中焊缝点才算未遮挡
+            visible[mi, si] = unblock
+
+        for i, r in enumerate(results):
+            r["hand"] = "forehand" if bool(visible[i].any()) else "backhand"
+
+
+    # ------------------------------------------------------------------
     # 切缝：把 workpiece_obj 重指向本缝邻域块
     # ------------------------------------------------------------------
     def _set_cur_seam(self, seam_id):
@@ -196,7 +333,7 @@ class ObserveAnythingScene(Scene):
         每采样点得 T_base_world=[Rz(yaw) | pos_world]，由 T_workpiece_in_base=inv(T_base_world) 得
         候选帧 (R=Rz(yaw).T, t=-R·pos_world)。过滤链（base 系，p_base=R·p_world+t）：
           ① 正面 bis_base.z≥0（front_face_filter，朝向级闸门，兼作正/反手分类：bis_base.x<0=正手）；
-          ② 端点在 ee 范围（照搬 _inrange，两端点都须在）；
+          ② 端点在 ee 范围（xy 径向两端都须在；竖焊缝仅较低端点判 z，横焊缝两端都判 z）；
           ③ 焊缝中点 base-x > seam_center_x_min_m（取代父类「工件最近点 base-x」判据）；
           ④ 场景体素点 vs init_free 无交集（核心需求，_pts_in_init_free）；
           ⑤ 轻去重（同朝向 + 2cm 同位）。
@@ -225,6 +362,9 @@ class ObserveAnythingScene(Scene):
         yaw_min, yaw_max, yaw_step = c.obs_fast_yaw_deg
         xy_lo, xy_hi = c.obs_fast_ee_xy_range
         z_lo, z_hi = c.obs_fast_ee_z_range
+        # 竖/横焊缝判据：焊缝起终点世界系高度差 > 阈值 ⇒ 竖焊缝（端点只判 xy 径向、不判 z）；否则横焊缝（xyz 全判）
+        vertical_dz = float(c.obs_fast_vertical_seam_dz)
+        is_vertical = abs(float(p0[2] - p1[2])) > vertical_dz
         x_min = float(c.obs_fast_seam_center_x_min)
         standoff = float(c.obs_fast_standoff)
         front_face = bool(c.obs_fast_front_face_filter)
@@ -245,9 +385,12 @@ class ObserveAnythingScene(Scene):
 
         yaws = np.arange(float(yaw_min), float(yaw_max), float(yaw_step))
 
-        def _inrange(pb):   # (M,3) → 布尔 (M,)：径向 ∈[xy_lo,xy_hi] 且 z ∈[z_lo,z_hi]
+        def _inxy(pb):   # (M,3) → 布尔 (M,)：径向 ∈ [xy_lo, xy_hi]
             r = np.hypot(pb[:, 0], pb[:, 1])
-            return (r >= xy_lo) & (r <= xy_hi) & (pb[:, 2] >= z_lo) & (pb[:, 2] <= z_hi)
+            return (r >= xy_lo) & (r <= xy_hi)
+
+        def _inz(pb):    # (M,3) → 布尔 (M,)：base-z ∈ [z_lo, z_hi]
+            return (pb[:, 2] >= z_lo) & (pb[:, 2] <= z_hi)
 
         results = []
         seen = set()
@@ -300,12 +443,14 @@ class ObserveAnythingScene(Scene):
 
             bis_base = R @ bis
             bis_base = bis_base / (np.linalg.norm(bis_base) + 1e-12)
-            hand = "forehand" if float(bis_base[0]) < 0.0 else "backhand"
+            # 旧 per-yaw 几何判据仅留作 debug 快照(①~⑤)的占位标签；真正的正/反手分类改用「初始相机可见性」，
+            # 在候选全部产出后由 _classify_hands 批量判定（见 plan_observe_scene.md §7）。
+            hand_dbg = "forehand" if float(bis_base[0]) < 0.0 else "backhand"
             goal_quat = pim.rotmat_to_quat_wxyz(pim._align_rotmat([1.0, 0.0, 0.0], bis_base))
 
             # ① 每 yaw 一代表：base 原点落焊缝中点（t=-R·mid → seam_center=0），含被正面过滤刷掉的 yaw
             if DBG:
-                snap_reps.append(_mk(R, -(R @ mid), bis_base, np.zeros(3), hand, goal_quat, oid))
+                snap_reps.append(_mk(R, -(R @ mid), bis_base, np.zeros(3), hand_dbg, goal_quat, oid))
 
             # ② 正面过滤：bis_base 只随朝向 R 变、与平移无关 ⇒ 朝向级闸门
             if front_face and float(bis_base[2]) < 0.0:
@@ -321,8 +466,13 @@ class ObserveAnythingScene(Scene):
             p1_base = Rp1[None, :] + t_all
             mid_base = Rmid[None, :] + t_all
 
-            # ③ 端点在 ee 范围（两端都须在）
-            m_ep = _inrange(p0_base) & _inrange(p1_base)
+            # ③ 端点在 ee 范围：xy 径向两端点都须在；竖焊缝仅要求世界系较低端点 z 在范围内，横焊缝两端点 z 都须在
+            m_ep = _inxy(p0_base) & _inxy(p1_base)
+            if is_vertical:
+                low_base = p0_base if float(p0[2]) <= float(p1[2]) else p1_base
+                m_ep &= _inz(low_base)
+            else:
+                m_ep &= _inz(p0_base) & _inz(p1_base)
             # ④ 焊缝中点 base-x > x_min
             m_x = mid_base[:, 0] > x_min
             idx = np.nonzero(m_ep & m_x)[0]
@@ -332,14 +482,14 @@ class ObserveAnythingScene(Scene):
             if DBG:
                 # ① 采样候选(全格点抽样) + ② 正面过滤后（同一存活总体）
                 for k in _pick(np.arange(n_grid), dbg_max).tolist():
-                    snap_raw.append(_mk(R, t_all[k], bis_base, mid_base[k], hand, goal_quat, oid))
-                    snap_front.append(_mk(R, t_all[k], bis_base, mid_base[k], hand, goal_quat, oid))
+                    snap_raw.append(_mk(R, t_all[k], bis_base, mid_base[k], hand_dbg, goal_quat, oid))
+                    snap_front.append(_mk(R, t_all[k], bis_base, mid_base[k], hand_dbg, goal_quat, oid))
                 # ③ 端点在范围后
                 for k in _pick(np.nonzero(m_ep)[0], dbg_max).tolist():
-                    snap_ep.append(_mk(R, t_all[k], bis_base, mid_base[k], hand, goal_quat, oid))
+                    snap_ep.append(_mk(R, t_all[k], bis_base, mid_base[k], hand_dbg, goal_quat, oid))
                 # ④ 焊缝中点 base-x 后
                 for k in _pick(idx, dbg_max).tolist():
-                    snap_xmin.append(_mk(R, t_all[k], bis_base, mid_base[k], hand, goal_quat, oid))
+                    snap_xmin.append(_mk(R, t_all[k], bis_base, mid_base[k], hand_dbg, goal_quat, oid))
 
             n_free_yaw = 0   # 本 yaw 已收进 snap_free 的数量（每 yaw 封顶 dbg_max）
             for k in idx.tolist():
@@ -350,7 +500,7 @@ class ObserveAnythingScene(Scene):
                     continue
                 seam_center = mid_base[k]                        # 真实焊缝中点在 base
                 if DBG and n_free_yaw < dbg_max:                 # init_free 后（去重前）快照
-                    snap_free.append(_mk(R, t, bis_base, seam_center, hand, goal_quat, oid))
+                    snap_free.append(_mk(R, t, bis_base, seam_center, hand_dbg, goal_quat, oid))
                     n_free_yaw += 1
                 # ⑥ 轻去重：同朝向 + 2cm 同位
                 key = (oid, round(float(t[0]), 2), round(float(t[1]), 2), round(float(t[2]), 2))
@@ -371,16 +521,18 @@ class ObserveAnythingScene(Scene):
                     "seam_center_base": np.asarray(seam_center, dtype=np.float64),
                     "wpx_near_base": None,
                     "orientation_id": int(oid),
-                    "hand": hand,
+                    "hand": None,                        # 由 _classify_hands 批量判定（§7）
                 })
 
+        # 正/反手分类：初始相机对该焊缝可见→forehand，全不可见→backhand（逐候选，批量一次 GPU 调用，§7.4）
+        self._classify_hands(seam_id, results)
         fore = [r for r in results if r["hand"] == "forehand"]
         back = [r for r in results if r["hand"] == "backhand"]
         print("[observe-fast] 逐步过滤 候选初始位姿（世界系采样机械臂 base xyz+yaw）：")
         print(f"  ① 采样候选（{len(yaws)} yaw × {n_grid} 格点）             : {len(yaws) * n_grid}")
         print(f"  ② 正面过滤(bis_base.z≥0)                    : {len(yaws)} → {n_yaw_kept} yaw"
               f" → 候选 {n_yaw_kept * n_grid}")
-        print(f"  ③ 端点在 ee 范围                            : {n_yaw_kept * n_grid} → {n_ep}")
+        print(f"  ③ 端点在 ee 范围（{'竖焊缝:xy两端+较低端点z' if is_vertical else '横焊缝:xyz两端'}）      : {n_yaw_kept * n_grid} → {n_ep}")
         print(f"  ④ 焊缝中点 base-x > {x_min:.3f}m                 : {n_ep} → {n_xmin}")
         print(f"  ⑤ 场景 vs init_free 无交集                  : {n_xmin} → {n_xmin - n_free}（相交丢 {n_free}）")
         print(f"  ⑥ 轻去重(同朝向 + 2cm 同位)                 : {n_xmin - n_free} → {len(results)}（重复丢 {n_dedup}）")
