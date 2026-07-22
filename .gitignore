@@ -9,3 +9,5 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+render/_assets_cache/

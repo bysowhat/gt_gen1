@@ -122,6 +122,13 @@ def _make_scene(args):
                  weld_json=args.weld_json)
     return scene
 
+def _make_oa_scene(args):
+    from gt_gen.observe_scene import ObserveAnythingScene
+    scene = ObserveAnythingScene(cfg="configs/default.yaml",
+                                usd_path=args.usd,
+                                welds_json=args.weld_json)
+    return scene
+
 def demo_init_pose(args):
     """原始示例：求候选初始位姿（需 GPU/curobo），可选 open3d 逐个可视化。"""
     from gt_gen.scene_viz import Open3DSceneVisualizer
@@ -225,7 +232,10 @@ def _out_path(scene, tag: str, seam_id: int = None, out_root: str = None) -> str
     out_root 给定则覆盖 cfg.output_root；seam_id 给定则文件名含焊缝号（per-seam pkl，
     里面仍是整场景快照——含其它已处理焊缝也无妨，命名区分即可断点续跑跳过本缝）。
     """
-    obj_stem = os.path.splitext(os.path.basename(scene.workpiece_obj))[0]
+    if not scene.workpiece_obj:
+        obj_stem = os.path.splitext(os.path.basename(scene.usd_path))[0]
+    else:   
+        obj_stem = os.path.splitext(os.path.basename(scene.workpiece_obj))[0]
     root = out_root or scene.cfg.output_root
     os.makedirs(root, exist_ok=True)
     if seam_id is not None:
@@ -304,6 +314,43 @@ def obstacle_type1_demo_main(args):
     print(f"[demo] type1 全部焊缝完成 → {out_root or scene.cfg.output_root}")
     
 
+def obstacle_type3_demo_main(args):
+    '''
+        Obersever Anything.
+        forehand： 初始关节角下焊缝能被看到
+        backhand： 初始关节角下焊缝完全看不到
+
+        debug:
+            Open3DSceneVisualizer(scene).show_observe_init_poses_debug(n=1, stride=1)
+    '''
+    scene = _make_oa_scene(args)
+    out_root = getattr(args, "out_root", None)
+    force = getattr(args, "force", False)
+
+    for seam_id in range(len(scene.seams)):
+        out_path = _out_path(scene, "type3", seam_id=seam_id, out_root=out_root)
+        if not force and os.path.exists(out_path):
+            print(f"[demo] seam {seam_id}：已存在 {out_path}，跳过")
+            continue
+        try:
+            scene._set_cur_seam(seam_id)
+            # 候选初始位姿：hand/障碍无关（放宽不避障），每缝算 1 次即可
+            scene.plan_init_pose_fast(verbose=False)
+            for hand in ("forehand", "backhand"):
+                if scene.compute_pose_and_plan_path(hand, max_stomp_try=1, max_init_pose=2):
+                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹成功")
+                else:
+                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹失败")
+            scene.save(out_path)          # 仅在本缝正常处理完后存盘（异常则不存 → 续跑重试）
+        except Exception as e:
+            import traceback
+            print(f"[demo] seam {seam_id} 异常跳过: {e}")
+            traceback.print_exc()
+
+    print(f"[demo] type2 全部焊缝完成 → {out_root or scene.cfg.output_root}")
+
+
+
 def viz(args):
     from gt_gen.scene import Scene
     from gt_gen.scene_viz import Open3DSceneVisualizer
@@ -325,14 +372,15 @@ def viz(args):
 def main():
     ap = argparse.ArgumentParser(description="Scene API demo：初始位姿求解 / 障碍物类型2 / 障碍物类型3 + isaacsim 可视化")
     ap.add_argument("--obj", default=DEFAULT_OBJ, help="工件 mesh（_part.obj / _watertight.obj）")
+    ap.add_argument("--usd", help="场景usd")
     ap.add_argument("--weld-json", default=DEFAULT_WELD_JSON, help="焊缝 _weld_angle3.json")
     ap.add_argument("--pkl", help="保存轨迹的pkl文件")
     ap.add_argument("--pkl-seamid", type=int, help="保存轨迹的pkl文件")
     ap.add_argument("--pkl-hand", help="保存轨迹的pkl文件")
     ap.add_argument("--ds", action="store_true",
                     help="viz：回放【关键帧采样后】轨迹（scene.sampled_trajectories，需先跑 scripts/traj_downsample.py）")
-    ap.add_argument("--task", default="viz", choices=["type1", "type2", "viz"],
-                    help="批处理任务：type1=障碍类型1 / type2=障碍类型2 / viz=本地可视化调试（默认）")
+    ap.add_argument("--task", default="viz", choices=["type1", "type2", "type3", "viz"],
+                    help="批处理任务：type1=障碍类型1 / type2=障碍类型2 / type3=ObserveAnything / viz=本地可视化调试（默认）")
     ap.add_argument("--out-root", default=None,
                     help="覆盖 cfg.output_root 的结果落盘根目录（per-seam pkl 存这里）")
     ap.add_argument("--force", action="store_true",
@@ -349,19 +397,25 @@ def main():
     args = ap.parse_args()
 
     # 默认 --task viz：保持本地可视化调试行为不变（勿与 curobo demo 同进程先后跑，见模块 docstring）。
-    # 批处理由 shell（scripts/bash/v1/）传 --task type1/type2 + --out-root 调用。
-    if args.task in ("type1", "type2"):
-        demo = obstacle_type1_demo_main if args.task == "type1" else obstacle_type2_demo_main
-        if _PROFILE_MAIN:
-            with _LineProfiler(__file__):       # PROFILEMAIN=1：逐行计时（含各行调用的耗时）
-                demo(args)
-        else:
-            demo(args)
-        return
-    
-    if args.task in ("viz"):
+    # 批处理由 shell（scripts/bash/v1/）传 --task type1/type2/type3 + --out-root 调用。
+    if args.task == "type1":
+        demo = obstacle_type1_demo_main  
+    elif args.task == "type2":
+        demo = obstacle_type2_demo_main
+    elif args.task == "type3":
+        demo = obstacle_type3_demo_main
+    elif args.task == "viz":
         viz(args)
-
+    else:
+        raise ValueError()
+        
+    if _PROFILE_MAIN:
+        with _LineProfiler(__file__):       # PROFILEMAIN=1：逐行计时（含各行调用的耗时）
+            demo(args)
+    else:
+        demo(args)
+    return
+    
     # --task viz（默认）：本地可视化调试入口
     # demo_obstacle_type2(args)
     # demo_obstacle_type3(args)

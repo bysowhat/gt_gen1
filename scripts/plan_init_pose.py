@@ -2163,8 +2163,10 @@ def _show_kejian2_results(cfg, obj_fp, weld, res, stride: int = 5, extra_geoms=N
         title = f"kejian2: {hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）— 按 C 下一个 / 关窗退出"
         bis = np.asarray(r["bisector_base"], dtype=np.float64)
         seam_c = np.asarray(r["seam_center_base"], dtype=np.float64)
+        _front_ok = float(bis[2]) >= 0.0          # 正面过滤判据：bis_base.z≥0 → 焊缝正脸朝上=可见
         print(f"[viz] {hand_label} 第 {i}/{N} 个（抽样 {idx + 1}/{n}）"
-              f" bisector base-x={float(bis[0]):+.3f}")
+              f" bisector base-x={float(bis[0]):+.3f} base-z={float(bis[2]):+.3f}"
+              f" → 正面过滤 {'✓正面(可见)' if _front_ok else '✗背面(z<0,丢弃)'}")
         vis = o3d.visualization.VisualizerWithKeyCallback()
         vis.create_window(window_name=title)
         for g in _lookup_solution_geoms(cfg, obj_fp, weld, sol):

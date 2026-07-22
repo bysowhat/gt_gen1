@@ -196,8 +196,8 @@ def main():
 
     shots = []          # 待拍照的焊缝: (i, cam_pos, look_at)
     for i, w in enumerate(welds):
-        p0 = np.asarray(w["p0"], float)
-        p1 = np.asarray(w["p1"], float)
+        p0 = np.asarray(w["corrected_p0"], float)
+        p1 = np.asarray(w["corrected_p1"], float)
         base = f"/World/welds/w{i:05d}"
         # 焊缝（红色圆柱：半径 seam_radius，长度=焊缝长度）
         add_cylinder(f"{base}/seam", p0, p1, args_cli.seam_radius, (1.0, 0.05, 0.05))

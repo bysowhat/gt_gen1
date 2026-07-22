@@ -339,6 +339,82 @@ class Config:
         """工件距 base_link 原点欧氏最近点的 base-x 分量下限（米）：须 > 此值否则丢弃。见 plan_init_pose_fast.workpiece_x_min_m。"""
         return float(self._fast.get("workpiece_x_min_m", 0.36))
 
+    # ---- observeanything（把机械臂悬空放进 USD 观测焊缝，见 gt_gen/observe_scene.py:ObserveAnythingScene） ----
+    @property
+    def _obs(self) -> dict:
+        return self.raw.get("observeanything", {})
+
+    @property
+    def _obs_fast(self) -> dict:
+        return self._obs.get("plan_init_pose_fast", {})
+
+    @property
+    def obs_fast_sample_cube_half(self) -> float:
+        """采样立方体半边长（米）：以焊缝中点为原点、[-H,H]³ 内采样机械臂 base 的 xyz。见 observeanything.plan_init_pose_fast.sample_cube_half_m。"""
+        return float(self._obs_fast.get("sample_cube_half_m", 2.5))
+
+    @property
+    def obs_fast_xy_step(self) -> float:
+        """base 位置 xy 采样间隔（米）。见 observeanything.plan_init_pose_fast.xy_step_m。"""
+        return float(self._obs_fast.get("xy_step_m", 0.20))
+
+    @property
+    def obs_fast_z_step(self) -> float:
+        """base 位置 z 采样间隔（米）。见 observeanything.plan_init_pose_fast.z_step_m。"""
+        return float(self._obs_fast.get("z_step_m", 0.10))
+
+    @property
+    def obs_fast_yaw_deg(self) -> list:
+        """base 绕世界竖直轴 yaw 采样 [min,max,step]（度，半开区间 [min,max)）。见 observeanything.plan_init_pose_fast.yaw_*_deg。"""
+        return [float(self._obs_fast.get("yaw_min_deg", 0.0)),
+                float(self._obs_fast.get("yaw_max_deg", 360.0)),
+                float(self._obs_fast.get("yaw_step_deg", 20.0))]
+
+    @property
+    def obs_fast_ee_xy_range(self) -> list:
+        """焊缝端点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）。见 observeanything.plan_init_pose_fast.ee_xy_range_m。"""
+        return list(self._obs_fast.get("ee_xy_range_m", [0.4, 1.0]))
+
+    @property
+    def obs_fast_ee_z_range(self) -> list:
+        """焊缝端点在 base_link 系 z [下限,上限]（米）。见 observeanything.plan_init_pose_fast.ee_z_range_m。"""
+        return list(self._obs_fast.get("ee_z_range_m", [-0.1, 0.1]))
+
+    @property
+    def obs_fast_seam_center_x_min(self) -> float:
+        """焊缝中点 base-x 下限（米）：seam_mid_base.x 须 > 此值否则丢弃（取代工件最近点判据）。见 observeanything.plan_init_pose_fast.seam_center_x_min_m。"""
+        return float(self._obs_fast.get("seam_center_x_min_m", 0.4))
+
+    @property
+    def obs_fast_standoff(self) -> float:
+        """goal 沿 bisector（远离工件方向）外移的 standoff 距离（米）。见 observeanything.plan_init_pose_fast.standoff_cm。"""
+        return float(self._obs_fast.get("standoff_cm", 0.0)) / 100.0
+
+    @property
+    def obs_fast_workpiece_x_voxel(self) -> float:
+        """场景体素点粒度（米），供「场景 vs init_free 无交集」过滤用。见 observeanything.plan_init_pose_fast.workpiece_x_voxel_m。"""
+        return float(self._obs_fast.get("workpiece_x_voxel_m", 0.1))
+
+    @property
+    def obs_fast_front_face_filter(self) -> bool:
+        """正面过滤 bis_base.z≥0：只在焊缝正脸可见的朝向放相机（兼作正/反手分类）。见 observeanything.plan_init_pose_fast.front_face_filter。"""
+        return bool(self._obs_fast.get("front_face_filter", True))
+
+    @property
+    def obs_fast_debug_max_per_step(self) -> int:
+        """plan_init_pose_fast(debug=True) 逐步过滤快照每步随机抽样上限（防 pkl 膨胀；合格步全存不受限）。见 observeanything.plan_init_pose_fast.debug_max_per_step。"""
+        return int(self._obs_fast.get("debug_max_per_step", 200))
+
+    @property
+    def obs_crop_radius(self) -> float:
+        """USD→obj 邻域裁剪半径（米）：焊缝中心球内整块 prim 保留。见 observeanything.crop.crop_radius_m。"""
+        return float(self._obs.get("crop", {}).get("crop_radius_m", 3.5))
+
+    @property
+    def obs_crop_watertight(self) -> bool:
+        """邻域裁剪块是否走 make_watertight 布尔并集成单一流形（false=拼接，快、每壳闭合、碰撞够用）。见 observeanything.crop.watertight。"""
+        return bool(self._obs.get("crop", {}).get("watertight", False))
+
     # ---- plan_init_pose_kejian（新逻辑：固定朝向 + 平移网格 + STOMP 可达，见 scripts/plan_init_pose_kejian.py） ----
     @property
     def _kejian(self) -> dict:

@@ -539,8 +539,8 @@ def find_welds(usd_path, lmin, lmax, ang_min_deg, ang_max_deg, nwind, verbose=Tr
         for r in regions:
             welds.append({
                 "prim_path": c["prim_path"],
-                "p0": p0.tolist(),
-                "p1": p1.tolist(),
+                "corrected_p0": p0.tolist(),
+                "corrected_p1": p1.tolist(),
                 "length": round(c["length"], 6),
                 "edge_dir": overall,
                 **r,

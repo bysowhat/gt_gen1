@@ -381,6 +381,10 @@ class Scene:
         # {seam_id: [step1,…,step8]}：plan_init_pose 逐步过滤每步【通过】的候选（raw 结果 dict），
         # 供 Open3DSceneVisualizer.show_init_poses_debug(n) 单步可视化。每次 plan_init_pose 覆盖本 seam。
         self.init_pose_debug_steps: Dict[int, List[List[dict]]] = {}
+        # {seam_id: [步名1,…]}：与 init_pose_debug_steps 逐位对齐的步骤中文名。父类 plan_init_pose 不填
+        # （viz 用其内置 _DEBUG_STEP_NAMES）；子类（如 ObserveAnythingScene）过滤链不同 → 填本字段，
+        # 供独立 viz（show_observe_init_poses_debug）显示正确步名。
+        self.init_pose_debug_step_names: Dict[int, List[str]] = {}
         # {seam_id: {"端点∈工作空间":[...], "+朝向粗筛...":[...], "碰撞safe...":[...]}}：
         # plan_init_pose(diagnostic=True) 时 lookup 内三阶段各随机抽 ≤10 个幸存候选（raw dict），
         # 供 Open3DSceneVisualizer.show_init_pose_prefilter 可视化预筛漏斗。非 diagnostic 时为空列表。
@@ -1000,6 +1004,7 @@ class Scene:
             cur_cfg=list(self.cur_cfg),
             init_pose_candidates=self.init_pose_candidates,   # {seam_id: {"forehand":[...],"backhand":[...]}}（InitPoseCandidate dataclass）
             init_pose_debug_steps=self.init_pose_debug_steps,  # {seam_id: [step1..step8]} 逐步过滤每步通过候选（raw dict）
+            init_pose_debug_step_names=self.init_pose_debug_step_names,  # {seam_id: [步名..]} 与 debug_steps 逐位对齐（子类过滤链专用）
             init_pose_prefilter_steps=self.init_pose_prefilter_steps,  # {seam_id: {阶段名: [raw dict]}} 预筛三阶段抽样（diagnostic）
             cur_init_pose=self.cur_init_pose,
             cur_init_hand=self.cur_init_hand,
@@ -1052,6 +1057,7 @@ class Scene:
         self.cur_cfg = list(state.get("cur_cfg", self.cur_cfg))
         self.init_pose_candidates = state.get("init_pose_candidates", {}) or {}
         self.init_pose_debug_steps = state.get("init_pose_debug_steps", {}) or {}
+        self.init_pose_debug_step_names = state.get("init_pose_debug_step_names", {}) or {}
         self.init_pose_prefilter_steps = state.get("init_pose_prefilter_steps", {}) or {}
         self.cur_init_pose = state.get("cur_init_pose")
         self.cur_init_hand = state.get("cur_init_hand",
@@ -1217,7 +1223,7 @@ class Scene:
     
     def compute_pose_and_plan_path(self, hand, include_obstacles: bool = True,
                                    device: str = None, max_stomp_try: int = 1,
-                                   init_pose_idx: int = None):
+                                   init_pose_idx: int = None, max_init_pose=2):
         """对某手别的每个候选 init pose，求观测位姿序列后【按序边走边看规划】覆盖整条焊缝的 GT。
 
         流程（每个候选 init pose）：
@@ -1247,7 +1253,7 @@ class Scene:
             idx_iter = range(n_cands)
         for init_pose_idx_loop in idx_iter:
             # 未指定时最多尝试 2 个初始位姿；指定 init_pose_idx 时只跑那一个
-            if init_pose_idx is None and init_pose_idx_loop >= 2:
+            if init_pose_idx is None and init_pose_idx_loop >= max_init_pose:
                 continue
 
             self.set_init_pose(hand, init_pose_idx_loop)
