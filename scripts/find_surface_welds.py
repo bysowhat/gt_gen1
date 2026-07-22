@@ -71,6 +71,8 @@ REGION_PROBE_DISTS = np.linspace(0, 0.01, 5)     # 楔形径向 5 距离
 N_REGION_ANGULAR   = 5                           # 楔形角向 5 方向（共 25 采样点）
 COLLINEAR_TOL_DEG  = 5.0                          # 接链共线容差
 DEDUP_EPS          = 1e-3                         # 去重端点距离阈值(米)
+SIMILAR_LEN_TOL    = 0.05                         # 相近焊缝：长度相对差 ≤5%
+SIMILAR_DIR_TOL    = 0.05                         # 相近焊缝：方向差 1-|cos| ≤5%
 
 
 # ===== 分阶段计时（验证瓶颈用）=====
@@ -362,6 +364,28 @@ def build_winding_groups(meshes, nwind):
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
+def filter_similar_welds(welds):
+    """逐 prim 过滤相近焊缝：同一 prim 内，长度相对差 ≤SIMILAR_LEN_TOL 且
+    方向差(1-|cos|) ≤SIMILAR_DIR_TOL 的焊缝只保留先出现的 1 条（保持原始顺序）。
+    """
+    reps_by_prim = defaultdict(list)   # prim_path -> [(length, dir_np)]
+    kept = []
+    for w in welds:
+        L = float(w["length"])
+        d = np.asarray(w["edge_dir"], float)
+        dup = False
+        for rL, rd in reps_by_prim[w["prim_path"]]:
+            len_diff = abs(L - rL) / max(L, rL, 1e-9)
+            dir_diff = 1.0 - abs(float(np.dot(d, rd)))
+            if len_diff <= SIMILAR_LEN_TOL and dir_diff <= SIMILAR_DIR_TOL:
+                dup = True
+                break
+        if not dup:
+            reps_by_prim[w["prim_path"]].append((L, d))
+            kept.append(w)
+    return kept
+
+
 def find_welds(usd_path, lmin, lmax, ang_min_deg, ang_max_deg, nwind, verbose=True):
     t0 = time.time()
     meshes = load_scene_meshes(usd_path, verbose)
@@ -521,6 +545,13 @@ def find_welds(usd_path, lmin, lmax, ang_min_deg, ang_max_deg, nwind, verbose=Tr
                 "edge_dir": overall,
                 **r,
             })
+
+    with _Timer("filter_similar"):
+        n_before = len(welds)
+        welds = filter_similar_welds(welds)
+    if verbose:
+        print(f"[filter] 相近焊缝去重(逐prim, 长度≤{SIMILAR_LEN_TOL:.0%} 且 "
+              f"方向≤{SIMILAR_DIR_TOL:.0%}): {n_before} -> {len(welds)}")
 
     if verbose:
         print(f"[done] {len(welds)} 条朝外焊缝，用时 {time.time() - t0:.1f}s")
