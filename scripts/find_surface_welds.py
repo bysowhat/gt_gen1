@@ -73,6 +73,27 @@ COLLINEAR_TOL_DEG  = 5.0                          # 接链共线容差
 DEDUP_EPS          = 1e-3                         # 去重端点距离阈值(米)
 
 
+# ===== 分阶段计时（验证瓶颈用）=====
+_T = defaultdict(float)   # 阶段累计耗时(秒)
+_C = defaultdict(int)     # 阶段调用次数
+
+
+class _Timer:
+    """with _Timer('winding'): ... 累加到 _T/_C。"""
+    __slots__ = ("key", "_t")
+
+    def __init__(self, key):
+        self.key = key
+
+    def __enter__(self):
+        self._t = time.perf_counter()
+        return self
+
+    def __exit__(self, *a):
+        _T[self.key] += time.perf_counter() - self._t
+        _C[self.key] += 1
+
+
 # ---------------------------------------------------------------------------
 # 1. 加载 USD → 世界系(米) trimesh
 # ---------------------------------------------------------------------------
@@ -204,11 +225,23 @@ def build_straight_chains(vertices, edge_vids, tol_deg):
 # ---------------------------------------------------------------------------
 # 5. 焊缝信息（照搬 step3_vis.py 语义）
 # ---------------------------------------------------------------------------
-def probe_on_face(edge_mid, direction, mesh):
-    """从 edge_mid 沿 direction 取点，判断是否贴在 mesh 面上。"""
-    pts = np.array([edge_mid + direction * d for d in PROBE_DISTS])
-    _, dist, _ = trimesh.proximity.closest_point(mesh, pts)
-    return int(np.sum(dist < ON_FACE_THRESH)) >= ON_FACE_MIN_COUNT
+def probe_on_face_batch(edge_mid, directions, pq):
+    """一次判定多个方向是否贴在 mesh 面上（复用 ProximityQuery，批量查询）。
+
+    与逐个 probe_on_face 数值等价：每个方向沿 PROBE_DISTS 取 10 点，到面 <ON_FACE_THRESH
+    的点数 ≥ ON_FACE_MIN_COUNT 记为贴面。directions: list[unit vec]，返回等长 list[bool]。
+    """
+    if len(directions) == 0:
+        return []
+    D = np.asarray(directions, float)                       # (K,3)
+    em = np.asarray(edge_mid, float)
+    pts = em[None, None, :] + D[:, None, :] * PROBE_DISTS[None, :, None]   # (K,10,3)
+    flat = pts.reshape(-1, 3)
+    with _Timer("probe.closest_point"):
+        _, dist, _ = pq.on_surface(flat)
+    dist = np.asarray(dist).reshape(len(directions), len(PROBE_DISTS))
+    cnt = np.sum(dist < ON_FACE_THRESH, axis=1)
+    return [int(c) >= ON_FACE_MIN_COUNT for c in cnt]
 
 
 def two_face_dirs(fi, fj, tm, edge_mid, edge_dir):
@@ -245,10 +278,14 @@ def sort_dirs_by_angle(dirs, edge_dir, normals):
             [normals[i] for i in order])
 
 
-def classify_out_regions(edge_mid, sdirs, sangles, snorms, Vw, Fw):
-    """相邻方向围成的楔形，winding 判内外，只返回朝外(OUT)区域的焊缝量。"""
+def enumerate_wedges(edge_mid, sdirs, sangles, snorms):
+    """列出所有非反射角楔形的几何 + 25 点采样 Q（不算 winding，延后批量算）。
+
+    返回 [ {bisector, gap_deg, boundary_dirs, boundary_normals, Q(np (M,3))} ]。
+    Q 的构造与原 classify_out_regions 完全一致；winding 的内外判定移到 Pass B/C。
+    """
     N = len(sdirs)
-    out = []
+    wedges = []
     for i in range(N):
         j = (i + 1) % N
         d0, d1 = np.asarray(sdirs[i], float), np.asarray(sdirs[j], float)
@@ -278,19 +315,14 @@ def classify_out_regions(edge_mid, sdirs, sangles, snorms, Vw, Fw):
                 Q.append(edge_mid + di * r)
         if not Q:
             continue
-        wn = igl.fast_winding_number(Vw, Fw, np.asarray(Q, np.float64))
-        ratio = float(np.sum(wn > 0.5)) / len(Q)
-        if ratio > 0.5:                          # inside → 丢弃
-            continue
-        out.append({
+        wedges.append({
             "bisector": b.tolist(),
             "gap_deg": round(float(np.degrees(gap)), 1),
-            "inside_ratio": round(ratio, 4),
-            "is_inside": False,
             "boundary_dirs": [d0.tolist(), d1.tolist()],
             "boundary_normals": [snorms[i].tolist(), snorms[j].tolist()],
+            "Q": np.asarray(Q, np.float64),
         })
-    return out
+    return wedges
 
 
 # ---------------------------------------------------------------------------
@@ -342,16 +374,24 @@ def find_welds(usd_path, lmin, lmax, ang_min_deg, ang_max_deg, nwind, verbose=Tr
 
     amin, amax = np.radians(ang_min_deg), np.radians(ang_max_deg)
     welds = []
-    seen = []                                    # 去重用端点
+
+    # ---- Pass A：逐 prim 收集候选楔形 + winding 采样点（延后批量算 winding）----
+    #   ① ProximityQuery 整 prim 建一次、贴面探测批量查询
+    #   楔形的 25 点采样先攒进所属 winding 组，记录切片 (grp,start,n)
+    ngroups = len(VF)
+    group_Q = [[] for _ in range(ngroups)]       # 每组待查询点块
+    group_rows = [0] * ngroups                   # 每组已累计点数（切片偏移）
+    cands = []                                   # 候选，保持原始迭代顺序（去重语义依赖）
 
     for prim_path, tm in tqdm(meshes):
-        # if len(welds) > 5:
-        #     break
-        pairs, evids = feature_edges(tm, amin, amax)
+        with _Timer("feature_edges"):
+            pairs, evids = feature_edges(tm, amin, amax)
         if len(pairs) == 0:
             continue
-        chains = build_straight_chains(tm.vertices, evids, COLLINEAR_TOL_DEG)
-        Vw, Fw = VF[path2grp[prim_path]]
+        with _Timer("build_chains"):
+            chains = build_straight_chains(tm.vertices, evids, COLLINEAR_TOL_DEG)
+        grp = path2grp[prim_path]
+        pq = trimesh.proximity.ProximityQuery(tm)   # 整 prim 复用一次
 
         for ch in chains:
             vids = ch["vids"]
@@ -359,14 +399,6 @@ def find_welds(usd_path, lmin, lmax, ang_min_deg, ang_max_deg, nwind, verbose=Tr
             p1 = np.asarray(tm.vertices[vids[-1]], float)
             length = float(np.linalg.norm(p1 - p0))
             if length < lmin or length > lmax:
-                continue
-
-            # 去重（端点近重复）
-            dup = any(
-                (np.allclose(p0, q0, atol=DEDUP_EPS) and np.allclose(p1, q1, atol=DEDUP_EPS)) or
-                (np.allclose(p0, q1, atol=DEDUP_EPS) and np.allclose(p1, q0, atol=DEDUP_EPS))
-                for q0, q1 in seen)
-            if dup:
                 continue
 
             # 代表边（链中点处）算焊缝量，忠于 ifc 的逐边语义
@@ -384,36 +416,119 @@ def find_welds(usd_path, lmin, lmax, ang_min_deg, ang_max_deg, nwind, verbose=Tr
             if len(dirs) < 2:
                 continue
 
-            # ±d 贴面探测筛选（用本 prim 网格）
-            kept_d, kept_n = [], []
-            for d, nrm in zip(dirs, normals):
-                for cand in (d, -d):
-                    if probe_on_face(edge_mid, cand, tm):
-                        kept_d.append(np.asarray(cand, float))
-                        kept_n.append(nrm)
+            # ±d 贴面探测筛选（用本 prim 网格），顺序 d0,-d0,d1,-d1 与原实现一致
+            cand_dirs = [np.asarray(dirs[0], float), -np.asarray(dirs[0], float),
+                         np.asarray(dirs[1], float), -np.asarray(dirs[1], float)]
+            cand_nrm = [normals[0], normals[0], normals[1], normals[1]]
+            flags = probe_on_face_batch(edge_mid, cand_dirs, pq)
+            kept_d = [cand_dirs[i] for i, f in enumerate(flags) if f]
+            kept_n = [cand_nrm[i] for i, f in enumerate(flags) if f]
             if len(kept_d) < 2:
                 continue
 
             sdirs, sangles, snorms = sort_dirs_by_angle(kept_d, edge_dir, kept_n)
-            regions = classify_out_regions(edge_mid, sdirs, sangles, snorms, Vw, Fw)
-            if not regions:
+            wedges = enumerate_wedges(edge_mid, sdirs, sangles, snorms)
+            if not wedges:
                 continue
 
-            seen.append((p0.copy(), p1.copy()))
-            overall = p1 - p0
-            overall = (overall / np.linalg.norm(overall)).tolist()
-            for r in regions:
-                welds.append({
-                    "prim_path": prim_path,
-                    "p0": p0.tolist(),
-                    "p1": p1.tolist(),
-                    "length": round(length, 6),
-                    "edge_dir": overall,
-                    **r,
-                })
+            # 每个楔形的 Q 攒进本组，记录 (grp,start,n) 供 Pass B/C 取回
+            for w in wedges:
+                Q = w.pop("Q")
+                start = group_rows[grp]
+                group_Q[grp].append(Q)
+                group_rows[grp] += len(Q)
+                w["_slice"] = (grp, start, len(Q))
+
+            cands.append({"prim_path": prim_path, "p0": p0, "p1": p1,
+                          "length": length, "wedges": wedges})
+
+    # ---- Pass B：每组一次批量 winding（① 关键提速：整组一次 BVH）----
+    group_wn = []
+    for g in range(ngroups):
+        Vw, Fw = VF[g]
+        if group_Q[g]:
+            allQ = np.vstack(group_Q[g])
+            with _Timer("winding.fwn"):
+                wn = igl.fast_winding_number(Vw, Fw, allQ)
+            group_wn.append(np.asarray(wn))
+        else:
+            group_wn.append(np.empty(0))
+
+    # ---- Pass C：原顺序去重(③ 空间哈希) + 取 winding 切片判 OUT + 组装 ----
+    def _cell(p):
+        return (int(np.floor(p[0] / DEDUP_EPS)),
+                int(np.floor(p[1] / DEDUP_EPS)),
+                int(np.floor(p[2] / DEDUP_EPS)))
+
+    def _neigh(c):
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    yield (c[0] + dx, c[1] + dy, c[2] + dz)
+
+    bucket = defaultdict(list)                   # cell -> [seen 下标]
+    seen = []                                    # [(p0,p1)]，注册后端点入 bucket
+
+    for c in cands:
+        p0, p1 = c["p0"], c["p1"]
+        # 收集近邻桶里的 seen 候选，再做精确 allclose（与原 O(n²) 语义等价）
+        cand_idx = set()
+        for cc in _neigh(_cell(p0)):
+            cand_idx.update(bucket.get(cc, ()))
+        for cc in _neigh(_cell(p1)):
+            cand_idx.update(bucket.get(cc, ()))
+        with _Timer("dedup"):
+            dup = False
+            for si in cand_idx:
+                q0, q1 = seen[si]
+                if ((np.allclose(p0, q0, atol=DEDUP_EPS) and np.allclose(p1, q1, atol=DEDUP_EPS)) or
+                        (np.allclose(p0, q1, atol=DEDUP_EPS) and np.allclose(p1, q0, atol=DEDUP_EPS))):
+                    dup = True
+                    break
+        if dup:
+            continue
+
+        regions = []
+        for w in c["wedges"]:
+            g, start, n = w["_slice"]
+            wn_slice = group_wn[g][start:start + n]
+            ratio = float(np.sum(wn_slice > 0.5)) / n
+            if ratio > 0.5:                      # inside → 丢弃
+                continue
+            regions.append({
+                "bisector": w["bisector"],
+                "gap_deg": w["gap_deg"],
+                "inside_ratio": round(ratio, 4),
+                "is_inside": False,
+                "boundary_dirs": w["boundary_dirs"],
+                "boundary_normals": w["boundary_normals"],
+            })
+        if not regions:
+            continue
+
+        idx = len(seen)
+        seen.append((p0, p1))
+        bucket[_cell(p0)].append(idx)
+        bucket[_cell(p1)].append(idx)
+        overall = p1 - p0
+        overall = (overall / np.linalg.norm(overall)).tolist()
+        for r in regions:
+            welds.append({
+                "prim_path": c["prim_path"],
+                "p0": p0.tolist(),
+                "p1": p1.tolist(),
+                "length": round(c["length"], 6),
+                "edge_dir": overall,
+                **r,
+            })
 
     if verbose:
         print(f"[done] {len(welds)} 条朝外焊缝，用时 {time.time() - t0:.1f}s")
+        if _T:
+            print("[timing] 各阶段累计耗时（占比 / 调用次数）:")
+            total = time.time() - t0
+            for k in sorted(_T, key=lambda x: -_T[x]):
+                print(f"  {k:24s} {_T[k]:8.1f}s  {_T[k]/total*100:5.1f}%  x{_C[k]}")
     return welds
 
 
