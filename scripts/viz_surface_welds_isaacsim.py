@@ -2,8 +2,8 @@
 
 打开原始 USD 场景，把 welds.json 里每条焊缝叠加画出来：
     · 焊缝       p0→p1        —— 红色圆柱（半径 5cm，长度=焊缝长度）
-    · bisector   中点→外部     —— 绿色线 + 端点小球（角平分线，指向张开的外部空间）
-    · boundary_dirs 两侧面方向 —— （可选，--show-boundary）黄/青短线，从中点沿两侧面出去
+    · bisector   中点→外部     —— 绿色圆柱+端点球（角平分线，指向张开的外部空间）
+    · boundary_dirs 两侧面方向 —— 黄/青圆柱+端点球，从中点沿两侧面出去
 
 坐标系：welds.json 是世界系(米)，本脚本直接 open 同一个 USD 场景作为 stage，
 故焊缝世界坐标与场景几何 1:1 对齐（前提 metersPerUnit=1，Isaac warehouse 即如此）。
@@ -33,10 +33,10 @@ def parse_args():
     ap.add_argument("--line-width", type=float, default=0.01, help="焊缝线宽(米)")
     ap.add_argument("--seam-radius", type=float, default=0.05,
                     help="焊缝圆柱半径(米)，默认 0.05=5cm")
-    ap.add_argument("--bisector-len", type=float, default=0.06,
-                    help="bisector 箭头长度(米)；0=不画")
-    ap.add_argument("--show-boundary", action="store_true",
-                    help="额外画两侧 boundary_dir 短线(黄/青)")
+    ap.add_argument("--bisector-len", type=float, default=1.0,
+                    help="bisector/boundary_dirs 方向向量长度(米)，默认 1.0；0=不画")
+    ap.add_argument("--vec-radius", type=float, default=0.02,
+                    help="方向向量圆柱半径(米)，默认 0.02=2cm")
     ap.add_argument("--max-welds", type=int, default=0, help="最多画多少条(0=全部)，控性能")
     ap.add_argument("--cam-dist", type=float, default=0.5,
                     help="为每条焊缝建相机的距离(米)，相机沿 bisector 正方向、看回中点，默认 0.5")
@@ -150,6 +150,22 @@ def add_camera(prim_path, cam_pos, look_at, focal=18.0, up=(0.0, 0.0, 1.0)):
     xf.AddTransformOp(precision=UsdGeom.XformOp.PrecisionDouble).Set(world)
 
 
+def add_vector(prim_path, origin, direction, length, radius, color):
+    """像焊缝一样用「圆柱 + 端点球」表示一个方向向量：
+
+    起点 origin，沿 direction(自动归一化)延伸 length 米，圆柱半径 radius，
+    末端加一个小球标出朝向。用不同颜色与焊缝区分。"""
+    d = np.asarray(direction, float)
+    n = float(np.linalg.norm(d))
+    if n < 1e-9 or length <= 0:
+        return
+    d = d / n
+    origin = np.asarray(origin, float)
+    tip = origin + d * length
+    add_cylinder(f"{prim_path}/shaft", origin, tip, radius, color)
+    add_sphere(f"{prim_path}/tip", tip, radius * 1.6, color)
+
+
 def add_sphere(prim_path, center, radius, color):
     stage = omni.usd.get_context().get_stage()
     s = UsdGeom.Sphere.Define(stage, prim_path)
@@ -192,7 +208,7 @@ def main():
 
     lw = args_cli.line_width
     blen = args_cli.bisector_len
-    tip_r = max(lw * 0.9, 0.006)
+    vr = args_cli.vec_radius
 
     shots = []          # 待拍照的焊缝: (i, cam_pos, look_at)
     for i, w in enumerate(welds):
@@ -203,12 +219,10 @@ def main():
         add_cylinder(f"{base}/seam", p0, p1, args_cli.seam_radius, (1.0, 0.05, 0.05))
 
         mid = 0.5 * (p0 + p1)
-        # bisector（绿 + 端点球）
+        # bisector（绿色圆柱+端点球，起点=焊缝中点，长度 blen 米，指向外部空气侧）
         if blen > 0 and w.get("bisector"):
             b = np.asarray(w["bisector"], float)
-            tip = mid + b * blen
-            add_polyline(f"{base}/bisector", [mid, tip], lw * 0.6, (0.1, 1.0, 0.1))
-            add_sphere(f"{base}/bisector_tip", tip, tip_r, (0.1, 1.0, 0.1))
+            add_vector(f"{base}/bisector", mid, b, blen, vr, (0.1, 1.0, 0.1))
         # 每条焊缝一台相机：bisector 正方向 cam_dist 处、看回中点（视线=bisector 反方向）
         if not args_cli.no_cam and w.get("bisector"):
             b = np.asarray(w["bisector"], float)
@@ -217,13 +231,12 @@ def main():
                 cam_pos = mid + (b / nb) * args_cli.cam_dist
                 add_camera(f"/World/weld_cams/cam_w{i:05d}", cam_pos, mid,
                            focal=args_cli.cam_focal)
-        # 两侧 boundary_dir（黄/青）
-        if args_cli.show_boundary and w.get("boundary_dirs"):
+        # 两侧 boundary_dir（黄/青圆柱+端点球，起点=焊缝中点，长度 blen 米）
+        if w.get("boundary_dirs"):
             cols = [(1.0, 1.0, 0.1), (0.1, 1.0, 1.0)]
             for k, d in enumerate(w["boundary_dirs"][:2]):
                 d = np.asarray(d, float)
-                add_polyline(f"{base}/bdir{k}", [mid, mid + d * blen * 0.7],
-                             lw * 0.5, cols[k])
+                add_vector(f"{base}/bdir{k}", mid, d, blen, vr, cols[k])
 
         # 记录拍照位姿：相机在 bisector 正方向 dist 处，看向中点 => 拍摄方向=bisector 反方向
         if args_cli.save and w.get("bisector"):
@@ -233,8 +246,7 @@ def main():
                 cam_pos = mid + (b / nb) * args_cli.save_dist
                 shots.append((i, cam_pos, mid))
 
-    print(f"[viz] 焊缝已建（红=焊缝圆柱 绿=bisector"
-          f"{' 黄/青=boundary_dir' if args_cli.show_boundary else ''}"
+    print(f"[viz] 焊缝已建（红=焊缝圆柱 绿=bisector 黄/青=boundary_dir"
           f"{'' if args_cli.no_cam else '，每条焊缝一台相机 /World/weld_cams/cam_wXXXXX'}）")
 
     # ---- 拍照 ----

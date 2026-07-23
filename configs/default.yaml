@@ -217,6 +217,7 @@ observeanything:                        # 观测场景：把机械臂悬空放�
     workpiece_x_voxel_m: 0.1            # 场景体素点粒度（米），供「场景 vs init_free 无交集」过滤用
     front_face_filter: false            # 正面过滤 bis_base.z≥0：只在焊缝正脸可见的朝向放相机。false=去掉该过滤。（正/反手分类已改用「初始相机可见性」，见 plan_observe_scene.md §7，不再由此过滤兼任）
     debug_max_per_step: 200             # debug=True 时逐步过滤快照每步随机抽样上限（防 pkl 膨胀；合格步全存不受限）
+    sort_yaw_weight: 0.3                # 候选排序（差异大排前面）里 yaw 相对权重：合成差异 = xyz欧氏距离 + 此值×yaw环形角距（各按最大量级归一）；<1 表示 xyz 比 yaw 更重要
     # 正/反手分类（plan_observe_scene.md §7）：backhand ⇔ 初始关节角(retract_config)下末端相机对该焊缝完全看不到
     visible_num_samples: 20             # 沿焊缝均匀取几个点判可见性（可见=在相机内参FOV内 且 未被裁剪块 mesh 遮挡）
     block_radius_m: 0.04                # 遮挡容差圆盘半径（米）：把视线加粗成 4cm 圆柱去探遮挡（沿用 config_pose.block_radius）

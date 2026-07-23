@@ -411,6 +411,11 @@ class Config:
         return int(self._obs_fast.get("debug_max_per_step", 200))
 
     @property
+    def obs_fast_sort_yaw_weight(self) -> float:
+        """候选排序（差异大排前面）里 yaw 相对权重：合成差异 = xyz欧氏距离 + 此值×yaw环形角距（各按最大量级归一）；<1 ⇒ xyz 比 yaw 更重要。见 observeanything.plan_init_pose_fast.sort_yaw_weight。"""
+        return float(self._obs_fast.get("sort_yaw_weight", 0.3))
+
+    @property
     def obs_fast_visible_num_samples(self) -> int:
         """正/反手分类：沿焊缝均匀取几个点判「初始相机可见性」（见 plan_observe_scene.md §7）。见 observeanything.plan_init_pose_fast.visible_num_samples。"""
         return int(self._obs_fast.get("visible_num_samples", 20))
