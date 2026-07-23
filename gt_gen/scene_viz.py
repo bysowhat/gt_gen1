@@ -274,6 +274,9 @@ class Open3DSceneVisualizer(SceneVisualizer):
         res = {"forehand": [c.raw for c in cands.get("forehand", [])],
                "backhand": [c.raw for c in cands.get("backhand", [])]}
 
+        # res = {"forehand": [],
+        #        "backhand": [c.raw for c in cands.get("backhand", [])]}
+
         # extra_geoms 钩子：障碍（随工件按 (R,t) 摆放）+ 初始关节角机械臂碰撞球（base 系、与候选无关）
         factories = []
         if scene._seam_obstacles():

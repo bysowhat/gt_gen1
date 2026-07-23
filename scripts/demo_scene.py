@@ -335,8 +335,11 @@ def obstacle_type3_demo_main(args):
         try:
             scene._set_cur_seam(seam_id)
             # 候选初始位姿：hand/障碍无关（放宽不避障），每缝算 1 次即可
-            scene.plan_init_pose_fast(verbose=False)
-            for hand in ("forehand", "backhand"):
+            scene.plan_init_pose_fast(verbose=True)
+            # from gt_gen.scene_viz import Open3DSceneVisualizer
+            # Open3DSceneVisualizer(scene).show_init_poses()
+            # for hand in ("forehand", "backhand"):
+            for hand in ["backhand"]:
                 if scene.compute_pose_and_plan_path(hand, max_stomp_try=1, max_init_pose=2):
                     print(f"[demo] seam {seam_id} {hand}：带障碍轨迹成功")
                 else:
