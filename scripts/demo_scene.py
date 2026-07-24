@@ -378,17 +378,17 @@ def viz(args):
 
 def viz_ob(args):
     from gt_gen.observe_scene import ObserveAnythingScene
-    from gt_gen.scene_viz import Open3DSceneVisualizer
+    from gt_gen.scene_viz import ObserveSceneVisualizer
 
     scene = ObserveAnythingScene.load(args.pkl)
     scene.summarize_trajectories()
-    # Open3DSceneVisualizer(scene).show_scene_isaacsim()
+    # ObserveSceneVisualizer(scene).show_scene_isaacsim()
     time.sleep(3)
     if args.ds:
         fps = 3
     else:
         fps = 30
-    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.pkl_hand,ds=args.ds,fps=fps)
+    ObserveSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.pkl_hand,ds=args.ds,fps=fps)
 
 
 def main():

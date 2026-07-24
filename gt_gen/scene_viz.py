@@ -21,6 +21,36 @@ from __future__ import annotations
 from gt_gen.scene import Scene, _load_plan_init_pose
 
 
+def _prefer_isaac_bundled_warp() -> bool:
+    """纯可视化进程专用：把 Isaac Sim 自带的 warp（site-packages/isaacsim/extscache/
+    omni.warp.core-*）插到 sys.path 最前，使随后的 `import warp` 拿到与 isaacsim 匹配的版本
+    （1.8.x，含 wp.types.array / warp.context / np_dtype_to_warp_type 等旧命名空间），而不是
+    本机 pip 装的 warp 1.13.0（为 curobo 装的，缺这些名字 → isaacsim.core.utils.warp import 即
+    AttributeError，SimulationApp 起不来）。
+
+    **须在任何 `import warp` / `import gt_gen.compat`（其模块级会 import warp）之前调用**，否则
+    warp 已进 sys.modules，换不掉。仅用于 show_*_isaacsim 这类干净可视化进程——它们不跑 curobo，
+    故不需要 pip warp 1.13；curobo 进程绝不能调本函数。用 find_spec 定位 isaacsim（不执行其模块，
+    避免过早 import warp）。返回是否成功切到自带 warp。"""
+    import importlib.util
+    import glob
+    import os
+    import sys
+    if "warp" in sys.modules:
+        return False                              # 已 import，来不及换
+    spec = importlib.util.find_spec("isaacsim")
+    if spec is None or not spec.origin:
+        return False
+    base = os.path.dirname(spec.origin)
+    cands = sorted(glob.glob(os.path.join(base, "extscache", "omni.warp.core-*")))
+    if not cands:
+        return False
+    ext_root = cands[-1]                          # 版本号排序取最新；其下含 warp/ 包
+    if os.path.isdir(os.path.join(ext_root, "warp")) and ext_root not in sys.path:
+        sys.path.insert(0, ext_root)
+    return True
+
+
 def _quat_wxyz_to_R(q):
     """四元数 wxyz -> 3×3 旋转矩阵（归一化后）。"""
     import numpy as np
@@ -1175,6 +1205,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
         ids = list(range(n)) if seam_ids is None else [int(i) % n for i in seam_ids]
 
         # —— SimulationApp 必须最先启动（在 import omni 之前）——
+        # warp 版本对齐：本机 pip warp 1.13.0（为 curobo 装）缺 wp.types.array / warp.context 等旧
+        # 命名空间，isaacsim.core.utils.warp 仍按旧命名空间用 → SimulationApp 起不来。可视化进程不跑
+        # curobo，故直接切到 Isaac 自带的 warp 1.8.x（须在任何 import warp / import compat 之前）。
+        _prefer_isaac_bundled_warp()
+        try:
+            from gt_gen import compat as _compat  # noqa: F401
+        except Exception:
+            pass
         try:
             import isaacsim  # noqa: F401  注册 omni.* 模块路径
         except ImportError:
@@ -1392,6 +1430,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
                 print(f"[viz] 取当前焊缝失败（忽略）: {_e}")
 
         # —— SimulationApp 必须最先启动（在 import omni 之前）——
+        # warp 版本对齐：本机 pip warp 1.13.0（为 curobo 装）缺 wp.types.array / warp.context 等旧
+        # 命名空间，isaacsim.core.utils.warp 仍按旧命名空间用 → SimulationApp 起不来。可视化进程不跑
+        # curobo，故直接切到 Isaac 自带的 warp 1.8.x（须在任何 import warp / import compat 之前）。
+        _prefer_isaac_bundled_warp()
+        try:
+            from gt_gen import compat as _compat  # noqa: F401
+        except Exception:
+            pass
         try:
             import isaacsim  # noqa: F401  注册 omni.* 模块路径
         except ImportError:
@@ -1642,7 +1688,10 @@ class Open3DSceneVisualizer(SceneVisualizer):
             zpool.append(float(np.asarray(sl)[:, 2].min()))
         world.scene.add_default_ground_plane(z_position=(min(zpool) - 1.0) if zpool else -1.0)
 
-        spawn_workpiece("/World/workpiece", scene.workpiece_obj, wp_pose7)
+        # 环境几何（工件/整场景）：默认画 scene.workpiece_obj；子类（如 ObserveSceneVisualizer）
+        # 可覆盖 _spawn_environment 改画整场景。spawn_mesh 内部已做 tf_pts(mesh 系→渲染系)，故与
+        # 焊缝/机械臂/goal 视锥同框对齐。
+        self._spawn_environment(spawn_workpiece, spawn_mesh, wp_pose7)
 
         # 当前焊缝红线（渲染系）
         if cur_seam_line is not None:
@@ -2213,6 +2262,14 @@ class Open3DSceneVisualizer(SceneVisualizer):
         obstacles = list(scene._seam_obstacles()) if show_obstacles else []
 
         # —— SimulationApp 必须最先启动（在 import omni 之前）——
+        # warp 版本对齐：本机 pip warp 1.13.0（为 curobo 装）缺 wp.types.array / warp.context 等旧
+        # 命名空间，isaacsim.core.utils.warp 仍按旧命名空间用 → SimulationApp 起不来。可视化进程不跑
+        # curobo，故直接切到 Isaac 自带的 warp 1.8.x（须在任何 import warp / import compat 之前）。
+        _prefer_isaac_bundled_warp()
+        try:
+            from gt_gen import compat as _compat  # noqa: F401
+        except Exception:
+            pass
         try:
             import isaacsim  # noqa: F401  注册 omni.* 模块路径
         except ImportError:
@@ -2427,6 +2484,16 @@ class Open3DSceneVisualizer(SceneVisualizer):
             world.step(render=True)
         simulation_app.close()
 
+    def _spawn_environment(self, spawn_workpiece, spawn_mesh, wp_pose7):
+        """把「环境几何」spawn 到 stage（供 show_scene_isaacsim 调用，可被子类覆盖）。
+
+        默认行为：画单个工件 mesh（scene.workpiece_obj），摆到渲染系 wp_pose7。
+        · spawn_workpiece(prim_path, obj_path, pose7)：从 .obj/.usd 建工件并摆位（含关物理）。
+        · spawn_mesh(prim_path, mesh_dict)：从 {points(mesh 系), counts, faces, color} 建 UsdGeom.Mesh，
+          内部已 tf_pts(mesh 系→渲染系)。子类画整场景时用它逐 prim 建 mesh，保证与工件同坐标口径。
+        """
+        spawn_workpiece("/World/workpiece", self.scene.workpiece_obj, wp_pose7)
+
     def show_trajectory_isaacsim(self, seam_id: int = None, hand: str = None,
                                  traj_index: int = -1, headless: bool = False,
                                  fps: int = 30, goal_variant: int = 0,
@@ -2515,6 +2582,64 @@ class Open3DSceneVisualizer(SceneVisualizer):
                                  observe=observe, goal=goal, flash_peak=flash_peak,
                                  flash_decay=flash_decay, goal_hold=goal_hold,
                                  base_intensity=base_intensity)
+
+
+class ObserveSceneVisualizer(Open3DSceneVisualizer):
+    """ObserveAnything（type3）场景的可视化器：回放轨迹时画【整个场景 USD】而非单个工件。
+
+    背景：type1/type2 的 pkl 里是【一个工件 obj】，回放时画工件即可；type3（ObserveAnythingScene）
+    没有工件——它对应一整个场景 USD（如 warehouse），scene.workpiece_obj 只是当前焊缝邻域裁出的
+    一小块。父类 Open3DSceneVisualizer 默认只画 workpiece_obj，故 type3 回放只能看到焊缝旁一小块。
+
+    本类只覆盖 _spawn_environment：遍历 scene._scene_prims（load_scene_meshes 产出的【世界系-米】
+    per-prim trimesh，pkl load 时按 usd_path 重新解析已备好），逐 prim 建 UsdGeom.Mesh。因裁剪块
+    与整场景走的是同一套世界系-米管线，摆到同一 wp_pose7(=inv(T_base_world)) 即与机械臂/焊缝/
+    goal 视锥严丝合缝。show_scene_isaacsim / show_trajectory_isaacsim 全整段复用父类。
+
+    用法（干净进程，勿与 curobo 同进程；见 Scene.save/load 说明）：
+        scene = ObserveAnythingScene.load(pkl)
+        ObserveSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=..., hand=...)
+    """
+
+    def _spawn_environment(self, spawn_workpiece, spawn_mesh, wp_pose7):
+        import numpy as np
+
+        scene = self.scene
+        prims = getattr(scene, "_scene_prims", None)
+        # 关键：pkl load() 时【故意不】解析整场景 mesh（那会在起 SimulationApp 之前自举 pxr，导致
+        # Isaac 的 USD 库被加载两次 → UsdPhysicsScene::Define 原生崩溃）。本方法在 SimulationApp
+        # 起来【之后】才跑，此时 pxr 已是 kit 自己那套；find_surface_welds 的 _bootstrap_pxr 见 pxr
+        # 可直接 import 便立即返回、无副作用 → 此刻懒加载整场景 mesh 才安全（见 observe_scene.load）。
+        if not prims and getattr(scene, "usd_path", None):
+            try:
+                from gt_gen.observe_scene import _load_scene_meshes
+                prims = _load_scene_meshes(scene.usd_path, verbose=False)
+                scene._scene_prims = prims
+                print(f"[viz] ObserveSceneVisualizer: 起 kit 后懒加载整场景 mesh {len(prims)} 个 prim")
+            except Exception as e:
+                print(f"[viz] ObserveSceneVisualizer: 懒加载整场景 mesh 失败（{e}），回退画裁剪块工件")
+                prims = None
+        if not prims:
+            # usd_path 缺失/不可读 → 回退画裁剪块工件（至少看到焊缝旁一小块）
+            print("[viz] ObserveSceneVisualizer: 无整场景 mesh，回退画裁剪块工件 scene.workpiece_obj")
+            spawn_workpiece("/World/workpiece", scene.workpiece_obj, wp_pose7)
+            return
+
+        n_face = 0
+        for i, (ppath, tm) in enumerate(prims):
+            verts = np.asarray(tm.vertices, float)
+            faces = np.asarray(tm.faces, np.int64).reshape(-1, 3)
+            if len(verts) == 0 or len(faces) == 0:
+                continue
+            # spawn_mesh 内部对 points 做 tf_pts(世界系-米 → 渲染系 base)，与裁剪块/机械臂同框
+            spawn_mesh(f"/World/scene/prim{i}", {
+                "points": verts,
+                "counts": [3] * len(faces),
+                "faces": faces.flatten().tolist(),
+                "color": [0.72, 0.72, 0.72],
+            })
+            n_face += len(faces)
+        print(f"[viz] ObserveSceneVisualizer: 画整场景 {len(prims)} 个 prim mesh（共 {n_face} 面）")
 
 
 class IsaacSimSceneVisualizer(SceneVisualizer):

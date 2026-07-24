@@ -82,13 +82,17 @@ class ObserveAnythingScene(Scene):
                  usd_path: Optional[str] = None,
                  welds_json: Optional[str] = None,
                  cache_dir: Optional[str] = None,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 load_meshes: bool = True):
         cfg = load_config(cfg)
         # 整场景 prim mesh（世界系/米），__init__ 只加载一次、缓存在内存供各缝裁剪复用。
-        # usd_path 为空（load 复原 / 纯可视化，不再裁剪新缝）时跳过整场景 mesh 加载——
-        # 裁剪块 .obj 已随 save 落盘，可视化只吃 workpiece_obj，用不到 _scene_prims。
+        # usd_path 为空（旧盘）时无从加载；load_meshes=False（可视化 load 路径）时【刻意跳过】——
+        # _load_scene_meshes 会经 find_surface_welds 自举 pxr，若在起 SimulationApp 之前跑会让 Isaac
+        # 的 USD 库被加载两次 → UsdPhysicsScene::Define 原生崩溃。可视化时改由 ObserveSceneVisualizer
+        # 在 SimulationApp 起来【之后】懒加载（那时 pxr 已是 kit 的，安全）。裁剪块 .obj 已随 save 落盘。
         self.usd_path: Optional[str] = usd_path
-        self._scene_prims = _load_scene_meshes(usd_path, verbose=verbose) if usd_path else None
+        self._scene_prims = (_load_scene_meshes(usd_path, verbose=verbose)
+                             if (usd_path and load_meshes) else None)
         if not welds_json:
             raise ValueError("ObserveAnythingScene 需要 welds_json（find_surface_welds.py 输出）")
         # 邻域裁剪块缓存：{seam_id: obj_fp}；体素点缓存：{seam_id: (K,3) 世界系}
@@ -125,9 +129,11 @@ class ObserveAnythingScene(Scene):
     @classmethod
     def load(cls, path: str) -> "ObserveAnythingScene":
         """从 save() 存盘复原（数据状态）供可视化。**不重跑整场景 USD mesh 加载**：
-        usd_path 传存盘值（旧盘可能为 None），为空则 __init__ 跳过 _load_scene_meshes（裁剪用不到），
-        workpiece_obj 由 _restore_state 用存盘的当缝裁剪块路径复原 → 直接喂
-        Open3DSceneVisualizer.show_observe_scene_isaacsim。
+        usd_path 传存盘值（供可视化时懒加载/参考），但强制 load_meshes=False → __init__ 跳过
+        _load_scene_meshes。原因：_load_scene_meshes 会经 find_surface_welds 自举 pxr，若在起
+        SimulationApp 之前跑，会让 Isaac 的 USD 库被加载两次 → UsdPhysicsScene::Define 原生崩溃。
+        整场景 mesh 改由 ObserveSceneVisualizer 在 SimulationApp 起来【之后】懒加载（pxr 已是 kit 的，
+        安全）；workpiece_obj 由 _restore_state 用存盘的当缝裁剪块路径复原。
 
         父类 Scene.load 会以 cls(workpiece_obj=..., weld_json=...) 构造，与本子类 __init__
         签名（usd_path/welds_json）不兼容，故必须在此覆盖。weld_json 路径须仍可读（重读焊缝）。
@@ -136,7 +142,7 @@ class ObserveAnythingScene(Scene):
         with open(path, "rb") as f:
             state = pickle.load(f)
         self = cls(cfg=state["cfg"], usd_path=state.get("usd_path"),
-                   welds_json=state["weld_json"], verbose=False)
+                   welds_json=state["weld_json"], verbose=False, load_meshes=False)
         self._restore_state(state)
         return self
 
@@ -153,12 +159,24 @@ class ObserveAnythingScene(Scene):
         if seam_id in self._crop_cache and os.path.isfile(self._crop_cache[seam_id]):
             return self._crop_cache[seam_id]
 
+        R = float(self.cfg.obs_crop_radius)
+        usd_stem = os.path.splitext(os.path.basename(str(self.usd_path)))[0]
+        obj_fp = os.path.join(self._cache_dir, f"{usd_stem}_seam{seam_id}_r{R:g}.obj")
+        # 磁盘缓存命中即直接返回：裁剪块文件名是确定性的（生成时已落盘）。可视化 load 路径刻意
+        # 不加载 _scene_prims（避免起 kit 前自举 pxr 崩溃），此时靠磁盘缓存复用裁剪块，无需整场景 mesh。
+        if os.path.isfile(obj_fp):
+            self._crop_cache[seam_id] = obj_fp
+            return obj_fp
+        if self._scene_prims is None:
+            raise RuntimeError(
+                f"焊缝 {seam_id} 裁剪块缓存缺失（{obj_fp}）且 _scene_prims 未加载：可视化进程不重建整场景"
+                f" mesh（会在起 SimulationApp 前自举 pxr 致崩）。请确认裁剪块 .obj 已随生成落到该缓存目录。")
+
         import gt_gen.compat
         import trimesh as _trimesh
         gt_gen.compat.apply_trimesh_shim()
 
         mid = np.asarray(self.seams[seam_id]["mid_world"], dtype=np.float64)
-        R = float(self.cfg.obs_crop_radius)
         kept = [tm for _pp, tm in self._scene_prims if _aabb_dist_to_point(tm, mid) <= R]
         if not kept:
             raise RuntimeError(
@@ -183,8 +201,6 @@ class ObserveAnythingScene(Scene):
                 if self._verbose:
                     print(f"[observe] 焊缝 {seam_id} 布尔并集失败({e})，回退拼接")
 
-        usd_stem = os.path.splitext(os.path.basename(str(self.usd_path)))[0]
-        obj_fp = os.path.join(self._cache_dir, f"{usd_stem}_seam{seam_id}_r{R:g}.obj")
         merged.export(obj_fp)
         self._crop_cache[seam_id] = obj_fp
         if self._verbose:
