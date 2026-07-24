@@ -820,7 +820,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
     _t = time.perf_counter()
     _observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth)
     _tick("observe", _t)
-    # _debug_viz_observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth, "after")   # 拍后
+    _debug_viz_observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth, "after")   # 拍后
 
     info = {"rounds": 0, "n_B": [], "free": [], "status_seq": [], "P_len": None}
     free_prev = voxmap.counts()[FREE]
@@ -949,7 +949,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                                         pose_cost_metric=metric, p_star=P)
         _tick("nbv", _t)
         # _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, r_list, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
-        # _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
+        _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
         info["status_seq"].append(r.status)
         info["n_B"].append(int(r.n_B))#r.n_B:本轮阻塞段B的体素个数
         if P is not None and info["P_len"] is None:

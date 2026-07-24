@@ -79,14 +79,18 @@ class ObserveAnythingScene(Scene):
 
     def __init__(self,
                  cfg,
-                 usd_path: str,
-                 welds_json: str,
+                 usd_path: Optional[str] = None,
+                 welds_json: Optional[str] = None,
                  cache_dir: Optional[str] = None,
                  verbose: bool = True):
         cfg = load_config(cfg)
-        # 整场景 prim mesh（世界系/米），__init__ 只加载一次、缓存在内存供各缝裁剪复用
-        self.usd_path: str = usd_path
-        self._scene_prims = _load_scene_meshes(usd_path, verbose=verbose)
+        # 整场景 prim mesh（世界系/米），__init__ 只加载一次、缓存在内存供各缝裁剪复用。
+        # usd_path 为空（load 复原 / 纯可视化，不再裁剪新缝）时跳过整场景 mesh 加载——
+        # 裁剪块 .obj 已随 save 落盘，可视化只吃 workpiece_obj，用不到 _scene_prims。
+        self.usd_path: Optional[str] = usd_path
+        self._scene_prims = _load_scene_meshes(usd_path, verbose=verbose) if usd_path else None
+        if not welds_json:
+            raise ValueError("ObserveAnythingScene 需要 welds_json（find_surface_welds.py 输出）")
         # 邻域裁剪块缓存：{seam_id: obj_fp}；体素点缓存：{seam_id: (K,3) 世界系}
         self._crop_cache: Dict[int, str] = {}
         self._scene_pts_cache: Dict[int, np.ndarray] = {}
@@ -102,6 +106,39 @@ class ObserveAnythingScene(Scene):
         # 父类构造：workpiece_obj 先占位（父类只存不读；_set_cur_seam 时按缝重指为邻域块），
         # weld_json=welds_json → _load_seam 直接复用父类（键已对齐）。
         super().__init__(cfg, workpiece_obj="", weld_json=welds_json)
+
+    # ------------------------------------------------------------------
+    # 存/取：父类 save 的 state 不含 usd_path/welds_json 语义，这里补一层让 load 自描述
+    # ------------------------------------------------------------------
+    def save(self, path: str) -> str:
+        """沿用父类 save（落 workpiece_obj=当缝裁剪块 / weld_json=welds_json），再补写 usd_path，
+        使存盘自描述（load 时若需重建整场景 mesh 可用；纯可视化则无所谓）。"""
+        import pickle
+        p = super().save(path)
+        with open(p, "rb") as f:
+            state = pickle.load(f)
+        state["usd_path"] = self.usd_path
+        with open(p, "wb") as f:
+            pickle.dump(state, f)
+        return p
+
+    @classmethod
+    def load(cls, path: str) -> "ObserveAnythingScene":
+        """从 save() 存盘复原（数据状态）供可视化。**不重跑整场景 USD mesh 加载**：
+        usd_path 传存盘值（旧盘可能为 None），为空则 __init__ 跳过 _load_scene_meshes（裁剪用不到），
+        workpiece_obj 由 _restore_state 用存盘的当缝裁剪块路径复原 → 直接喂
+        Open3DSceneVisualizer.show_observe_scene_isaacsim。
+
+        父类 Scene.load 会以 cls(workpiece_obj=..., weld_json=...) 构造，与本子类 __init__
+        签名（usd_path/welds_json）不兼容，故必须在此覆盖。weld_json 路径须仍可读（重读焊缝）。
+        """
+        import pickle
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        self = cls(cfg=state["cfg"], usd_path=state.get("usd_path"),
+                   welds_json=state["weld_json"], verbose=False)
+        self._restore_state(state)
+        return self
 
     # ------------------------------------------------------------------
     # USD → 焊缝邻域裁剪世界系(米) .obj
@@ -542,8 +579,10 @@ class ObserveAnythingScene(Scene):
         back_c = [InitPoseCandidate.from_kejian2(d) for d in back]
 
         history = self.init_pose_candidates.get(seam_id, {"forehand": [], "backhand": []})
-        history["forehand"].extend(random.sample(fore_c, len(fore_c)))
-        history["backhand"].extend(random.sample(back_c, len(back_c)))
+        # 按【机械臂 base 位姿差异】降序排列（差异大的排前面，xyz 权重高于 yaw）——替代随机排序
+        yw = self.cfg.obs_fast_sort_yaw_weight
+        history["forehand"].extend(self._sort_by_base_pose_diversity(fore_c, yaw_weight=yw))
+        history["backhand"].extend(self._sort_by_base_pose_diversity(back_c, yaw_weight=yw))
         self.init_pose_candidates[seam_id] = history
         self.init_pose_candidates_length[seam_id] = {
             "forehand": len(history["forehand"]),
@@ -568,4 +607,41 @@ class ObserveAnythingScene(Scene):
             self.init_pose_debug_step_names[seam_id] = []
         self.init_pose_prefilter_steps[seam_id] = {}
         return self.init_pose_candidates[seam_id]
+
+    @staticmethod
+    def _sort_by_base_pose_diversity(cands: List["InitPoseCandidate"],
+                                     yaw_weight: float = 0.3) -> List["InitPoseCandidate"]:
+        """把同一手别候选按【机械臂 base 位姿差异】独立分数降序排列（差异大的排前面）。
+
+        与父类 Scene._sort_by_xyz_diversity（只看工件平移 t）不同：本类采样的是机械臂 base 在
+        世界系的位姿(xyz+yaw)，而每个候选的 t 落在各自 base 系（R 不同），跨候选比 t 无物理意义。
+        故先由 T_workpiece_in_base 还原每个候选的 base 世界位姿：
+          · R = Rz(yaw)ᵀ ⇒ yaw = atan2(R[0,1], R[0,0])；
+          · pos_world = -Rᵀ · t（机械臂 base 原点在世界系）。
+        再算差异分：每个候选到本组其余候选的【加权平均距离】，加权 = xyz 欧氏距离(米) + yaw_weight
+        × yaw 环形角距(rad, 归一到各自最大量级后合成，故 yaw_weight 直接是相对权重)；分越高=越离群/
+        铺得开，排越前。**xyz 比 yaw 更重要**（yaw_weight<1）。≤1 个时原样返回；稳定排序（同分保序）。
+        """
+        n = len(cands)
+        if n <= 1:
+            return list(cands)
+        pos = np.empty((n, 3), dtype=np.float64)   # 机械臂 base 原点（世界系）
+        yaw = np.empty(n, dtype=np.float64)        # base 绕世界竖直轴 yaw（rad）
+        for i, c in enumerate(cands):
+            R = np.asarray(c.R, dtype=np.float64).reshape(3, 3)
+            t = np.asarray(c.t, dtype=np.float64).reshape(3)
+            pos[i] = -(R.T @ t)
+            yaw[i] = np.arctan2(R[0, 1], R[0, 0])
+        # 两两 xyz 欧氏距离
+        d_xyz = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=2)          # (n,n) 米
+        # 两两 yaw 环形角距 ∈ [0, π]
+        dyaw = np.abs(yaw[:, None] - yaw[None, :])
+        d_yaw = np.minimum(dyaw, 2.0 * np.pi - dyaw)                               # (n,n) rad
+        # 各自按最大量级归一（尺度无关），再按权重合成——xyz 权重固定 1，yaw 权重更低
+        d_xyz_n = d_xyz / (d_xyz.max() + 1e-12)
+        d_yaw_n = d_yaw / (d_yaw.max() + 1e-12)
+        D = d_xyz_n + float(yaw_weight) * d_yaw_n                                  # (n,n)
+        score = D.sum(axis=1) / float(n - 1)
+        order = sorted(range(n), key=lambda i: -float(score[i]))                   # 分数降序、稳定
+        return [cands[i] for i in order]
 

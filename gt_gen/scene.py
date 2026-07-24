@@ -1049,6 +1049,18 @@ class Scene:
             state = pickle.load(f)
         self = cls(cfg=state["cfg"], workpiece_obj=state["workpiece_obj"],
                    weld_json=state["weld_json"])
+        self._restore_state(state)
+        return self
+
+    def _restore_state(self, state: dict):
+        """把 save() 落盘的【数据状态】灌回 self（供 Scene.load 与子类 load 复用）。
+
+        不负责构造（cfg/weld_json 由各自 __init__ 设定），但会用存盘值覆盖 workpiece_obj：
+        子类（如 ObserveAnythingScene）构造期把 workpiece_obj 占位为空、切缝时才重指为该缝裁剪块，
+        故必须用存盘的当缝裁剪块路径复原，否则 load 后无工件 mesh 可视化。
+        """
+        if state.get("workpiece_obj"):
+            self.workpiece_obj = state["workpiece_obj"]
         if state.get("seam") is not None:
             self.seam = state["seam"]
             self.seam_id = state["seam_id"]
@@ -1073,7 +1085,7 @@ class Scene:
         n_b = len(cur_cands.get("backhand", []))
         cur = ("%s#%d" % (self.cur_init_hand, self.cur_init_index)
                if self.cur_init_index is not None else "未设")
-        print(f"[scene] 已加载 ← {path}（候选 正手{n_f}/反手{n_b}，"
+        print(f"[scene] 已加载（候选 正手{n_f}/反手{n_b}，"
               f"障碍 {sum(len(l) for hd in self.obstacles.values() for l in hd.values())}，goal_poses {sum(1 for v in self.goal_poses.values() if v)}，"
               f"轨迹 {sum(len(v2) for d in self.trajectories.values() for v2 in d.values())}，"
               f"当前 init pose={cur}）")
@@ -1103,6 +1115,8 @@ class Scene:
                           include_obstacles: bool = None,
                           horizontal: int = None,
                           device: str = None,
+                          use_nm: bool = None,
+                          pl_limit_deg: float = None,
                           **cfg_overrides) -> list:
         """给定当前 3D 世界（工件 + 障碍）与本焊缝，计算覆盖整条焊缝的【观测位姿序列】(goal pose)。
 
@@ -1152,6 +1166,12 @@ class Scene:
             horizontal = int(sec.get("horizontal", 2))
         if device is None:
             device = str(sec.get("device", "cuda"))
+        # 朝向是否启用 nm(双面法向 45°±15°)子项；False → orientation 只剩 tgt+pl 两项
+        if use_nm is None:
+            use_nm = bool(sec.get("use_nm", True))
+        # pl 锥半角覆盖(deg)；None=几何半二面角(默认)，设值(如90)=放宽到 bisector 正半空间(开放/反折焊缝)
+        if pl_limit_deg is None:
+            pl_limit_deg = sec.get("pl_limit_deg", None)
         # 障碍膨胀量(米,方法级)：显式 **cfg_overrides > yaml 段 > 0；只作用碰撞世界（见 _inject_obstacles_into_scenepose2）
         obstacle_buffer_m = float(cfg_overrides.get("obstacle_buffer_m",
                                                     sec.get("obstacle_buffer_m", 0.0)) or 0.0)
@@ -1165,7 +1185,7 @@ class Scene:
         cfg = Configuration()
         cfg.usd_path = ""
         cfg.pc_path = ""
-        _method_keys = {"include_obstacles", "horizontal", "device", "obstacle_buffer_m"}
+        _method_keys = {"include_obstacles", "horizontal", "device", "obstacle_buffer_m", "use_nm", "pl_limit_deg"}
         for k, v in {**sec, **cfg_overrides}.items():
             if k in _method_keys:
                 continue
@@ -1183,6 +1203,22 @@ class Scene:
         seam_tangent = torch.as_tensor(seam_tangent_np, dtype=torch.float, device=device)
         seam_limits = torch.as_tensor(seam_limits_np, dtype=torch.float, device=device)
 
+        # —— 临时诊断：焊缝朝向坐标系自洽性（orientation 代价的输入）——
+        _d1 = np.asarray(seam_limits_np[0, 0], float)
+        _d2 = np.asarray(seam_limits_np[0, 1], float)
+        _t = np.asarray(seam_tangent_np[0], float)
+        _n1 = np.cross(_d1, _t); _n2 = np.cross(_d2, _t)
+        def _ang(a, b):
+            na, nb = np.linalg.norm(a), np.linalg.norm(b)
+            if na < 1e-9 or nb < 1e-9:
+                return float("nan")
+            return float(np.degrees(np.arccos(np.clip(np.dot(a, b) / (na * nb), -1, 1))))
+        print(f"[scene][diag] seam#{self.seam_id} 朝向系: |d1|={np.linalg.norm(_d1):.3f} "
+              f"|d2|={np.linalg.norm(_d2):.3f} |t|={np.linalg.norm(_t):.3f} | "
+              f"t·d1={np.dot(_t,_d1):+.3f} t·d2={np.dot(_t,_d2):+.3f} | "
+              f"∠(d1,d2)={_ang(_d1,_d2):.1f}° ∠(n1,n2)={_ang(_n1,_n2):.1f}° "
+              f"|n1|={np.linalg.norm(_n1):.3f} |n2|={np.linalg.norm(_n2):.3f}")
+
         # —— 工件↔机器人相对摆放：piece 在原点(identity)，robot base = 工件系下 inv(T_workpiece_in_base) ——
         pim = _load_plan_init_pose()
         T = self.cur_init_pose.T_workpiece_in_base
@@ -1193,6 +1229,8 @@ class Scene:
 
         scene2 = ScenePose2(cfg, num_envs=cfg.num_envs, device=device,
                             obj_path=self.workpiece_obj, robot_cfg_path=self.cfg.robot_cfg_path)
+        scene2.use_nm = bool(use_nm)      # 朝向 nm 子项开关（False → orientation 仅 tgt+pl）
+        scene2.pl_limit_deg = (None if pl_limit_deg is None else float(pl_limit_deg))  # pl 锥半角覆盖(deg)
 
         want_obs = bool(include_obstacles and self._seam_obstacles(self.cur_init_hand))   # 只避开当前手别的障碍
         # reset：把工件按 piece->base_link 摆进碰撞世界并选关节限位
@@ -1203,7 +1241,35 @@ class Scene:
 
         optimizer = Optimizer(cfg=cfg, scene=scene2, device=device)
         optimizer.resetSeamData(seam_line, seam_tangent, seam_limits)
+        scene2._diag_reset()          # 临时诊断：开启各代价分量通过率累计
         cam_pose, joints, start_pts, end_pts = optimizer.solve()
+
+        # —— 临时诊断：各代价分量通过率(cost≈0 占比) + finish 计数 ——
+        _d = getattr(scene2, "_diag", None)
+        if _d is not None:
+            def _pr(name):
+                p, t = _d[name]
+                return f"{name}={100.0 * p / t:.1f}%({p}/{t})" if t else f"{name}=NA"
+            try:
+                _nf = int(optimizer.finish.int().sum().item())
+                _nb = int(optimizer.finish.numel())
+            except Exception:
+                _nf = _nb = -1
+            print("[scene][diag] 分量通过率(cost≈0): "
+                  + "  ".join(_pr(k) for k in ("collision", "insides", "block", "orientation"))
+                  + f"  | finish={_nf}/{_nb} (需 finish≥num_poses 才有解)")
+            # orientation 三子项：均分(原始) + 加权后(tgt0.3/pl0.2/nm0.5) + 通过率
+            _w = {"tgt": 0.3, "pl": 0.2, "nm": 0.5}
+            def _sub(name):
+                p, t, s = _d[name]
+                if not t:
+                    return f"{name}=NA"
+                mean = s / t
+                return (f"{name}: 均分={mean:.3f} 加权={_w[name] * mean:.3f} "
+                        f"通过={100.0 * p / t:.1f}%")
+            print(f"[scene][diag] orientation 子项(use_nm={use_nm} pl_limit_deg={pl_limit_deg}；加权和="
+                  + ("0.3tgt+0.2pl+0.5nm" if use_nm else "0.3tgt+0.2pl，nm已关") + "): "
+                  + " | ".join(_sub(k) for k in ("tgt", "pl", "nm")))
 
         result = None
         if cam_pose is None:
@@ -1223,7 +1289,8 @@ class Scene:
     
     def compute_pose_and_plan_path(self, hand, include_obstacles: bool = True,
                                    device: str = None, max_stomp_try: int = 1,
-                                   init_pose_idx: int = None, max_init_pose=2):
+                                   init_pose_idx: int = None, max_init_pose=2, use_nm=True,
+                                   pl_limit_deg: float = None):
         """对某手别的每个候选 init pose，求观测位姿序列后【按序边走边看规划】覆盖整条焊缝的 GT。
 
         流程（每个候选 init pose）：
@@ -1257,7 +1324,7 @@ class Scene:
                 continue
 
             self.set_init_pose(hand, init_pose_idx_loop)
-            res = self.compute_goal_pose()
+            res = self.compute_goal_pose(use_nm=use_nm, pl_limit_deg=pl_limit_deg)
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
 

@@ -116,6 +116,10 @@ class ScenePose2:
         self.orientation_cost_weight = cfg.orientation_cost_weight
         # 接受门槛专用的朝向放宽角度(deg)；0=不放宽=gate 与全量朝向代价一致(向后兼容)
         self.orient_gate_relax = float(getattr(cfg, "orient_gate_relax", 0.0))
+        # 朝向是否启用 nm(双面法向 45°±15°)子项；False → orientation 只剩 tgt+pl 两项(compute_goal_pose 传入)
+        self.use_nm = True
+        # pl 锥半角覆盖(deg)；None=用几何 soll_dist(半二面角)，设值(如90)=放宽到 bisector 正半空间(开放/反折焊缝)
+        self.pl_limit_deg = None
         '''
         ┌───────────────┬──────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
         │     变量       │      值      │                                                                             作用                                                                              │
@@ -286,6 +290,14 @@ class ScenePose2:
 
         return self.robot_pose_init
 
+    # ------------------------------------------------------------------ 临时诊断
+    def _diag_reset(self):
+        """临时诊断：累计各代价分量的“通过率”(cost≈0 的样本占比)，供 compute_goal_pose 打印。
+        置 None 关闭累计（默认关闭，零开销）。"""
+        self._diag = {"collision": [0, 0], "insides": [0, 0], "block": [0, 0], "orientation": [0, 0],
+                      # orientation 三子项：[通过数, 总数, 原始分之和]（权重 tgt0.3/pl0.2/nm0.5）
+                      "tgt": [0, 0, 0.0], "pl": [0, 0, 0.0], "nm": [0, 0, 0.0]}
+
     # ------------------------------------------------------------------ 碰撞代价
     def computeCollisionCost(self, cam_poses: torch.Tensor, joints_opt: torch.Tensor):
         """与 ScenePose.computeCollisionCost 完全一致（纯 reshape 外壳）。"""
@@ -295,6 +307,10 @@ class ScenePose2:
         cost, joints = self.getJoints(cam_poses, joints_opt)
         cost = cost.reshape(B, R)
         joints = joints.reshape(B, R, 6)
+        _d = getattr(self, "_diag", None)
+        if _d is not None:      # collision cost∈{0,1}，通过=0（IK 可解且无碰撞）
+            _d["collision"][0] += int((cost == 0).sum().item())
+            _d["collision"][1] += int(cost.numel())
         return cost, joints
 
     def getJoints(self, poses: torch.Tensor, joints_opt: torch.Tensor):
@@ -429,7 +445,8 @@ class ScenePose2:
         block_cost = torch.stack(block_cost, dim=0)
         block_cost /= self.num_steps
 
-        costs, costs_o, costs_gate = self.visionOrientation(seam_line, seam_tangent, seam_limits, cam_poses, block_mask)
+        costs, costs_o, costs_gate, tgt_c, pl_c, nm_c = self.visionOrientation(
+            seam_line, seam_tangent, seam_limits, cam_poses, block_mask)
         orientation_cost = [computeCostSingle(costs[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
         orientation_cost = torch.stack(orientation_cost, dim=0)
         orientation_cost /= self.num_steps
@@ -437,6 +454,23 @@ class ScenePose2:
         orientation_cost_gate = [computeCostSingle(costs_gate[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
         orientation_cost_gate = torch.stack(orientation_cost_gate, dim=0)
         orientation_cost_gate /= self.num_steps
+        _d = getattr(self, "_diag", None)
+        if _d is not None:      # 视觉分量通过=当前窗口 cost≈0（insides:全在FOV内 / block:全不被遮 / orientation:朝向达标）
+            _eps = 1e-6
+            _d["insides"][0] += int((insides_cost <= _eps).sum().item())
+            _d["insides"][1] += int(insides_cost.numel())
+            _d["block"][0] += int((block_cost <= _eps).sum().item())
+            _d["block"][1] += int(block_cost.numel())
+            _d["orientation"][0] += int((orientation_cost <= _eps).sum().item())
+            _d["orientation"][1] += int(orientation_cost.numel())
+            # orientation 三子项：按与 orientation_cost 完全相同的方式聚合(窗口求和 /num_steps)，
+            # 故有 orientation = 0.3*tgt + 0.2*pl + 0.5*nm 仍成立。记通过数 + 原始分之和(供算均值)。
+            for _nm, _raw in (("tgt", tgt_c), ("pl", pl_c), ("nm", nm_c)):
+                _agg = torch.stack([computeCostSingle(_raw[s:e], int(i))
+                                    for s, e, i in zip(start_idx, end_idx, idx_array)], dim=0) / self.num_steps
+                _d[_nm][0] += int((_agg <= _eps).sum().item())
+                _d[_nm][1] += int(_agg.numel())
+                _d[_nm][2] += float(_agg.sum().item())
         if self.original_costs:
             assert isinstance(costs_o, torch.Tensor)
             orientation_cost_o = [computeCostSingle(costs_o[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
@@ -571,6 +605,8 @@ class ScenePose2:
         direction_pl = direction_pl / (torch.norm(direction_pl, dim=-1, keepdim=True) + 1e-8)
         soll_dist = torch.bmm(mid_vector.unsqueeze(-2), seam_limits[:, 1].unsqueeze(-1)).squeeze(-1).squeeze(-1)
         soll_dist = torch.acos(torch.clamp(soll_dist, -1, 1)) / torch.pi * 180
+        if getattr(self, "pl_limit_deg", None) is not None:   # 开放/反折焊缝：把 pl 锥放宽到指定半角(如90°=bisector正半空间)
+            soll_dist = torch.full_like(soll_dist, float(self.pl_limit_deg))
         dist = torch.bmm(direction_pl.unsqueeze(-2), mid_vector.unsqueeze(-1)).squeeze(-1).squeeze(-1)
         dist = torch.acos(torch.clamp(dist, -1, 1)) / torch.pi * 180
         pl_cost = dist - soll_dist
@@ -613,6 +649,11 @@ class ScenePose2:
             nm_cost = nm_cost_0 + nm_cost_1
             nm_cost_gate = nm_cost_0_gate + nm_cost_1_gate
 
+        if not getattr(self, "use_nm", True):   # compute_goal_pose(use_nm=False)：朝向只留 tgt+pl 两项
+            nm_cost = torch.zeros_like(nm_cost)
+            nm_cost_gate = torch.zeros_like(nm_cost_gate)
+            nm_cost_o = torch.zeros_like(nm_cost_o)
+
         orientation_cost = tgt_cost * tgt_cost_scale + pl_cost * pl_cost_scale + nm_cost * nm_cost_scale
         orientation_cost_gate = (tgt_cost_gate * tgt_cost_scale + pl_cost_gate * pl_cost_scale
                                  + nm_cost_gate * nm_cost_scale)
@@ -620,7 +661,9 @@ class ScenePose2:
             orientation_cost_o = tgt_cost_o * tgt_cost_scale + pl_cost_o * pl_cost_scale + nm_cost_o * nm_cost_scale
         else:
             orientation_cost_o = None
-        return orientation_cost, orientation_cost_o, orientation_cost_gate
+        # 临时诊断：把三个子项(未加权原始分)也带出去，供 computeVisionCost_1 聚合打印
+        return (orientation_cost, orientation_cost_o, orientation_cost_gate,
+                tgt_cost, pl_cost, nm_cost)
 
     # ------------------------------------------------------------------ Utils（照搬 ScenePose）
     def generate_transformation(self, xyz, R):

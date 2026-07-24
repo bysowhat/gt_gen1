@@ -203,13 +203,13 @@ observeanything:                        # 观测场景：把机械臂悬空放�
   plan_init_pose_fast:                  # 重写版快速初始位姿求解：不动工件，直接在世界系采样机械臂 base 的 xyz+yaw
     # 采样：以焊缝中点为原点、周边 sample_cube_half_m 立方体内采样机械臂 base 的 xyz + yaw（臂竖直）
     sample_cube_half_m: 2.5             # 立方体“周边 2.5m” = 半边长（采样区 [-2.5,2.5]³，边长 5m）
-    xy_step_m: 0.20                     # xy 采样间隔（米）
+    xy_step_m: 0.10                     # xy 采样间隔（米）
     z_step_m: 0.10                      # z  采样间隔（米）
     yaw_min_deg: 0
     yaw_max_deg: 360
     yaw_step_deg: 20                    # yaw 绕世界竖直轴采样间隔（度，半开区间 [min,max)）
     # 可达/过滤（口径同 plan_init_pose_fast）
-    ee_xy_range_m: [0.4, 1.0]           # 端点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
+    ee_xy_range_m: [0.4, 1.5]           # 端点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
     ee_z_range_m: [-0.1, 0.1]           # 端点在 base_link 系 z [下限,上限]（米）
     vertical_seam_dz_m: 0.15            # 竖/横焊缝判据：焊缝起终点世界系高度差 |p0.z-p1.z| > 此值 ⇒ 竖焊缝（端点只判 xy 径向、不判 z）；否则横焊缝（xyz 全判）
     seam_center_x_min_m: 0.4            # 焊缝中点 base-x 下限（米，取代「工件最近点 base-x」判据）

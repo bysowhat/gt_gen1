@@ -320,6 +320,8 @@ def obstacle_type3_demo_main(args):
         forehand： 初始关节角下焊缝能被看到
         backhand： 初始关节角下焊缝完全看不到
 
+        buffer_m: 0.001->0.1
+
         debug:
             Open3DSceneVisualizer(scene).show_observe_init_poses_debug(n=1, stride=1)
     '''
@@ -328,6 +330,10 @@ def obstacle_type3_demo_main(args):
     force = getattr(args, "force", False)
 
     for seam_id in range(len(scene.seams)):
+
+        seam_id = 319 # 319 779 758
+
+
         out_path = _out_path(scene, "type3", seam_id=seam_id, out_root=out_root)
         if not force and os.path.exists(out_path):
             print(f"[demo] seam {seam_id}：已存在 {out_path}，跳过")
@@ -338,12 +344,11 @@ def obstacle_type3_demo_main(args):
             scene.plan_init_pose_fast(verbose=True)
             # from gt_gen.scene_viz import Open3DSceneVisualizer
             # Open3DSceneVisualizer(scene).show_init_poses()
-            # for hand in ("forehand", "backhand"):
-            for hand in ["backhand"]:
-                if scene.compute_pose_and_plan_path(hand, max_stomp_try=1, max_init_pose=2):
-                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹成功")
+            for hand in ("forehand", "backhand"):
+                if scene.compute_pose_and_plan_path(hand, max_stomp_try=1, max_init_pose=2, use_nm=False, pl_limit_deg=170):
+                    print(f"[demo] seam {seam_id} {hand}：轨迹成功")
                 else:
-                    print(f"[demo] seam {seam_id} {hand}：带障碍轨迹失败")
+                    print(f"[demo] seam {seam_id} {hand}：轨迹失败")
             scene.save(out_path)          # 仅在本缝正常处理完后存盘（异常则不存 → 续跑重试）
         except Exception as e:
             import traceback
@@ -369,7 +374,13 @@ def viz(args):
         fps = 30
     Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.pkl_hand,ds=args.ds,fps=fps)
 
-  
+
+def viz_ob(args):
+    from gt_gen.observe_scene import ObserveAnythingScene
+    from gt_gen.scene_viz import Open3DSceneVisualizer
+
+    scene = ObserveAnythingScene.load(args.pkl)
+    Open3DSceneVisualizer(scene).show_scene_isaacsim()
 
 
 def main():
@@ -409,6 +420,8 @@ def main():
         demo = obstacle_type3_demo_main
     elif args.task == "viz":
         viz(args)
+    elif args.task == "vizob":
+        viz_ob(args)
     else:
         raise ValueError()
         

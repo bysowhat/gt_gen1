@@ -1863,6 +1863,293 @@ class Open3DSceneVisualizer(SceneVisualizer):
             world.step(render=True)
         simulation_app.close()
 
+    def show_observe_scene_isaacsim(self, headless: bool = False, variant: int = 0,
+                                    arm_index: int = None, cam_stride: int = 1,
+                                    draw_cameras: bool = False):
+        """用 **isaacsim** 可视化【观测场景】（ObserveAnythingScene）：base 系画 工件裁剪块 +
+        焊缝红线 + 机械臂 + 沿缝扫掠的一整串观测位姿视锥。
+
+        为何独立于 show_scene_isaacsim：观测场景 goal_poses[seam_id] 里 cam_pose/joints 的第一维
+        是【沿焊缝的 N 个观测点】、第二维才是【K 个朝向变体】，即 (N,K,7)/(N,K,6)；而焊接版
+        show_scene_isaacsim 把第一维当 K 变体、第二维当 B 观测位姿（(K,B,7)），语义相反。直接复用
+        会只画到单点的 K 个朝向而非整条观测轨迹，故这里按 (N,K,·) 口径专门画 N 个视锥沿缝扫掠。
+
+        坐标系恒为 base 系（须已 set_init_pose / load 出 cur_init_pose）：工件裁剪块按
+        T_workpiece_in_base 摆到 base 系（裁剪块 .obj 在世界系，与 seam p*_world 同框，
+        经同一 T 变到 base），机械臂 base 在原点。
+
+        参数：
+          · variant   —— 画第几个朝向变体 K（0..K-1，越界夹取）；N 个观测点都取该变体的 cam_pose。
+          · arm_index —— None：机械臂摆 retract 起始角；给 int：摆到第 arm_index 个观测点的
+                          关节角 joints[arm_index, variant]（无需 IK），并高亮该视锥。
+          · cam_stride—— N 个视锥抽稀步长（默认 1 全画；160 个太密时调大，如 4）。
+          · draw_cameras—— 是否为每个视锥再放真实 UsdGeom.Camera（默认否，避免上百个相机 gizmo 杂乱）。
+        headless=True 时 spawn 后跑几帧即退（自检），打印 VIZ_SCENE_DONE。
+        """
+        import os
+        import sys
+        import numpy as np
+
+        scene = self.scene
+        cur = scene.cur_init_pose
+        if cur is None:
+            print("[viz] show_observe_scene_isaacsim 需要 base 系（cur_init_pose）——"
+                  "请先 set_init_pose 或 load 出含当前候选的场景。")
+            return
+
+        # —— 渲染坐标系变换 T（世界系/裁剪块 mesh 系 → base 系）——
+        T = np.asarray(cur.T_workpiece_in_base, float)
+        wp_pose7 = np.asarray(cur.workpiece_pose7, float)         # 工件在 base 系 pose7（wxyz）
+        R_T, t_T = T[:3, :3], T[:3, 3]
+
+        def tf_pts(P):
+            return np.asarray(P, float) @ R_T.T + t_T             # (…,3) 世界系 → base 系
+
+        # 当前焊缝折线（世界系）→ base 系
+        cur_seam_line = None
+        try:
+            cur_seam_line = np.asarray(scene._seam_frame()[6], float)   # (N,3) 世界系
+        except Exception as _e:
+            print(f"[viz] 取当前焊缝失败（忽略）: {_e}")
+
+        # —— SimulationApp 必须最先启动（在 import omni 之前）——
+        try:
+            import isaacsim  # noqa: F401
+        except ImportError:
+            pass
+        from omni.isaac.kit import SimulationApp
+        simulation_app = SimulationApp({"headless": bool(headless)})
+
+        from omni.isaac.core import World
+        from omni.isaac.core.objects import cuboid as _cuboid
+        from omni.isaac.core.utils.stage import add_reference_to_stage
+        from omni.isaac.core.prims import XFormPrim
+        import omni.usd
+        from pxr import Usd, UsdGeom, UsdPhysics, Gf
+        from scipy.spatial.transform import Rotation as Rsp
+
+        def _compose_pose7(pose7):
+            """把世界系 pose7=[x,y,z,qw,qx,qy,qz] 经 T 变到 base 系，返回 base 系 pose7（wxyz）。"""
+            p = np.asarray(pose7, float)
+            Rc = Rsp.from_quat([p[4], p[5], p[6], p[3]])          # wxyz → xyzw
+            Rw = Rsp.from_matrix(R_T) * Rc
+            pos = R_T @ p[:3] + t_T
+            q = Rw.as_quat()                                      # xyzw
+            return np.r_[pos, q[3], q[0], q[1], q[2]]
+
+        def spawn_obj_mesh(pth, obj_path):
+            import trimesh
+            tm = trimesh.load(obj_path, force="mesh")
+            verts = np.asarray(tm.vertices, float)
+            faces = np.asarray(tm.faces, np.int64).reshape(-1, 3)
+            stage = omni.usd.get_context().get_stage()
+            mesh = UsdGeom.Mesh.Define(stage, pth)
+            mesh.CreatePointsAttr([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in verts])
+            mesh.CreateFaceVertexCountsAttr([3] * len(faces))
+            mesh.CreateFaceVertexIndicesAttr(faces.flatten().tolist())
+            mesh.CreateDisplayColorAttr([Gf.Vec3f(0.72, 0.72, 0.72)])
+
+        def spawn_workpiece(pth, obj_path, pose7):
+            """工件裁剪块摆到 base 系 pose7（关物理当纯视觉）。有同名 .usd 才 reference，否则 trimesh 建 Mesh。"""
+            usd_cands = []
+            if obj_path.endswith("_watertight.obj"):
+                usd_cands.append(obj_path[: -len("_watertight.obj")] + ".usd")
+            usd_cands.append(os.path.splitext(obj_path)[0] + ".usd")
+            usd_obj = next((c for c in usd_cands
+                            if c.endswith(".usd") and os.path.exists(c)), None)
+            if usd_obj is not None:
+                add_reference_to_stage(usd_path=usd_obj, prim_path=pth)
+            else:
+                spawn_obj_mesh(pth, obj_path)
+            XFormPrim(pth).set_world_pose(position=np.asarray(pose7[:3], float).tolist(),
+                                          orientation=np.asarray(pose7[3:7], float).tolist())
+            stg = omni.usd.get_context().get_stage()
+            for pr in Usd.PrimRange(stg.GetPrimAtPath(pth)):
+                if pr.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(pr).GetCollisionEnabledAttr().Set(False)
+                if pr.HasAPI(UsdPhysics.RigidBodyAPI):
+                    UsdPhysics.RigidBodyAPI(pr).GetRigidBodyEnabledAttr().Set(False)
+
+        def spawn_segment(path, name, p0, p1, color, thick=0.01):
+            p0 = np.asarray(p0, float); p1 = np.asarray(p1, float)
+            seg = p1 - p0
+            L = float(np.linalg.norm(seg))
+            if L < 1e-9:
+                return None
+            d_hat = seg / L
+            z = np.array([0.0, 0.0, 1.0])
+            v = np.cross(z, d_hat); s = float(np.linalg.norm(v)); c = float(np.dot(z, d_hat))
+            if s < 1e-9:
+                Rm = np.eye(3) if c > 0 else Rsp.from_euler("x", 180, degrees=True).as_matrix()
+            else:
+                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                Rm = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+            quat = Rsp.from_matrix(Rm).as_quat()          # xyzw
+            _cuboid.VisualCuboid(prim_path=path, name=name, position=(p0 + p1) / 2.0,
+                                 orientation=np.r_[quat[3], quat[:3]], size=1.0,
+                                 scale=np.array([thick, thick, L]), color=np.asarray(color, float))
+            return path
+
+        def spawn_seam_line(prefix, name0, seam_pts, color=(1.0, 0.0, 0.0), thick=0.01):
+            for si in range(len(seam_pts) - 1):
+                spawn_segment(f"{prefix}/seg{si}", f"{name0}_{si}",
+                              seam_pts[si], seam_pts[si + 1], color, thick)
+
+        # —— 观测位姿视锥（scene_pose 同款 FOV 八顶点，+z 朝焊缝）——
+        def _fov_corners():
+            scl, scl_z = 7.0 / 11.0, 9.5 / 11.0
+            near = np.array([[0.135 * scl, -0.20 * 5 / 6 * scl, 0.4],
+                             [-0.135 * scl, -0.20 * 5 / 6 * scl, 0.4],
+                             [-0.135 * scl, 0.20 * 5 / 6 * scl, 0.4],
+                             [0.135 * scl, 0.20 * 5 / 6 * scl, 0.4]], float)
+            dz = 0.140 * scl_z * scl; dy = 0.185 * 5 / 6 * scl_z * scl; z_far = 0.4 * (1 + scl_z)
+            far = np.array([[0.135 * scl + dz, -0.20 * 5 / 6 * scl - dy, z_far],
+                            [-0.135 * scl - dz, -0.20 * 5 / 6 * scl - dy, z_far],
+                            [-0.135 * scl - dz, 0.20 * 5 / 6 * scl + dy, z_far],
+                            [0.135 * scl + dz, 0.20 * 5 / 6 * scl + dy, z_far]], float)
+            return near, far
+
+        def _cam_intrinsics():
+            scl, scl_z = 7.0 / 11.0, 9.5 / 11.0
+            near_z = 0.4
+            far_z = 0.4 * (1 + scl_z)
+            half_w = 0.135 * scl
+            half_h = 0.20 * 5 / 6 * scl
+            return half_w, half_h, near_z, far_z
+
+        def spawn_camera(path, pos_w, R_w, half_w, half_h, near_z, far_z, focal=24.0):
+            stage = omni.usd.get_context().get_stage()
+            cam = UsdGeom.Camera.Define(stage, path)
+            cam.CreateFocalLengthAttr(float(focal))
+            cam.CreateHorizontalApertureAttr(float(2.0 * focal * half_w / near_z))
+            cam.CreateVerticalApertureAttr(float(2.0 * focal * half_h / near_z))
+            cam.CreateClippingRangeAttr(Gf.Vec2f(float(near_z), float(far_z)))
+            Rx180 = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], float)
+            q = Rsp.from_matrix(np.asarray(R_w, float) @ Rx180).as_quat()   # xyzw
+            XFormPrim(path).set_world_pose(position=np.asarray(pos_w, float).tolist(),
+                                           orientation=np.r_[q[3], q[0], q[1], q[2]].tolist())
+
+        def spawn_frustum(prefix, idx, pos_w, R_w, near, far, color):
+            apex = np.asarray(pos_w, float)
+            nw = apex + near @ R_w.T
+            fw = apex + far @ R_w.T
+            for k in range(4):
+                spawn_segment(f"{prefix}/near{k}", f"g{idx}_near{k}", nw[k], nw[(k + 1) % 4], color, 0.004)
+                spawn_segment(f"{prefix}/far{k}", f"g{idx}_far{k}", fw[k], fw[(k + 1) % 4], color, 0.004)
+                spawn_segment(f"{prefix}/side{k}", f"g{idx}_side{k}", nw[k], fw[k], color, 0.004)
+                spawn_segment(f"{prefix}/apex{k}", f"g{idx}_apex{k}", apex, nw[k], color, 0.004)
+
+        # —— 解析 goal_poses：(N 观测点, K 变体, 7/6)；variant 选 K，arm_index 选 N ——
+        res = scene.goal_poses.get(scene.seam_id)
+        cam_pose = joints = None
+        N = K = 0
+        if res is not None:
+            cam_pose = np.asarray(res["cam_pose"], float)         # (N,K,7) 世界系 wxyz
+            joints = np.asarray(res["joints"], float)             # (N,K,DOF)
+            N, K = cam_pose.shape[0], cam_pose.shape[1]
+        vk = max(0, min(int(variant), K - 1)) if K else 0
+
+        # —— 机械臂关节角：arm_index 给定则摆到该观测点，否则 retract ——
+        arm_q = np.asarray(scene.cur_cfg, float)
+        arm_ai = None
+        if arm_index is not None and N:
+            arm_ai = max(0, min(int(arm_index), N - 1))
+            arm_q = np.asarray(joints[arm_ai, vk], float)
+
+        print(f"工件      : {scene.workpiece_obj}")
+        print(f"焊缝/手别 : seam #{scene.seam_id}（{scene.cur_init_hand}），候选#{scene.cur_init_index}")
+        print(f"观测位姿  : " + (f"{N} 观测点 × {K} 变体 → 画变体#{vk}（沿缝抽稀步长 {cam_stride}）"
+                                  if N else "无（未 compute_goal_pose）"))
+        print(f"机械臂    : " + (f"摆到观测点#{arm_ai}(变体#{vk}) 的关节角" if arm_ai is not None
+                                  else "retract 起始角"))
+
+        world = World(stage_units_in_meters=1.0)
+
+        # —— 机械臂：base 在原点 ——
+        robot = None
+        try:
+            from gt_gen import compat as _compat  # noqa: F401  warp shim（须在 curobo 前）
+            from curobo.util_file import load_yaml
+            import curobo as _curobo
+            _curobo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(_curobo.__file__))))
+            for _isaac in (os.path.join(_curobo_root, "examples", "isaac_sim"),
+                           "/home/a/Projects/Github/curobo/examples/isaac_sim"):
+                if os.path.isdir(_isaac) and _isaac not in sys.path:
+                    sys.path.insert(0, _isaac)
+            from helper import add_robot_to_scene
+            robot_cfg = load_yaml(scene.cfg.robot_cfg_path)["robot_cfg"]
+            robot, _ = add_robot_to_scene(robot_cfg, world)
+        except Exception as e:
+            print(f"[viz] 机械臂 spawn 失败（忽略，仅画工件/焊缝/视锥）: {e}")
+            robot = None
+
+        # 地面：置于焊缝最低处下方 1m
+        zmin = None
+        if cur_seam_line is not None:
+            zmin = float(tf_pts(cur_seam_line)[:, 2].min())
+        world.scene.add_default_ground_plane(z_position=(zmin - 1.0) if zmin is not None else -1.0)
+
+        # 工件裁剪块（base 系）
+        spawn_workpiece("/World/workpiece", scene.workpiece_obj, wp_pose7)
+
+        # 当前焊缝红线（base 系）
+        if cur_seam_line is not None:
+            spawn_seam_line("/World/seam/cur", "seam_cur", tf_pts(cur_seam_line), color=[1.0, 0.0, 0.0])
+
+        # 观测视锥沿缝扫掠（青→黄按沿缝序）：cam_pose[n, vk] 世界系 → base 系
+        n_drawn = 0
+        if N:
+            near, far = _fov_corners()
+            half_w, half_h, near_z, far_z = _cam_intrinsics()
+            stride = max(1, int(cam_stride))
+            idxs = list(range(0, N, stride))
+            if arm_ai is not None and arm_ai not in idxs:
+                idxs.append(arm_ai)                               # 保证被摆臂的那个观测点也画视锥
+                idxs.sort()
+            for n in idxs:
+                p7 = _compose_pose7(cam_pose[n, vk])              # 世界系 → base 系
+                R_w = Rsp.from_quat([p7[4], p7[5], p7[6], p7[3]]).as_matrix()
+                t = 0.0 if N <= 1 else n / (N - 1)
+                col = [1.0, 1.0, 1.0] if n == arm_ai else [t, 1.0, 1.0 - t]   # 被摆臂的观测点染白高亮
+                spawn_frustum(f"/World/obs/c{n}", n, p7[:3], R_w, near, far, col)
+                if draw_cameras or n == arm_ai:
+                    spawn_camera(f"/World/obs/cam{n}", p7[:3], R_w, half_w, half_h, near_z, far_z)
+                n_drawn += 1
+        print(f"已画视锥  : {n_drawn} 个" + ("（含被摆臂观测点，染白）" if arm_ai is not None else ""))
+
+        world.reset()
+
+        # 机械臂关节角
+        idx_list = None
+        if robot is not None:
+            try:
+                if hasattr(robot, "initialize"):
+                    robot.initialize()
+                idx_list = [robot.get_dof_index(j) for j in scene.cfg.joint_names]
+                robot.set_joint_positions(np.asarray(arm_q, float), idx_list)
+            except Exception as e:
+                print(f"[viz] 机械臂设关节角失败（忽略）: {e}")
+
+        if headless:
+            for _ in range(3):
+                world.step(render=False)
+            print(f"已 spawn 工件 + 机械臂 + {n_drawn} 个观测视锥。")
+            print("VIZ_SCENE_DONE")
+            simulation_app.close()
+            return
+
+        try:
+            from omni.kit.viewport.menubar.lighting.actions import _set_lighting_mode
+            _set_lighting_mode("Grey Studio")
+        except Exception:
+            pass
+
+        print("播放中（关闭窗口结束）。base 系：工件裁剪块 + 焊缝红线 + 机械臂 + 观测视锥（青→黄沿缝）。")
+        while simulation_app.is_running():
+            world.step(render=True)
+        simulation_app.close()
+
     def show_init_poses_isaacsim(self, hand: str = None, top_n: int = 3, spacing: float = 2.5,
                                  joints: str = "reach", show_seam: bool = True,
                                  show_obstacles: bool = True, headless: bool = False):
