@@ -1117,6 +1117,9 @@ class Scene:
                           device: str = None,
                           use_nm: bool = None,
                           pl_limit_deg: float = None,
+                          use_collision: bool = None,
+                          use_insides: bool = None,
+                          use_block: bool = None,
                           **cfg_overrides) -> list:
         """给定当前 3D 世界（工件 + 障碍）与本焊缝，计算覆盖整条焊缝的【观测位姿序列】(goal pose)。
 
@@ -1172,9 +1175,22 @@ class Scene:
         # pl 锥半角覆盖(deg)；None=几何半二面角(默认)，设值(如90)=放宽到 bisector 正半空间(开放/反折焊缝)
         if pl_limit_deg is None:
             pl_limit_deg = sec.get("pl_limit_deg", None)
+        # 分量开关(方法级)：False → 该代价整段置 0(不参与优化/接受门槛)。默认 True=全开(行为不变)。
+        #   use_collision 关的是 collision 代价(含 IK 可解性+物理碰撞两部分)；use_insides/use_block 关视觉子代价。
+        if use_collision is None:
+            use_collision = bool(sec.get("use_collision", True))
+        if use_insides is None:
+            use_insides = bool(sec.get("use_insides", True))
+        if use_block is None:
+            use_block = bool(sec.get("use_block", True))
         # 障碍膨胀量(米,方法级)：显式 **cfg_overrides > yaml 段 > 0；只作用碰撞世界（见 _inject_obstacles_into_scenepose2）
         obstacle_buffer_m = float(cfg_overrides.get("obstacle_buffer_m",
                                                     sec.get("obstacle_buffer_m", 0.0)) or 0.0)
+        # 碰撞世界统一安全间隙(米,方法级)：显式 **cfg_overrides > yaml 段 > 0。与 obstacle_buffer_m 不同——
+        # 它经 cuRobo collision_activation_distance 对碰撞世界【所有 mesh(工件 + 世界 obj + 障碍)统一生效】，
+        # 机械臂碰撞球离表面 <此距离即判碰，逼 ES 选更远位姿。适用 ObserveAnything(整块世界当 piece 无法 OBB 膨胀)。
+        world_buffer_m = float(cfg_overrides.get("world_buffer_m",
+                                                 sec.get("world_buffer_m", 0.0)) or 0.0)
 
         cgp = _load_compute_goal_poses2()
         Configuration = cgp.Configuration
@@ -1185,7 +1201,7 @@ class Scene:
         cfg = Configuration()
         cfg.usd_path = ""
         cfg.pc_path = ""
-        _method_keys = {"include_obstacles", "horizontal", "device", "obstacle_buffer_m", "use_nm", "pl_limit_deg"}
+        _method_keys = {"include_obstacles", "horizontal", "device", "obstacle_buffer_m", "world_buffer_m", "use_nm", "pl_limit_deg", "use_collision", "use_insides", "use_block"}
         for k, v in {**sec, **cfg_overrides}.items():
             if k in _method_keys:
                 continue
@@ -1228,9 +1244,16 @@ class Scene:
         piece_pose_t = torch.as_tensor(piece_pose7, dtype=torch.float, device=device)
 
         scene2 = ScenePose2(cfg, num_envs=cfg.num_envs, device=device,
-                            obj_path=self.workpiece_obj, robot_cfg_path=self.cfg.robot_cfg_path)
+                            obj_path=self.workpiece_obj, robot_cfg_path=self.cfg.robot_cfg_path,
+                            collision_activation_distance=world_buffer_m)
         scene2.use_nm = bool(use_nm)      # 朝向 nm 子项开关（False → orientation 仅 tgt+pl）
         scene2.pl_limit_deg = (None if pl_limit_deg is None else float(pl_limit_deg))  # pl 锥半角覆盖(deg)
+        scene2.use_collision = bool(use_collision)   # 分量开关：False → collision 代价(含 IK 可解性+物理碰撞)整段置 0
+        scene2.use_insides = bool(use_insides)       # 分量开关：False → 视觉 insides 代价置 0
+        scene2.use_block = bool(use_block)           # 分量开关：False → 视觉 block(遮挡) 代价置 0
+        if world_buffer_m > 0:
+            print(f"[scene] compute_goal_pose：碰撞世界统一安全间隙 world_buffer_m={world_buffer_m:.3f}m"
+                  f"（对工件+世界 obj+障碍全生效，机械臂离表面 <此距离即判碰）")
 
         want_obs = bool(include_obstacles and self._seam_obstacles(self.cur_init_hand))   # 只避开当前手别的障碍
         # reset：把工件按 piece->base_link 摆进碰撞世界并选关节限位
@@ -1238,6 +1261,11 @@ class Scene:
         if want_obs:
             self._inject_obstacles_into_scenepose2(scene2, buffer_m=obstacle_buffer_m,
                                                    hand=self.cur_init_hand)     # 障碍与工件同 pose 一起进碰撞世界（避障；buffer_m>0 膨胀）
+
+        # 诊断句柄：把当前 scene2（含工件+障碍的碰撞世界）与所用 world_buffer_m 存到 self，
+        # 供 compute_pose_and_plan_path 复核每个 goal pose 下碰撞球到世界表面的真实最短净空。
+        self._last_goal_scene2 = scene2
+        self._last_world_buffer_m = world_buffer_m
 
         optimizer = Optimizer(cfg=cfg, scene=scene2, device=device)
         optimizer.resetSeamData(seam_line, seam_tangent, seam_limits)
@@ -1257,7 +1285,8 @@ class Scene:
                 _nf = _nb = -1
             print("[scene][diag] 分量通过率(cost≈0): "
                   + "  ".join(_pr(k) for k in ("collision", "insides", "block", "orientation"))
-                  + f"  | finish={_nf}/{_nb} (需 finish≥num_poses 才有解)")
+                  + f"  | finish={_nf}/{_nb} (需 finish≥num_poses 才有解)"
+                  + f" | 开关 use_collision={use_collision} use_insides={use_insides} use_block={use_block}")
             # orientation 三子项：均分(原始) + 加权后(tgt0.3/pl0.2/nm0.5) + 通过率
             _w = {"tgt": 0.3, "pl": 0.2, "nm": 0.5}
             def _sub(name):
@@ -1288,8 +1317,8 @@ class Scene:
         return result
     
     def compute_pose_and_plan_path(self, hand, include_obstacles: bool = True,
-                                   device: str = None, max_stomp_try: int = 1,
-                                   init_pose_idx: int = None, max_init_pose=2, use_nm=True,
+                                   device: str = None, extra_stomp_try: int = 1,
+                                   init_pose_idx: int = None, max_goal_pose=2, max_init_pose=10, use_nm=True,
                                    pl_limit_deg: float = None):
         """对某手别的每个候选 init pose，求观测位姿序列后【按序边走边看规划】覆盖整条焊缝的 GT。
 
@@ -1318,17 +1347,66 @@ class Scene:
             idx_iter = [int(init_pose_idx)] if n_cands else []
         else:
             idx_iter = range(n_cands)
+
+        success_goal_pose_num = 0
+
         for init_pose_idx_loop in idx_iter:
-            # 未指定时最多尝试 2 个初始位姿；指定 init_pose_idx 时只跑那一个
-            if init_pose_idx is None and init_pose_idx_loop >= max_init_pose:
-                continue
+            if success_goal_pose_num >= max_goal_pose or init_pose_idx_loop >= max_init_pose:
+                break
 
             self.set_init_pose(hand, init_pose_idx_loop)
-            res = self.compute_goal_pose(use_nm=use_nm, pl_limit_deg=pl_limit_deg)
+            res = self.compute_goal_pose(use_nm=use_nm, pl_limit_deg=pl_limit_deg, use_block=True, use_collision=True, use_insides=True)
             if res is None:                              # 该 init pose 无观测位姿解
                 continue
+            
+            success_goal_pose_num += 1
 
-            # self.save('/media/a/新加卷/tempt/4/scene2.pkl')
+            # # —— 诊断：核对每个 goal pose 下【机械臂所有碰撞球到碰撞世界(工件+障碍)表面】的最短净空 ——
+            # # 目的：解释“可视化看着离障碍没有 world_buffer_m 那么远”。ES 用 collision_activation_distance
+            # # =world_buffer_m 过滤，surviving 位姿的 min_clearance 理应 ≥ world_buffer_m。若确实如此，
+            # # 那视觉上的“近”是【相机→焊缝视线距离】(视觉/工作距离需求)，并非碰撞球净空，二者是两回事。
+            # res_debug = None
+            # try:
+            #     _s2 = getattr(self, "_last_goal_scene2", None)
+            #     _wb = float(getattr(self, "_last_world_buffer_m", 0.0) or 0.0)
+            #     if _s2 is not None:
+            #         _jt = res["joints"]                          # (K,B,DOF)
+            #         _B, _dof = _jt.shape[1], _jt.shape[-1]
+            #         _q = _jt[0].reshape(_B, _dof)                # 变体0：B 个 goal pose 的关节角
+            #         _clr = _s2.sphere_world_clearance(_q).detach().cpu().numpy()  # (B,) 每 pose 最短净空(m)
+            #         res_debug = {"min_clearance_m": [float(v) for v in _clr],
+            #                      "world_buffer_m": _wb}
+            #         _flag = "" if (_wb <= 0 or float(_clr.min()) >= _wb - 1e-4) \
+            #                 else "  ⚠ 有 pose 净空 < world_buffer_m！"
+            #         print(f"[scene][debug] init#{init_pose_idx_loop} {hand} 各 goal pose 碰撞球最短净空(m)="
+            #               + ", ".join(f"{v:+.4f}" for v in _clr)
+            #               + f"  | world_buffer_m={_wb:.4f}{_flag}")
+            # except Exception as _e:
+            #     import traceback
+            #     print(f"[scene][debug] res_debug 计算失败: {_e}")
+            #     traceback.print_exc()
+
+            # # self.save('/media/a/新加卷/tempt/4/scene2.pkl')
+
+            # # —— 可视化：debug compute_goal_pose 的 collision cost —— 这批 goal pose 的“碰撞”来自哪里
+            # # 参考 stomp_planner/stomp_planning_api.py 的 _viz_collision：画整臂碰撞球 + 工件 mesh，
+            # # 把触发/逼近 collision 各来源的球用显眼颜色标出，直指“collision cost 由哪一项贡献”：
+            # #   红=arm-vs-工件(球面净空≤world_buffer_m，cuRobo 用此 buffer 把臂推离工件)；
+            # #   紫/青=自碰撞对(低link紫/高link青)；橙=Link1/2/3 侵入相机视锥(field 锥)。
+            # # 逐 goal pose 弹一个 open3d 窗口（关掉当前窗口看下一个）。注释此行即关闭可视化。
+            # try:
+            #     _s2v = getattr(self, "_last_goal_scene2", None)
+            #     if _s2v is not None:
+            #         _viz_goal_pose_inflation(
+            #             _s2v,
+            #             res["cam_pose"][0],     # (B,7) variant0 的 B 个相机 goal pose（piece 系）
+            #             res["joints"][0],       # (B,6) 对应关节角
+            #             world_buffer_m=float(getattr(self, "_last_world_buffer_m", 0.0) or 0.0),
+            #         )
+            # except Exception as _e:
+            #     import traceback
+            #     print(f"[scene][viz] goal pose collision 可视化失败: {_e}")
+            #     traceback.print_exc()
 
             jt = res["joints"]
             joints = jt.detach().cpu().numpy() if hasattr(jt, "detach") else np.asarray(jt)
@@ -1353,7 +1431,7 @@ class Scene:
                     entry = self.plan_explore_path(
                         goal_index=pose_idx, variant=variant,
                         cur_joints=start, ctx=ctx, vm=vm,
-                        max_stomp_try=max_stomp_try)   # 共享 vm ＝ 继承前一个 pose 的观测
+                        extra_stomp_try=extra_stomp_try)   # 共享 vm ＝ 继承前一个 pose 的观测
                     seq_entries.append(entry)
                     if entry["status"] != "reached":
                         all_reached = False
@@ -1384,7 +1462,7 @@ class Scene:
                           device: str = None,
                           ctx: Ctx = None,
                           vm=None,
-                          max_stomp_try=1) -> dict:
+                          extra_stomp_try=1) -> dict:
         """从【当前机械臂关节角】边走边看规划一条到 goal 关节角目标的探索轨迹（GT）。
 
         忠实复用 scripts/place_obstacles_to_gt2.py 的主体（gt_gen.main_loop.generate_gt，一行不改），
@@ -1468,7 +1546,7 @@ class Scene:
         _t0 = time.perf_counter()
         GT, status, info = generate_gt(h_truth, h_expl, vm, truth_scene, None,
                                        camera_model=cam, world_plan=world,
-                                       goal_cfg=goal_joints, start_cfg=start,max_stomp_try=max_stomp_try)
+                                       goal_cfg=goal_joints, start_cfg=start,extra_stomp_try=extra_stomp_try)
         if _PROFILEMAIN:
             print(f"[PROFILEMAIN][generate_gt] pose#{gi} 主循环={time.perf_counter() - _t0:.3f}s "
                   f"status={status} rounds={info.get('rounds')}")
@@ -1987,3 +2065,212 @@ class Scene:
         print(f"[scene] add_obstacle_type1：焊缝 {self.seam_id} link {link} 扫掠空间放置 "
               f"{otype_used}（{len(prims_wp)} 原语），已挂 self.obstacles")
         return spec
+
+
+# ======================================================================
+# goal pose collision cost 来源可视化（debug compute_goal_pose 4 个 cost 里的 collision 项）
+# ----------------------------------------------------------------------
+# 设计参考 stomp_planner/stomp_planning_api.py 的 _viz_collision：画整臂碰撞球 + 工件 mesh，
+# 把触发/逼近 collision 的球用显眼颜色标出。collision cost 的三个空间来源在这里拆开显示：
+#   ① arm-vs-工件：球面到工件表面净空 ≤ world_buffer_m 的球（cuRobo 用此 buffer 把臂推离工件）→ 红；
+#   ② 自碰撞：跨 link 且球面净空 ≤ self_margin 的球对（低 link 紫 / 高 link 青）；
+#   ③ field 锥：Link1/2/3 的碰撞球侵入相机视锥（遮挡自己视野）→ 橙，并画出视锥线框。
+# （collision cost 的第 4 个来源 IK 越界/无解 是非空间量，无法在 3D 里画，只在文末打印是否满足。）
+_VIZ_C_WORLD = [0.90, 0.10, 0.10]     # 红：arm-vs-工件（world_buffer_m 判碰源）
+_VIZ_C_SELF_LO = [0.65, 0.15, 0.90]   # 紫：自碰对中低 link 号球
+_VIZ_C_SELF_HI = [0.10, 0.75, 0.85]   # 青：自碰对中高 link 号球
+_VIZ_C_CONE = [1.00, 0.55, 0.00]      # 橙：侵入相机视锥的 Link1/2/3 球
+_VIZ_C_GRAY = [0.62, 0.62, 0.62]      # 灰：未触发任何来源的球
+_VIZ_C_MESH = [0.72, 0.72, 0.72]      # 浅灰：工件 mesh
+
+
+def _quat_to_R_np(q):
+    """四元数 [qw,qx,qy,qz] -> 3x3 旋转矩阵（与 opt_math_pose 同约定，纯 numpy）。"""
+    w, x, y, z = (float(v) for v in q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+    ], float)
+
+
+def _viz_adjacent_link_pairs(scene2):
+    """从 cuRobo link_chain_map 取「父子相邻」link 对 set{frozenset({a,b})}（设计贴合，忽略自碰）。
+    与 stomp_planning_api._adjacent_link_pairs 同逻辑。取不到返回空集。"""
+    lcm = getattr(scene2.rw.kinematics.kinematics_config, "link_chain_map", None)
+    if lcm is None:
+        return set()
+    a = lcm.detach().cpu().numpy().astype(int)
+    n = a.shape[0]
+    depth = a.sum(axis=1) - 1
+    adj = set()
+    for i in range(n):
+        for j in range(n):
+            if i != j and a[i, j] == 1 and depth[i] - depth[j] == 1:
+                adj.add(frozenset((i, j)))
+    return adj
+
+
+def _viz_goal_pose_inflation(scene2, cam_poses, joints, world_buffer_m=0.0,
+                             self_margin=0.005, cone_margin=0.0):
+    """逐 goal pose 弹 open3d 窗口，标出该观测位姿的 collision cost 来源（见本节顶部注释）。
+
+    参数
+      scene2        : ScenePose2（须已 reset，self.rw 世界=工件，含 robot_base_inv_pose / _field_sphere_mask）。
+      cam_poses     : (B,7) variant 的 B 个相机 goal pose，piece 系 [x,y,z, qw,qx,qy,qz]。
+      joints        : (B,6) 上述 pose 对应关节角（base_link/靠上底座定义的 6 关节）。
+      world_buffer_m: arm-vs-工件判红门槛（=ES 的 collision_activation_distance）。
+      self_margin   : 自碰逼近对判定球面净空门槛（默认 5mm，比 cfg 的 1mm 大以显出“最近的对”）。
+      cone_margin   : 视锥半径外扩量（默认 0=严格按锥面）。
+    """
+    import torch
+    try:
+        import open3d as o3d
+    except Exception as e:                                      # noqa: BLE001
+        print(f"[scene][viz] open3d 不可用，跳过：{e}")
+        return
+    try:
+        import trimesh
+        _has_tm = True
+    except Exception as e:                                      # noqa: BLE001
+        print(f"[scene][viz] trimesh 不可用，arm-vs-工件净空无法逐球算(红不高亮)：{e}")
+        _has_tm = False
+
+    # field 锥几何常量（取自 scene_pose2；取不到用默认值兜底）
+    try:
+        from scene_pose2 import _FIELD_HEIGHT, _FIELD_RADIUS   # noqa: E402
+    except Exception:                                          # noqa: BLE001
+        _FIELD_HEIGHT, _FIELD_RADIUS = 0.4, 0.335 / 2
+
+    cam = np.asarray(cam_poses.detach().cpu().numpy() if hasattr(cam_poses, "detach")
+                     else cam_poses, float)                    # (B,7)
+    jnt = np.asarray(joints.detach().cpu().numpy() if hasattr(joints, "detach")
+                     else joints, float)                       # (B,6)
+    B = int(cam.shape[0])
+
+    # piece->base_link：工件 mesh 与所有相机量统一换到 base_link 系（与碰撞球 FK 同系）
+    rinv = scene2.robot_base_inv_pose[0].detach().cpu().numpy()  # [x,y,z,qw,qx,qy,qz]
+    R_rinv, p_rinv = _quat_to_R_np(rinv[3:7]), rinv[:3]
+    verts_w = np.asarray(scene2._verts_list, float) @ R_rinv.T + p_rinv
+    faces = np.asarray(scene2._faces_list, np.int32)
+    tm_world = trimesh.Trimesh(vertices=verts_w, faces=faces, process=False) if (_has_tm and verts_w.size) else None
+
+    link_ignore = _viz_adjacent_link_pairs(scene2)
+    full_field_mask = scene2._field_sphere_mask.detach().cpu().numpy().astype(bool)  # 全量球中 Link1/2/3 掩码
+    idx2name = {int(v): str(k) for k, v in
+                dict(scene2.rw.kinematics.kinematics_config.link_name_to_idx_map).items()}
+
+    print(f"[scene][viz] 共 {B} 个 goal pose，逐个弹窗（关闭当前窗口看下一个）。"
+          f"配色：红=arm-vs-工件(≤{world_buffer_m*1000:.0f}mm)  紫/青=自碰对  橙=侵入视锥  灰=无")
+
+    for bi in range(B):
+        q = jnt[bi]
+        qt = torch.as_tensor([[float(v) for v in q]], device=scene2.device, dtype=torch.float32)
+        kin = scene2.rw.get_kinematics(qt)
+        sph_full = kin.link_spheres_tensor.detach().cpu().numpy()[0]                   # (S_full,4)
+        li_full = scene2.rw.kinematics.kinematics_config.link_sphere_idx_map.detach().cpu().numpy()
+        keep = sph_full[:, 3] > 1e-6
+        sph = sph_full[keep]
+        li = li_full[keep].astype(int)
+        field_mask = full_field_mask[keep]
+        S = int(sph.shape[0])
+        c, r = sph[:, :3], sph[:, 3]
+
+        # ① arm-vs-工件：球面到工件表面净空 ≤ world_buffer_m → 红
+        world_hit = np.zeros(S, bool)
+        min_clear = np.inf
+        if tm_world is not None and S:
+            _, dist, _ = trimesh.proximity.closest_point(tm_world, c)   # (S,) 球心->表面
+            clearance = dist - r                                         # 球面净空
+            min_clear = float(clearance.min())
+            world_hit = clearance <= max(float(world_buffer_m), 1e-6)
+
+        # ② 自碰撞：跨 link 且球面净空 ≤ self_margin 的球对（低 link 紫 / 高 link 青）
+        self_lo, self_hi, self_pairs = set(), set(), []
+        for i in range(S):
+            for j in range(i + 1, S):
+                if li[i] == li[j]:
+                    continue
+                if frozenset((int(li[i]), int(li[j]))) in link_ignore:
+                    continue
+                d = float(np.linalg.norm(c[i] - c[j]))
+                gap = float(r[i] + r[j] + float(self_margin) - d)
+                if gap > 0.0:
+                    lo, hi = (i, j) if li[i] <= li[j] else (j, i)
+                    self_lo.add(lo)
+                    self_hi.add(hi)
+                    self_pairs.append((lo, hi, gap))
+        self_pairs.sort(key=lambda p: p[2], reverse=True)
+
+        # ③ field 锥：Link1/2/3 球侵入相机视锥 → 橙
+        apex_b = R_rinv @ cam[bi, :3] + p_rinv
+        axis_b = (R_rinv @ _quat_to_R_np(cam[bi, 3:7]))[:, 2]
+        axis_b = axis_b / (np.linalg.norm(axis_b) + 1e-9)
+        rel = c - apex_b
+        t = rel @ axis_b
+        radial = np.linalg.norm(rel - t[:, None] * axis_b[None, :], axis=1)
+        cone_r = np.clip(t, 0.0, None) / _FIELD_HEIGHT * _FIELD_RADIUS
+        inside = (t >= -r) & (t <= _FIELD_HEIGHT + r) & (radial <= cone_r + r + float(cone_margin)) & (r > 1e-6)
+        cone_hit = inside & field_mask
+
+        # 配色（优先级 世界 > 视锥 > 自碰；便于一眼看主导来源，多来源在打印里给全量计数）
+        colors = [list(_VIZ_C_GRAY) for _ in range(S)]
+        for si in range(S):
+            if world_hit[si]:
+                colors[si] = list(_VIZ_C_WORLD)
+            elif cone_hit[si]:
+                colors[si] = list(_VIZ_C_CONE)
+            elif si in self_lo:
+                colors[si] = list(_VIZ_C_SELF_LO)
+            elif si in self_hi:
+                colors[si] = list(_VIZ_C_SELF_HI)
+
+        # 打印诊断
+        _clr_txt = f"{min_clear*1000:+.1f}mm" if np.isfinite(min_clear) else "NA(无trimesh)"
+        msg = (f"[scene][viz] goal pose {bi + 1}/{B}: collision 来源球数 —"
+               f" arm-vs-工件(红)={int(world_hit.sum())}"
+               f" | 自碰对(紫/青)={len(self_pairs)}"
+               f" | 视锥(橙)={int(cone_hit.sum())}"
+               f"   [工件最短净空={_clr_txt}, world_buffer_m={world_buffer_m*1000:.0f}mm]")
+        if self_pairs:
+            top = "; ".join(
+                f"{idx2name.get(int(li[i]), li[i])}#{i}<->{idx2name.get(int(li[j]), li[j])}#{j}(gap={g*1000:.1f}mm)"
+                for i, j, g in self_pairs[:5])
+            msg += f"\n            自碰逼近对[{len(self_pairs)}] top5: {top}"
+        print(msg)
+
+        # 组装 open3d 几何
+        geoms = [o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.3)]   # base_link 系
+        if verts_w.size:
+            om = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts_w),
+                                           o3d.utility.Vector3iVector(faces))
+            om.compute_vertex_normals()
+            om.paint_uniform_color(_VIZ_C_MESH)
+            geoms.append(om)
+        for si in range(S):
+            cx, cy, cz, rr = (float(v) for v in sph[si])
+            ball = o3d.geometry.TriangleMesh.create_sphere(radius=max(rr, 1e-3), resolution=8)
+            ball.translate((cx, cy, cz))
+            ls = o3d.geometry.LineSet.create_from_triangle_mesh(ball)
+            ls.paint_uniform_color(colors[si])
+            geoms.append(ls)
+
+        # 相机视锥线框（橙）：锥顶=镜头 apex，锥底在 axis 方向 _FIELD_HEIGHT 处、半径 _FIELD_RADIUS
+        tmp = np.array([1.0, 0.0, 0.0]) if abs(axis_b[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(axis_b, tmp)
+        u = u / (np.linalg.norm(u) + 1e-9)
+        v = np.cross(axis_b, u)
+        n_seg = 24
+        base_c = apex_b + axis_b * _FIELD_HEIGHT
+        ring = [base_c + _FIELD_RADIUS * (np.cos(a) * u + np.sin(a) * v)
+                for a in np.linspace(0.0, 2.0 * np.pi, n_seg, endpoint=False)]
+        pts = [apex_b] + ring
+        lines = [[0, 1 + k] for k in range(n_seg)] + [[1 + k, 1 + ((k + 1) % n_seg)] for k in range(n_seg)]
+        cone = o3d.geometry.LineSet(o3d.utility.Vector3dVector(np.asarray(pts, float)),
+                                    o3d.utility.Vector2iVector(np.asarray(lines, np.int32)))
+        cone.paint_uniform_color(_VIZ_C_CONE)
+        geoms.append(cone)
+
+        title = (f"goal pose {bi + 1}/{B}  红=arm-vs-工件({int(world_hit.sum())})  "
+                 f"紫/青=自碰({len(self_pairs)})  橙=视锥({int(cone_hit.sum())})")
+        o3d.visualization.draw_geometries(geoms, window_name=title)

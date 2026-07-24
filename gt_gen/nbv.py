@@ -338,7 +338,7 @@ def best_next_view_using_oracle(handle, cur_cfg, voxmap, truth_scene, goal_pose,
     if B.shape[0] == 0:
         '''
             如果B是0,说明之前的plan失败了：
-            之前的plan是在voxelmap上的plan，但是B又是0,说明oxelmap本身的voxel size太大，导致无法规划成功，
+            之前的plan是在voxelmap上的plan，但是B又是0,说明voxelmap本身的voxel size太大，导致无法规划成功，
             比如voxel map下无法规划成功（有碰撞），但是真实场景中没有碰撞
             这样怎么observe也没用，所以这种情况直接判定失败。
         '''

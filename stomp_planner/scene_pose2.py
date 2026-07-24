@@ -90,10 +90,14 @@ def _raycast_kernel():
 
 class ScenePose2:
     def __init__(self, cfg: Configuration, num_envs=None, device="cuda",
-                 obj_path: str = "", robot_cfg_path: str = "", retract=None):
+                 obj_path: str = "", robot_cfg_path: str = "", retract=None,
+                 collision_activation_distance: float = 0.0):
         self.cfg = cfg
         self.device = device
         self.num_envs = cfg.num_envs if num_envs is None else num_envs
+        # cuRobo 碰撞检查器安全间隙(米)：机械臂碰撞球离碰撞世界任意 mesh(工件+障碍)表面 <此距离即判“碰”，
+        # 逼 ES 位姿优化器选出离工件/世界更远的观测位姿。0=只判真穿透(贴面也 0 代价)。见 compute_goal_pose.world_buffer_m。
+        self.collision_activation_distance = float(collision_activation_distance)
 
         # —— 与 ScenePose.__init__ 一致的纯 torch 配置 ——
         self.num_steps = cfg.num_steps
@@ -120,6 +124,12 @@ class ScenePose2:
         self.use_nm = True
         # pl 锥半角覆盖(deg)；None=用几何 soll_dist(半二面角)，设值(如90)=放宽到 bisector 正半空间(开放/反折焊缝)
         self.pl_limit_deg = None
+        # 分量开关(compute_goal_pose 传入)：False → 该分量代价整段置 0，等价于“不使用此代价”。
+        #   use_collision：collision 代价(注意其含 IK 可解性+物理碰撞两部分，一起关)；
+        #   use_insides / use_block：视觉的 insides / block 子代价(orientation 不在此开关内)。
+        self.use_collision = True
+        self.use_insides = True
+        self.use_block = True
         '''
         ┌───────────────┬──────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
         │     变量       │      值      │                                                                             作用                                                                              │
@@ -233,7 +243,7 @@ class ScenePose2:
         rw_cfg = RobotWorldConfig.load_from_config(
             self._rd, WorldConfig(mesh=[m0]), tensor_args=ta,
             collision_checker_type=CollisionCheckerType.MESH,
-            collision_activation_distance=0.0, n_meshes=6,#n_meshes 这个碰撞世界最多放几个 mesh"
+            collision_activation_distance=self.collision_activation_distance, n_meshes=6,#n_meshes 这个碰撞世界最多放几个 mesh"
         )
         self.rw = RobotWorld(rw_cfg)
         self._WorldConfig = WorldConfig
@@ -307,6 +317,8 @@ class ScenePose2:
         cost, joints = self.getJoints(cam_poses, joints_opt)
         cost = cost.reshape(B, R)
         joints = joints.reshape(B, R, 6)
+        if not self.use_collision:      # 关掉 collision 代价(含 IK 可解性+物理碰撞)：置 0，joints 仍保留供下游
+            cost = torch.zeros_like(cost)
         _d = getattr(self, "_diag", None)
         if _d is not None:      # collision cost∈{0,1}，通过=0（IK 可解且无碰撞）
             _d["collision"][0] += int((cost == 0).sum().item())
@@ -394,8 +406,12 @@ class ScenePose2:
         kin = self.rw.get_kinematics(q)
         spheres = kin.link_spheres_tensor                                 # (N, S, 4)
 
-        # arm-vs-工件 + 自碰撞（cuRobo，constraint：穿透才 >0）
-        d_world = self.rw.get_collision_constraint(spheres.unsqueeze(1)).squeeze(1)   # (N,)
+        # arm-vs-工件 + 自碰撞（cuRobo）
+        # ⚠ 必须用 get_collision_distance(走 collision_cost)，它的 activation_distance =
+        #   collision_activation_distance(=world_buffer_m)；而 get_collision_constraint 走
+        #   collision_constraint，其 activation 被 cuRobo 写死为 0.0(只判真穿透)，world_buffer_m
+        #   对它无效。故这里改用 distance：球面到表面净空 < world_buffer_m 即 cost>0 判“碰”。
+        d_world = self.rw.get_collision_distance(spheres.unsqueeze(1)).squeeze(1)     # (N,)
         d_self = self.rw.get_self_collision(spheres.unsqueeze(1)).squeeze(1)          # (N,)
         hit = (d_world > 1e-6) | (d_self > 1e-6)
         hit = hit.to(self.device)
@@ -413,6 +429,38 @@ class ScenePose2:
         cone_hit = inside.any(dim=-1)                                     # (N,)
 
         return (hit | cone_hit).int()
+
+    # ------------------------------------------------------------------ 诊断：碰撞球净空
+    def sphere_world_clearance(self, joints: torch.Tensor):
+        """诊断用：对一批关节角，返回每个构型下【所有碰撞球到碰撞世界(工件+障碍)表面】的最短净空(米)。
+
+        与 _collided_batch 用的是同一套 self.rw 世界（含 reset 的工件 + _inject 的障碍）与同一套整臂
+        碰撞球(全 11 个 link 的 link_spheres_tensor)。返回值语义：
+          · >0：最近的那个碰撞球【球面】离世界表面还有这么远（净空）；
+          · ≤0：已贴面/穿透（负值≈穿透深度）。
+        这正是 ES 过滤所比较的量——collision_activation_distance(=world_buffer_m) 判 “碰” 的门槛是
+        “球面到表面 < 此距离”，故 surviving 的 goal pose 理应满足 最短净空 ≥ world_buffer_m。
+
+        参数 joints: (N, DOF)。返回 (N,) tensor（在 self.device）。
+        """
+        from curobo.geom.sdf.world import CollisionQueryBuffer
+        q = joints.to(self._ta.device).contiguous()
+        if q.dim() == 1:
+            q = q.unsqueeze(0)
+        kin = self.rw.get_kinematics(q)
+        spheres = kin.link_spheres_tensor                        # (N, S, 4) 基座系, [x,y,z,r]
+        x = spheres.unsqueeze(1).contiguous()                    # (N, 1, S, 4)
+        wm = self.rw.world_model
+        buf = CollisionQueryBuffer.initialize_from_shape(x.shape, self._ta, wm.collision_types)
+        weight = self._ta.to_device([1.0])
+        act = self._ta.to_device([0.0])
+        # compute_esdf：返回球【心】到最近表面的 signed 距离（>0 在物体内, <0 在物体外），不含半径。
+        esdf = wm.get_sphere_distance(x, buf, weight, act,
+                                      sum_collisions=False, compute_esdf=True)
+        esdf = esdf.reshape(spheres.shape[0], spheres.shape[1])  # (N, S)
+        radii = spheres[..., 3]                                  # (N, S)
+        clearance = (-esdf) - radii                              # 球面到表面净空(>0安全, ≤0贴/穿)
+        return clearance.min(dim=1).values.to(self.device)       # (N,) 每构型最短净空
 
     # ------------------------------------------------------------------ 视觉代价（_1 路径）
     def computeVisionCost_1(self, seam_line, seam_tangent, seam_limits, cam_poses, idx, block_mask,
@@ -439,11 +487,17 @@ class ScenePose2:
             insides_cost_o = [computeCostSingle(costs_o[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
             insides_cost_o = torch.stack(insides_cost_o, dim=0)
             insides_cost_o /= self.num_steps
+        if not self.use_insides:                                    # 关掉 insides 代价：置 0
+            insides_cost = torch.zeros_like(insides_cost)
+            if self.original_costs:
+                insides_cost_o = torch.zeros_like(insides_cost_o)
 
         unblock, costs = self.visionBlock(seam_line, cam_poses[:, :3])
         block_cost = [computeCostSingle(costs[s:e], int(i)) for s, e, i in zip(start_idx, end_idx, idx_array)]
         block_cost = torch.stack(block_cost, dim=0)
         block_cost /= self.num_steps
+        if not self.use_block:                                      # 关掉 block(遮挡) 代价：置 0
+            block_cost = torch.zeros_like(block_cost)
 
         costs, costs_o, costs_gate, tgt_c, pl_c, nm_c = self.visionOrientation(
             seam_line, seam_tangent, seam_limits, cam_poses, block_mask)

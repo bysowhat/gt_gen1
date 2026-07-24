@@ -365,9 +365,9 @@ class Config:
 
     @property
     def obs_fast_yaw_deg(self) -> list:
-        """base 绕世界竖直轴 yaw 采样 [min,max,step]（度，半开区间 [min,max)）。见 observeanything.plan_init_pose_fast.yaw_*_deg。"""
-        return [float(self._obs_fast.get("yaw_min_deg", 0.0)),
-                float(self._obs_fast.get("yaw_max_deg", 360.0)),
+        """base yaw 采样 [min,max,step]（度，半开区间 [min,max)）——相对【base +x 正对焊缝】基准朝向的偏差角（范围 -180~180），非世界系绝对 yaw。见 observeanything.plan_init_pose_fast.yaw_*_deg。"""
+        return [float(self._obs_fast.get("yaw_min_deg", -90.0)),
+                float(self._obs_fast.get("yaw_max_deg", 90.0)),
                 float(self._obs_fast.get("yaw_step_deg", 20.0))]
 
     @property

@@ -88,7 +88,7 @@ goal:                                   # 末端目标相对焊缝的摆放（St
                                         # GT 轨迹终点即停在此 standoff 位姿（不再向表面靠近）。
 
 compute_goal_pose:                      # 观测位姿(goal pose) ES 优化器参数（Scene.compute_goal_pose，包 compute_goal_poses2）
-  # 除下列【方法级】4 键外，本段其余键名须与 stomp_planner/config_pose.ConfigurationPose 的属性【同名】，
+  # 除下列【方法级】键外，本段其余键名须与 stomp_planner/config_pose.ConfigurationPose 的属性【同名】，
   # Scene.compute_goal_pose 会逐个 setattr 到 ConfigurationPose（未列出的沿用其默认）；num_randoms_all /
   # num_envs 由 Scene 依 num_batches/num_randoms_* 自动重算，勿在此填。显式传参给方法可覆盖本段。
   include_obstacles: true               # 【方法级】是否把已放障碍并入 ScenePose2 碰撞世界（避障；open_cylinder 纯视觉跳过）
@@ -96,8 +96,18 @@ compute_goal_pose:                      # 观测位姿(goal pose) ES 优化器�
                                         # 机械臂避障留安全间隙(同 STOMP 绕行 obstacle_buffer_m 语义)。只影响碰撞世界；
                                         # 遮挡视线(visionBlock)仍用真实尺寸避免过度保守；工件不膨胀。0=不膨胀。
                                         # !!!!!!!建议是roi.voxel_size_m的3倍！！！！！！！！！！！！！
+  world_buffer_m: 0.18                   # 【方法级】碰撞世界统一安全间隙(米)：经 cuRobo collision_activation_distance
+                                        # 对碰撞世界【所有 mesh(工件 + USD 世界裁剪 obj + 注入障碍)统一生效】——机械臂碰撞球
+                                        # 离表面 <此距离即判“碰”，逼 ES 选出离工件/世界更远的观测位姿。与 obstacle_buffer_m
+                                        # 区别：后者只 OBB 膨胀“额外添加”的障碍(type1/2/3)，对 ObserveAnything 整块世界当 piece
+                                        # 的情形无效；本键正是为那种情形。0=只判真穿透(旧行为)。⚠对工件也生效，过大会让贴近
+                                        # 焊缝的观测位姿全判碰而无解，建议 0.03~0.08 起调。
   horizontal: 2                         # 【方法级】关节限位选择：0=水平 / 1=垂直 / 其它=all（全范围，最宽松）
   device: cuda                          # 【方法级】计算设备
+  # —— 【方法级】分量开关：false → 该代价整段置 0，不参与优化/接受门槛(用于诊断哪个分量卡住 finish) ——
+  use_collision: true                   # collision 代价(⚠含 IK 可解性+物理碰撞两部分，一起关；关后 joints 仍算出交下游)
+  use_insides: true                     # 视觉 insides 代价(焊缝点是否落在相机 FOV 六面体内)
+  use_block: true                       # 视觉 block 代价(焊缝点视线是否被工件遮挡)
   # —— 进化策略采样规模（⚠ 调太小会触发优化器内部假设崩溃 reshape[0,6]，见 compute_goal_poses2；默认 8×100）——
   num_batches: 8                        # 并行批数
   num_randoms_new: 100                  # 每批新采样数（num_envs = num_batches*(num_randoms_new+num_randoms_old)）
@@ -126,7 +136,7 @@ init_free:                              # 初始引导 FREE 空间（见 docs/in
   box_max_m: [2.5, 1.3, 1.7]            # 表示机械臂工作空间，立方体法：AABB 盒上界角点（米）。中心落在 base_link，整块置 FREE
 
   method_for_init: "box"           # 机械臂初始 FREE 空间方案：cylinder=圆柱(cyl_*) | box=立方体(box_*_for_init)
-  box_min_m_for_init: [-1.4, -1.0, -0.5]         # 表示机械臂初始free空间，立方体法：AABB 盒下界角点（米，base_link 系，轴对齐）
+  box_min_m_for_init: [-1.4, -1.0, -0.3]         # 表示机械臂初始free空间，立方体法：AABB 盒下界角点（米，base_link 系，轴对齐）
   box_max_m_for_init: [0.2, 1.0, 2.0]            # 表示机械臂初始free空间，立方体法：AABB 盒上界角点（米）。中心落在 base_link，整块置 FREE
 
 
@@ -203,14 +213,16 @@ observeanything:                        # 观测场景：把机械臂悬空放�
   plan_init_pose_fast:                  # 重写版快速初始位姿求解：不动工件，直接在世界系采样机械臂 base 的 xyz+yaw
     # 采样：以焊缝中点为原点、周边 sample_cube_half_m 立方体内采样机械臂 base 的 xyz + yaw（臂竖直）
     sample_cube_half_m: 2.5             # 立方体“周边 2.5m” = 半边长（采样区 [-2.5,2.5]³，边长 5m）
-    xy_step_m: 0.10                     # xy 采样间隔（米）
-    z_step_m: 0.10                      # z  采样间隔（米）
-    yaw_min_deg: 0
-    yaw_max_deg: 360
-    yaw_step_deg: 20                    # yaw 绕世界竖直轴采样间隔（度，半开区间 [min,max)）
+    xy_step_m: 0.20                     # xy 采样间隔（米）
+    z_step_m: 0.2                      # z  采样间隔（米）
+    # yaw 不是世界系绝对 yaw，而是相对【机械臂 base +x 正对焊缝】基准朝向的偏差角（度，范围 -180~180，半开区间 [min,max)）
+    # 基准朝向：bisector 在 base 系 y=0 且 x<0（base +x 指向焊缝）；世界 yaw = atan2(bis.y,bis.x)+180° + 本偏差
+    yaw_min_deg: -1
+    yaw_max_deg: 1
+    yaw_step_deg: 20                    # yaw 偏差采样间隔（度）
     # 可达/过滤（口径同 plan_init_pose_fast）
-    ee_xy_range_m: [0.4, 1.5]           # 端点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
-    ee_z_range_m: [-0.1, 0.1]           # 端点在 base_link 系 z [下限,上限]（米）
+    ee_xy_range_m: [0.4, 1.6]           # 端点在 base_link 系 xy 平面到原点【径向距离】[下限,上限]（米）
+    ee_z_range_m: [-0.2, 0.2]           # 端点在 base_link 系 z [下限,上限]（米）
     vertical_seam_dz_m: 0.15            # 竖/横焊缝判据：焊缝起终点世界系高度差 |p0.z-p1.z| > 此值 ⇒ 竖焊缝（端点只判 xy 径向、不判 z）；否则横焊缝（xyz 全判）
     seam_center_x_min_m: 0.4            # 焊缝中点 base-x 下限（米，取代「工件最近点 base-x」判据）
     standoff_cm: 0.0                    # goal 沿 bisector（远离工件方向）外移的 standoff 距离（cm）

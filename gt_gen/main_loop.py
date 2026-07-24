@@ -43,7 +43,7 @@ def _observe(voxmap, fk_handle, q, camera_model, truth_scene, max_depth, pixel_s
 
 
 def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max_depth,
-             every_n=None, pixel_stride: int = 16, max_stomp_try=1):
+             every_n=None, pixel_stride: int = 16, extra_stomp_try=1):
     """在 h_expl(VOXEL) 上规划 cur_cfg→target_cfg，取插值轨迹；沿途每 every_n 个路点 _observe
     一次（边走边拍），终点构型再补拍一次。
 
@@ -67,7 +67,7 @@ def _move_to(h_expl, voxmap, cur_cfg, target_cfg, camera_model, truth_scene, max
         traj = si.plan_joint_single(cfg, cur_cfg=cur_cfg, target_cfg=target_cfg, world=world,
                                     checker_type=ck)
         if traj is None:
-            for _ in range(max_stomp_try):
+            for _ in range(extra_stomp_try):
                 traj = si.plan_joint_single(cfg, cur_cfg=cur_cfg, target_cfg=target_cfg, world=world,
                                     checker_type=ck)
                 if traj is not None:
@@ -730,7 +730,7 @@ def _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, r_list, camera_model, tru
 
 def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 camera_model=None, params=None, h_truth_plan=None, p_star_init=None,
-                world_plan=None, goal_cfg=None, start_cfg=None, max_stomp_try=1):
+                world_plan=None, goal_cfg=None, start_cfg=None, extra_stomp_try=1):
     """完整 ①~⑦ 主循环（goal 已含 standoff 后退）。
 
     入参：
@@ -820,7 +820,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
     _t = time.perf_counter()
     _observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth)
     _tick("observe", _t)
-    _debug_viz_observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth, "after")   # 拍后
+    # _debug_viz_observe(voxmap, h_truth, cur_cfg, camera_model, truth_scene, max_depth, "after")   # 拍后
 
     info = {"rounds": 0, "n_B": [], "free": [], "status_seq": [], "P_len": None}
     free_prev = voxmap.counts()[FREE]
@@ -855,9 +855,16 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                 # dump_inputs("plan_joint_case.pkl", cfg, _w1, cur_cfg, goal_cfg, _ck1)
             else:
                 seg = si.plan_pose_single(cfg, _w1, cur_cfg, goal_pose, checker_type=_ck1)
-
+        
             if seg is None:
-                for _ in range(max_stomp_try):
+                # from gt_gen.reach_b import compute_reach_pt, compute_blocking_B
+                # reach_idx = compute_reach_pt(h_truth, voxmap, P)
+                # cfg = h_truth.config
+                # nbv = (params if params is not None else cfg.params).get("nbv", {})
+                # k = int(nbv.get("k_lookahead", 6))
+                # B = compute_blocking_B(h_truth, voxmap, P, reach_idx, k)
+                # if B == 0:
+                for _ in range(extra_stomp_try):
                     seg = si.plan_joint_single(cfg, _w1, cur_cfg, goal_cfg, checker_type=_ck1)
                     if seg is not None:
                         break
@@ -909,11 +916,11 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                     # [-0.13571767508983612, -0.9203471541404724, 1.2579456567764282, -1.0674389600753784, -0.9313104748725891, -2.814171075820923]
                 #_debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)
                 #为了解决较难case, 多规划几遍可能就有解了
-                if P is None:
-                    for _ in range(max_stomp_try):
-                        P = si.plan_joint_single(cfg, world_plan, cur_cfg, goal_cfg)
-                        if P is not None:
-                            break
+                # if P is None:
+                #     for _ in range(max_stomp_try):
+                #         P = si.plan_joint_single(cfg, world_plan, cur_cfg, goal_cfg)
+                #         if P is not None:
+                #             break
                 if P is None:
                     print(f"[step② P*失败 R{rnd}] STOMP 在 world_plan 上未找到到 goal 的合格轨迹")
                     # STOMP 规划不出 P* → 本场景不可行，直接失败退出 generate_gt（不再进 NBV/后续轮）
@@ -949,7 +956,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
                                         pose_cost_metric=metric, p_star=P)
         _tick("nbv", _t)
         # _debug_viz_candidates(h_truth, voxmap, cur_cfg, r, r_list, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮全部候选+分数
-        _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
+        # _debug_viz_nbv(h_truth, voxmap, cur_cfg, r, camera_model, truth_scene, max_depth, params, rnd=rnd)  # 每轮 NBV 结果
         info["status_seq"].append(r.status)
         info["n_B"].append(int(r.n_B))#r.n_B:本轮阻塞段B的体素个数
         if P is not None and info["P_len"] is None:
@@ -964,7 +971,7 @@ def generate_gt(h_truth, h_expl, voxmap, truth_scene, goal_pose,
             for cand_idx, cand in enumerate(r_list):                              # 按 score 降序逐个试，第一个能走通(seg 非 None)的就用
                 _t = time.perf_counter()
                 seg, seg_obs = _move_to(h_expl, voxmap, cur_cfg, cand.cfg, camera_model, truth_scene,
-                                        max_depth, every_n=every_n, max_stomp_try=max_stomp_try)
+                                        max_depth, every_n=every_n, extra_stomp_try=extra_stomp_try)
                 _tick("move", _t)
                 #_debug_viz_seg(h_truth, voxmap, cur_cfg, seg, truth_scene, goal_pose, rnd=rnd)
                 if seg is not None:

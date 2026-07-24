@@ -331,7 +331,7 @@ def obstacle_type3_demo_main(args):
 
     for seam_id in range(len(scene.seams)):
 
-        seam_id = 319 # 319 779 758
+        seam_id = 758 # 319 779 758
 
 
         out_path = _out_path(scene, "type3", seam_id=seam_id, out_root=out_root)
@@ -341,11 +341,12 @@ def obstacle_type3_demo_main(args):
         try:
             scene._set_cur_seam(seam_id)
             # 候选初始位姿：hand/障碍无关（放宽不避障），每缝算 1 次即可
-            scene.plan_init_pose_fast(verbose=True)
+            scene.plan_init_pose_fast(verbose=True, debug=False)
             # from gt_gen.scene_viz import Open3DSceneVisualizer
             # Open3DSceneVisualizer(scene).show_init_poses()
+            # Open3DSceneVisualizer(scene).show_observe_init_poses_debug(3)
             for hand in ("forehand", "backhand"):
-                if scene.compute_pose_and_plan_path(hand, max_stomp_try=1, max_init_pose=2, use_nm=False, pl_limit_deg=170):
+                if scene.compute_pose_and_plan_path(hand, extra_stomp_try=1, max_goal_pose=2, use_nm=False, pl_limit_deg=170, max_init_pose=20):
                     print(f"[demo] seam {seam_id} {hand}：轨迹成功")
                 else:
                     print(f"[demo] seam {seam_id} {hand}：轨迹失败")
@@ -380,7 +381,14 @@ def viz_ob(args):
     from gt_gen.scene_viz import Open3DSceneVisualizer
 
     scene = ObserveAnythingScene.load(args.pkl)
-    Open3DSceneVisualizer(scene).show_scene_isaacsim()
+    scene.summarize_trajectories()
+    # Open3DSceneVisualizer(scene).show_scene_isaacsim()
+    time.sleep(3)
+    if args.ds:
+        fps = 3
+    else:
+        fps = 30
+    Open3DSceneVisualizer(scene).show_trajectory_isaacsim(seam_id=args.pkl_seamid,hand=args.pkl_hand,ds=args.ds,fps=fps)
 
 
 def main():
@@ -393,7 +401,7 @@ def main():
     ap.add_argument("--pkl-hand", help="保存轨迹的pkl文件")
     ap.add_argument("--ds", action="store_true",
                     help="viz：回放【关键帧采样后】轨迹（scene.sampled_trajectories，需先跑 scripts/traj_downsample.py）")
-    ap.add_argument("--task", default="viz", choices=["type1", "type2", "type3", "viz"],
+    ap.add_argument("--task", default="viz", choices=["type1", "type2", "type3", "viz", "vizob"],
                     help="批处理任务：type1=障碍类型1 / type2=障碍类型2 / type3=ObserveAnything / viz=本地可视化调试（默认）")
     ap.add_argument("--out-root", default=None,
                     help="覆盖 cfg.output_root 的结果落盘根目录（per-seam pkl 存这里）")

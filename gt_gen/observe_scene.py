@@ -366,7 +366,9 @@ class ObserveAnythingScene(Scene):
         不再 lay_flat / 移动工件；改为在世界系直接采样机械臂 base 的位置(xyz) + 朝向(yaw，臂竖直)：
           · 位置：以焊缝中点 mid_world 为原点，立方体 [-H,H]³（H=sample_cube_half_m）内按
             xy_step_m / z_step_m 取格点 pos_world；
-          · 朝向：绕世界竖直轴 yaw 从 yaw_min~yaw_max（半开）步长 yaw_step_deg；
+          · 朝向：绕世界竖直轴 yaw = yaw_ref + 偏差，偏差从 yaw_min~yaw_max（半开）步长 yaw_step_deg；
+            yaw_ref 为【base +x 正对焊缝】的基准朝向（bisector 在 base 系 y=0、x<0），故配置的 yaw_*_deg
+            是相对该基准的偏差角（度，范围 -180~180），而非世界系绝对 yaw；
         每采样点得 T_base_world=[Rz(yaw) | pos_world]，由 T_workpiece_in_base=inv(T_base_world) 得
         候选帧 (R=Rz(yaw).T, t=-R·pos_world)。过滤链（base 系，p_base=R·p_world+t）：
           ① 正面 bis_base.z≥0（front_face_filter，朝向级闸门，兼作正/反手分类：bis_base.x<0=正手）；
@@ -420,7 +422,12 @@ class ObserveAnythingScene(Scene):
         offsets = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], axis=1)   # (N,3)
         G_world = mid[None, :] + offsets                                   # (N,3) base 原点候选（世界系）
 
-        yaws = np.arange(float(yaw_min), float(yaw_max), float(yaw_step))
+        # yaw 采样：配置的 yaw_*_deg 不是世界系 yaw，而是相对【base +x 正对焊缝】基准朝向的偏差角（度，范围 -180~180）。
+        # 基准朝向 yaw_ref：使 bisector 在 base 系满足 y=0 且 x<0（即 base +x 指向焊缝、bisector 指 base 的 -x）。
+        # bis_base = Rz(yaw)ᵀ·bis ⇒ bis_base.y=0 得 yaw=atan2(bis.y,bis.x)（此时 bis_base.x=+|bis_xy|>0），
+        # 再 +180° 翻到 bis_base.x<0 ⇒ yaw_ref = atan2(bis.y, bis.x) + 180°。世界 yaw = yaw_ref + 偏差。
+        yaw_ref_deg = np.degrees(np.arctan2(float(bis[1]), float(bis[0]))) + 180.0
+        yaws = yaw_ref_deg + np.arange(float(yaw_min), float(yaw_max), float(yaw_step))
 
         def _inxy(pb):   # (M,3) → 布尔 (M,)：径向 ∈ [xy_lo, xy_hi]
             r = np.hypot(pb[:, 0], pb[:, 1])
