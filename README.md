@@ -3,7 +3,8 @@
 cd /kpfs_dataset_ssd/dataset/baiyu/code/gt_gen_hanfeng
 FILELIST=/kpfs_dataset_ssd/dataset/render_baiyu/filenames.txt TIMEOUT=7200 scripts/bash/v1/run_obstacle_type1.sh
 FILELIST=/kpfs_dataset_ssd/dataset/render_baiyu/filenames.txt TIMEOUT=1800 scripts/bash/v1/run_obstacle_type2.sh
- ./scripts/bash/v1/run_obstacle_type3.sh 0 /kpfs_dataset_ssd/dataset/render_baiyu/obstacle_type3/usd/warehouse.usdz /kpfs_dataset_ssd/dataset/render_baiyu/obstacle_type3/jsons/warehouse.json
+./scripts/bash/v1/run_obstacle_type3.sh 0 /kpfs_dataset_ssd/dataset/render_baiyu/obstacle_type3/usd/warehouse.usdz /kpfs_dataset_ssd/dataset render_baiyu/obstacle_type3/jsons/warehouse.json /kpfs_dataset_ssd/dataset/render_baiyu/obstacle_type3/traj/warehouse
+
  
 下采样轨迹
 PY=/workspace/isaaclab/_isaac_sim/python.sh scripts/bash/v1/traj_downsample_batch.sh /kpfs_dataset_ssd/dataset/render_baiyu/obstacle_type2.bk /kpfs_dataset_ssd/dataset/render_baiyu/obstacle_type2.ds

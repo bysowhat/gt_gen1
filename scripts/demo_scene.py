@@ -330,10 +330,6 @@ def obstacle_type3_demo_main(args):
     force = getattr(args, "force", False)
 
     for seam_id in range(len(scene.seams)):
-
-        seam_id = 758 # 319 779 758
-
-
         out_path = _out_path(scene, "type3", seam_id=seam_id, out_root=out_root)
         if not force and os.path.exists(out_path):
             print(f"[demo] seam {seam_id}：已存在 {out_path}，跳过")
