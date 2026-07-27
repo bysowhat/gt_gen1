@@ -11,10 +11,13 @@ traj_sampler/geometry_sampling/kinematics.CameraFKConfig / 方案 D6），无写
 
 用法（单文件）：
     conda run -n env_isaaclab python scripts/traj_downsample.py \
-        --pkl /media/a/新加卷/tempt/5/xxx_type2_seam0.pkl --out-dir /media/a/新加卷/tempt/5_ds
+        --pkl /media/a/新加卷/tempt/5/xxx_type2_seam0.pkl --out-dir /media/a/新加卷/tempt/5_ds --task type2
 用法（整目录）：
     conda run -n env_isaaclab python scripts/traj_downsample.py \
-        --in-dir /media/a/新加卷/tempt/5 --out-dir /media/a/新加卷/tempt/5_ds
+        --in-dir /media/a/新加卷/tempt/5 --out-dir /media/a/新加卷/tempt/5_ds --task type2
+type3（ObserveAnything，须显式 --task type3 才能保住 usd_path，供渲染整场景 USD 用）：
+    conda run -n env_isaaclab python scripts/traj_downsample.py \
+        --in-dir /media/a/新加卷/tempt/7 --out-dir /media/a/新加卷/tempt/7_ds --task type3
 """
 import argparse
 import os
@@ -43,16 +46,23 @@ def _load_sampling_params(config_path):
     )
 
 
-def downsample_pkl(pkl_path, out_dir, sp, fk=None, device="cuda", verbose=True):
+def downsample_pkl(pkl_path, out_dir, sp, fk=None, device="cuda", verbose=True, task="type2"):
     """对单个 Scene pkl 采样 → 写 sampled_trajectories → 另存到 out_dir/<原文件名>。
 
     fk 可传入已构建的 CameraFKConfig 复用（整目录批处理时避免重复初始化 curobo）；
     为 None 时用 scene.cfg 现建一个。返回输出路径。
+
+    task：type1/type2 用基类 Scene 加载；type3 用 ObserveAnythingScene（load_meshes=False，
+    不碰 mesh/pxr），使其实例 save 走覆盖版把 usd_path 写回下采样 pkl（渲染整场景 USD 需要）。
     """
-    from gt_gen.scene import Scene
     from geometry_sampling import CameraFKConfig, sample_keyframes_single
 
-    scene = Scene.load(pkl_path)
+    if task == "type3":
+        from gt_gen.observe_scene import ObserveAnythingScene
+        scene = ObserveAnythingScene.load(pkl_path)
+    else:
+        from gt_gen.scene import Scene
+        scene = Scene.load(pkl_path)
     summary = scene.summarize_trajectories(verbose=verbose)
 
     if fk is None:
@@ -97,6 +107,8 @@ def main():
     g.add_argument("--pkl", help="单个 Scene pkl")
     g.add_argument("--in-dir", help="输入目录（处理其下所有 .pkl）")
     ap.add_argument("--out-dir", required=True, help="输出目录（另存、保留原文件名、不覆盖原 pkl）")
+    ap.add_argument("--task", required=True, choices=["type1", "type2", "type3"],
+                    help="数据类型：type1/type2 用基类 Scene；type3 用 ObserveAnythingScene（保住 usd_path）")
     ap.add_argument("--config", default=_DEFAULT_CFG,
                     help="采样参数来源 yaml（默认 configs/default.yaml，读其 traj_downsample 段）")
     ap.add_argument("--device", default="cuda")
@@ -105,7 +117,7 @@ def main():
     sp = _load_sampling_params(args.config)
 
     if args.pkl:
-        downsample_pkl(args.pkl, args.out_dir, sp, device=args.device)
+        downsample_pkl(args.pkl, args.out_dir, sp, device=args.device, task=args.task)
         return
 
     pkls = sorted(f for f in os.listdir(args.in_dir) if f.endswith(".pkl"))
@@ -115,7 +127,7 @@ def main():
         pkl_path = os.path.join(args.in_dir, fname)
         print(f"[traj_downsample] ({i + 1}/{len(pkls)}) {fname}")
         # 同一 config → CameraFKConfig 可跨文件复用（省去重复初始化 curobo）
-        _, fk = downsample_pkl(pkl_path, args.out_dir, sp, fk=fk, device=args.device)
+        _, fk = downsample_pkl(pkl_path, args.out_dir, sp, fk=fk, device=args.device, task=args.task)
 
 
 if __name__ == "__main__":
