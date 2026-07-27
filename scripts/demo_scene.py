@@ -213,7 +213,7 @@ def obstacle_type2_demo_main(args):
                 # 1) 加 1 个类型2 遮挡板，挂到本手别桶
                 scene.add_obstacle_type2(hand=hand)
                 # 2) 规划带障碍轨迹（只避开本手别桶障碍）
-                if scene.compute_pose_and_plan_path(hand, max_stomp_try=1):
+                if scene.compute_pose_and_plan_path(hand, extra_stomp_try=1):
                     print(f"[demo] seam {seam_id} {hand}：带障碍轨迹成功")
                 else:
                     print(f"[demo] seam {seam_id} {hand}：带障碍轨迹失败")

@@ -52,11 +52,23 @@ def _bootstrap_pxr():
         pass
     if os.environ.get("_PXR_BOOTSTRAPPED"):
         raise ImportError("pxr 自举失败：已设路径仍无法导入")
-    cands = glob.glob(os.path.join(sys.prefix, "lib", "python*", "site-packages",
-                                   "isaacsim", "extscache", "omni.usd.libs*"))
+    # omni.usd.libs 里带着 pxr，两种布局都要覆盖：
+    #   pip 装 isaacsim： <prefix>/lib/python*/site-packages/isaacsim/extscache/omni.usd.libs*
+    #   二进制 Isaac Sim：<isaac_root>/extscache/omni.usd.libs*（prefix 形如 .../_isaac_sim/kit/python）
+    patterns = [
+        os.path.join(sys.prefix, "lib", "python*", "site-packages",
+                     "isaacsim", "extscache", "omni.usd.libs*"),
+        os.path.join(sys.prefix, os.pardir, os.pardir, "extscache", "omni.usd.libs*"),
+        os.path.join(sys.prefix, "extscache", "omni.usd.libs*"),
+    ]
+    cands = []
+    for pat in patterns:
+        cands = glob.glob(pat)
+        if cands:
+            break
     if not cands:
         raise ImportError("找不到 isaacsim 的 pxr（omni.usd.libs*），请确认在 env_isaaclab 内运行")
-    pxr_root = cands[0]
+    pxr_root = os.path.realpath(cands[0])
     lib = os.pathsep.join([os.path.join(pxr_root, "bin"), os.path.join(sys.prefix, "lib")])
     os.environ["LD_LIBRARY_PATH"] = lib + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
     os.environ["PYTHONPATH"] = pxr_root + os.pathsep + os.environ.get("PYTHONPATH", "")
